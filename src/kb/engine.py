@@ -17,7 +17,7 @@ from src.llm import get_deepseek_llm
 from .prompt_templates import render_prompt_template_guidance, select_prompt_templates
 from .qa_store import QAStore
 from .text2sql import Text2SQL, Text2SQLConfirmRequired
-from .rag import RAGRetriever, RAGRetrieveResult
+from .rag import get_rag_retriever, RAGRetrieveResult
 from .retrieval_eval import evaluate_retrieval
 
 
@@ -120,7 +120,7 @@ class KnowledgeEngine:
         """初始化 QA 库、Text2SQL、RAG 检索器及 RAG 用 LLM 链（仅 DeepSeek）。"""
         self.qa = QAStore()
         self.text2sql = Text2SQL()
-        self.rag = RAGRetriever()
+        self.rag = get_rag_retriever()
         self._llm = _get_llm()  # 仅 DeepSeek，禁止 OpenAI
         self._rag_chain = _RAG_PROMPT | self._llm
         self._last_trace = KnowledgeQueryTrace(final_status="init")

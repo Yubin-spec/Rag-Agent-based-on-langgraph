@@ -11,7 +11,7 @@ from .schema_loader import (
     TableInfo,
     ColumnInfo,
 )
-from .rag import RAGRetriever, RAGRetrieveResult, ChunkWithEval
+from .rag import RAGRetriever, get_rag_retriever, RAGRetrieveResult, ChunkWithEval
 from .chunking import chunk_text, chunk_text_multi_size, ChunkWithParent, DEFAULT_CHUNK_SIZES, DEFAULT_PARENT_OVERLAP
 from .retrieval_eval import (
     evaluate_retrieval,
@@ -34,6 +34,7 @@ __all__ = [
     "TableInfo",
     "ColumnInfo",
     "RAGRetriever",
+    "get_rag_retriever",
     "RAGRetrieveResult",
     "ChunkWithEval",
     "chunk_text",

@@ -16,7 +16,7 @@ from functools import lru_cache
 # 允许使用的大模型名称（仅 DeepSeek，禁止 OpenAI 的 gpt-4 等）
 ALLOWED_LLM_PREFIXES = ("deepseek-", "deepseek_reasoner")
 # 允许的向量/重排模型：仅 BGE 系列
-ALLOWED_EMBEDDING_MODELS = ("BAAI/bge-m3", "bge-m3", "BAAI/bge-m3")
+ALLOWED_EMBEDDING_MODELS = ("BAAI/bge-m3", "bge-m3")
 ALLOWED_RERANKER_MODELS = ("BAAI/bge-reranker-large", "bge-reranker-large")
 
 
@@ -39,11 +39,13 @@ class Settings(BaseSettings):
     deepseek_circuit_breaker_failures: int = 3  # 同一节点连续失败达到该次数后熔断
     deepseek_circuit_breaker_open_seconds: int = 30  # 熔断持续时间，到期后自动半开探测
 
-    # ---------- 向量模型（仅 BGE-M3） ----------
+    # ---------- 向量模型（仅 BGE-M3，本地部署/本地加载） ----------
+    # 可为 HuggingFace 模型名（如 BAAI/bge-m3）或本地路径（如 /path/to/bge-m3），本地加载不调用远程 API
     bge_embedding_model: str = "BAAI/bge-m3"
     embedding_device: str = "cpu"
 
-    # ---------- 重排模型（仅 BGE Reranker Large） ----------
+    # ---------- 重排模型（仅 BGE Reranker Large，本地部署/本地加载） ----------
+    # 可为 HuggingFace 模型名或本地路径，本地加载不调用远程 API
     bge_reranker_model: str = "BAAI/bge-reranker-large"
 
     # ---------- Milvus 向量库 ----------
@@ -67,10 +69,17 @@ class Settings(BaseSettings):
     text2sql_schema_refresh_interval_seconds: int = 3600  # 1 小时检测 schema 是否变更并重新扫描
     text2sql_schema_overrides_path: str = "./data/text2sql_schema_overrides.json"  # 人工审核的表/列含义及表间关联
 
-    # ---------- MinerU 文档解析 ----------
+    # ---------- MinerU 文档解析（本地部署版） ----------
+    # MinerU 本地部署时填写本地服务地址，如 http://127.0.0.1:8001；为空则使用占位解析（仅文本+切块）
     mineru_api_url: str = ""
+    # 本地部署时通常不需要 token，留空即可；若服务端要求鉴权再填写
     mineru_api_token: str = ""
+    # True：使用本地 MinerU 时配置 mineru_api_url 即可；url 为空则使用占位解析
     mineru_use_local: bool = True
+    # 并发控制：同时调用 MinerU API 的最大数量，超出时排队等待，避免打满 MinerU
+    mineru_concurrency_limit: int = 5
+    # MinerU API 单次请求超时（秒）
+    mineru_timeout_seconds: int = 120
 
     # ---------- 路径 ----------
     upload_dir: str = "./data/uploads"

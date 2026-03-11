@@ -464,9 +464,7 @@ async def doc_upload(request: Request, file: UploadFile = File(...)):
             f.write(data)
     await asyncio.to_thread(_write, path, content)
     client = MinerUClient()
-    result = await asyncio.to_thread(
-        client.parse_file, file.filename or path, content
-    )
+    result = await client.parse_file_async(file.filename or path, content)
     cache_key = _parse_cache_key(user_id, result.task_id)
     _parse_cache[cache_key] = result
     return {

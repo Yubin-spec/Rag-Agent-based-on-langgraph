@@ -5,21 +5,8 @@
 """
 from typing import List, Optional
 from config import get_settings
+from src.kb.embedding_loader import get_bge_embedding
 from .mineru_client import ChunkItem, ParseResult
-
-
-def _get_embedding_model():
-    """加载 BGE-M3 用于生成 chunk 向量（仅允许的 embedding 模型）。"""
-    try:
-        from FlagEmbedding import FlagModel
-        s = get_settings()
-        return FlagModel(
-            s.bge_embedding_model,
-            use_fp16=False,
-            device=s.embedding_device,
-        )
-    except Exception:
-        return None
 
 
 class MilvusUploader:
@@ -29,9 +16,9 @@ class MilvusUploader:
     """
 
     def __init__(self):
-        """加载配置与 BGE-M3，并确保目标 collection 存在且已 load。"""
+        """使用单例 BGE-M3（与 RAG 复用），并确保目标 collection 存在且已 load。"""
         self.settings = get_settings()
-        self._embed = _get_embedding_model()
+        self._embed = get_bge_embedding()
         self._collection = None
         self._ensure_collection()
 

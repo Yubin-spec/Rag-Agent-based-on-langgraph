@@ -2,8 +2,8 @@
 """
 复杂问题 RAG：BM25 + HNSW 混合检索（3:7），检索评估与重检，答案展示依据来源。
 模型使用约定（本项目禁止调用 OpenAI）：
-  - 向量模型：仅 BGE-M3（BAAI/bge-m3），用于 Milvus 检索与上传；
-  - 重排模型：仅 BGE Reranker Large（BAAI/bge-reranker-large）；
+  - 向量模型：仅 BGE-M3（BAAI/bge-m3），本地部署/本地加载，不调用远程 embedding API；
+  - 重排模型：仅 BGE Reranker Large（BAAI/bge-reranker-large），本地部署/本地加载，不调用远程 API；
   - 大模型不在此模块调用，由 kb.engine 使用 DeepSeek。
 """
 from typing import List, Optional, Tuple
@@ -11,10 +11,21 @@ from dataclasses import dataclass
 
 from config import get_settings
 from .retrieval_eval import evaluate_retrieval, RetrievalEvalResult
+from .embedding_loader import get_bge_embedding, get_bge_reranker
 
 
 def _get_settings():
     return get_settings()
+
+_rag_retriever_singleton: Optional["RAGRetriever"] = None
+
+
+def get_rag_retriever() -> "RAGRetriever":
+    """进程内单例 RAG 检索器，避免重复加载 BGE/Milvus。"""
+    global _rag_retriever_singleton
+    if _rag_retriever_singleton is None:
+        _rag_retriever_singleton = RAGRetriever()
+    return _rag_retriever_singleton
 
 
 @dataclass
@@ -41,12 +52,12 @@ class RAGRetriever:
     """
     RAG 检索器：全文(BM25)与向量(Milvus/HNSW)按 3:7 合并，BGE 重排，
     对候选做匹配度/无关比例评估，低于阈值则重检（最多 3 次）。
-    向量与重排仅使用 BGE 系列，不调用 OpenAI。
+    向量与重排均为本地部署：BGE-M3 / BGE Reranker 在进程内加载，不调用任何远程 embedding/rerank API。
     """
 
     def __init__(self):
-        self._embedding = None  # BGE-M3，仅此向量模型
-        self._reranker = None   # BGE Reranker Large，仅此重排模型
+        self._embedding = None  # BGE-M3，本地加载
+        self._reranker = None   # BGE Reranker Large，本地加载
         self._milvus_collection = None
         self._bm25_index = None
         self._bm25_corpus: List[str] = []
@@ -56,30 +67,12 @@ class RAGRetriever:
         self._init_bm25()
 
     def _init_embedding(self) -> None:
-        """加载 BGE-M3 向量模型（仅允许的 embedding 模型，非 OpenAI）。"""
-        try:
-            from FlagEmbedding import FlagModel
-            s = _get_settings()
-            self._embedding = FlagModel(
-                s.bge_embedding_model,
-                use_fp16=False,
-                device=s.embedding_device,
-            )
-        except Exception:
-            self._embedding = None
+        """使用单例 BGE-M3，与 MilvusUploader 复用，避免重复加载。"""
+        self._embedding = get_bge_embedding()
 
     def _init_reranker(self) -> None:
-        """加载 BGE Reranker Large（仅允许的重排模型，非 OpenAI）。"""
-        try:
-            from FlagEmbedding import FlagReranker
-            s = _get_settings()
-            self._reranker = FlagReranker(
-                s.bge_reranker_model,
-                use_fp16=False,
-                device=s.embedding_device,
-            )
-        except Exception:
-            self._reranker = None
+        """使用单例 BGE Reranker Large。"""
+        self._reranker = get_bge_reranker()
 
     def _init_milvus(self) -> None:
         """连接 Milvus 并加载配置的 collection（向量检索用）。"""
