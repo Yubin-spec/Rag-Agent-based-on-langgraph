@@ -1,0 +1,45 @@
+# 知识库智能体 - 内网 Docker 部署
+# 使用：在项目根目录 cp .env.example .env 并填写配置后，执行 docker compose up -d
+version: "3.8"
+
+services:
+  app:
+    build: .
+    image: kb-agent:latest
+    container_name: kb-agent
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    # 使用本 compose 的 Redis 时，在 .env 中设置 REDIS_URL=redis://redis:6379/0
+    volumes:
+      # 持久化：SQLite、上传文件、Schema 覆盖、高频 QA 数据
+      - ./data:/app/data
+    # 可选：需缓存时启动 redis，仅启动 app 时缓存不可用
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    container_name: kb-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  redis_data:

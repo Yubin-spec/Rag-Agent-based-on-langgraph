@@ -1,0 +1,43 @@
+# 虚拟环境与缓存
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.eggs
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# 环境与本地配置（通过 compose 或 -e 注入）
+.env
+.env.local
+.env.*.local
+
+# 数据与上传（挂载卷，不打包进镜像）
+data/
+*.db
+*.sqlite
+uploads/
+
+# 版本控制与文档
+.git
+.gitignore
+*.md
+docs/
+
+# IDE 与系统
+.idea
+.vscode
+.DS_Store
+*.log
+
+# 测试与脚本（按需保留）
+tests/
+scripts/
+*.sh
+
+# Docker 自身
+Dockerfile*
+docker-compose*
+.dockerignore

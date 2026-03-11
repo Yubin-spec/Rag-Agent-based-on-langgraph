@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>知识库智能体</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #f7f8fa; color: #222; }
+    h1 { font-size: 1.25rem; margin-top: 0; }
+    section { margin-bottom: 2rem; }
+    .app-shell { display: flex; min-height: 100vh; }
+    .sidebar { width: 280px; border-right: 1px solid #e5e7eb; background: #fff; padding: 1rem; overflow-y: auto; }
+    .main-panel { flex: 1; padding: 1rem 1.25rem; max-width: calc(100vw - 280px); }
+    .conversation-search { width: 100%; margin-top: 0.75rem; padding: 0.55rem 0.65rem; border: 1px solid #d1d5db; border-radius: 8px; }
+    .conversation-list { margin-top: 0.75rem; }
+    .conversation-item { width: 100%; text-align: left; padding: 0.75rem; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; cursor: pointer; margin-bottom: 0.5rem; }
+    .conversation-item.active { border-color: #06c; background: #eef6ff; }
+    .conversation-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.5rem; }
+    .conversation-meta { min-width: 0; flex: 1; }
+    .conversation-title { font-size: 0.95rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .conversation-time { font-size: 0.8rem; color: #666; margin-top: 0.25rem; }
+    .conversation-actions { display: flex; gap: 0.25rem; flex-shrink: 0; }
+    .conversation-actions button { border: none; background: transparent; color: #666; cursor: pointer; font-size: 0.85rem; padding: 0.1rem 0.2rem; }
+    .conversation-actions button:hover { color: #111; }
+    .conversation-actions button.delete:hover { color: #c62828; }
+    .empty-conversations { color: #666; font-size: 0.9rem; padding: 0.75rem 0.25rem; }
+    .upload-box { border: 2px dashed #ccc; padding: 1.5rem; text-align: center; border-radius: 8px; }
+    .upload-box input { display: none; }
+    .upload-box label { cursor: pointer; color: #06c; }
+    .parse-result { background: #f5f5f5; padding: 1rem; border-radius: 8px; max-height: 300px; overflow: auto; white-space: pre-wrap; font-size: 0.9rem; }
+    .chat-box { display: flex; gap: 8px; margin-top: 0.5rem; }
+    .chat-box input { flex: 1; padding: 0.5rem; border: 1px solid #ccc; border-radius: 6px; }
+    .chat-box button { padding: 0.5rem 1rem; background: #06c; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    .messages { margin-top: 1rem; }
+    .msg { padding: 0.75rem; border-radius: 8px; margin-bottom: 0.5rem; max-width: 85%; }
+    .msg.user { background: #e3f2fd; margin-left: 0; }
+    .msg.assistant { background: #f5f5f5; margin-left: auto; }
+    .msg-content { white-space: pre-wrap; }
+    .msg-actions { margin-top: 0.5rem; display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; }
+    .feedback-btn { border: 1px solid #d1d5db; background: #fff; color: #333; border-radius: 999px; padding: 0.2rem 0.65rem; cursor: pointer; font-size: 0.82rem; }
+    .feedback-btn.active { background: #0b57d0; border-color: #0b57d0; color: #fff; }
+    .feedback-status { font-size: 0.8rem; color: #666; }
+    .analytics-panel { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 1rem; }
+    .analytics-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.75rem; margin-top: 0.75rem; }
+    .analytics-card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 0.75rem; background: #fafafa; }
+    .analytics-card strong { display: block; font-size: 1.2rem; margin-top: 0.25rem; }
+    .analytics-list { margin-top: 1rem; }
+    .analytics-list h3 { margin-bottom: 0.4rem; }
+    .analytics-list ul { padding-left: 1rem; margin: 0; }
+    .analytics-list li { margin-bottom: 0.4rem; line-height: 1.5; }
+    .ops-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.75rem; margin-top: 0.75rem; }
+    .ops-card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 0.75rem; background: #fafafa; }
+    .ops-card .label { font-size: 0.85rem; color: #666; }
+    .ops-card .value { margin-top: 0.3rem; font-size: 1.05rem; font-weight: 600; word-break: break-word; }
+    .ops-card.ok { border-color: #b7dfc2; background: #f2fbf5; }
+    .ops-card.warn { border-color: #f2d184; background: #fff9eb; }
+    .ops-card.bad { border-color: #efb5b5; background: #fff3f3; }
+    .confirm-upload { margin-top: 0.5rem; }
+    .confirm-upload button { padding: 0.5rem 1rem; background: #2e7d32; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    .error { color: #c62828; font-size: 0.9rem; }
+    .schema-section { margin-top: 1rem; }
+    .schema-table { border: 1px solid #ddd; border-radius: 8px; margin-bottom: 1rem; overflow: hidden; }
+    .schema-table h3 { margin: 0; padding: 0.5rem 1rem; background: #eee; font-size: 1rem; }
+    .schema-table table { width: 100%; border-collapse: collapse; }
+    .schema-table th, .schema-table td { padding: 0.4rem 0.6rem; text-align: left; border-bottom: 1px solid #eee; }
+    .schema-table input { width: 100%; padding: 0.25rem; border: 1px solid #ccc; border-radius: 4px; }
+    .schema-table input[readonly] { background: #f9f9f9; }
+    .relations-table input { min-width: 80px; }
+    .btn-small { padding: 0.25rem 0.5rem; font-size: 0.85rem; cursor: pointer; border-radius: 4px; border: 1px solid #ccc; background: #fff; }
+    .btn-small.del { color: #c62828; }
+    .schema-actions { margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <h1>知识库智能体</h1>
+      <button type="button" id="clearChat" class="btn-small">+ 新建对话</button>
+      <input type="text" id="conversationSearch" class="conversation-search" placeholder="搜索会话标题" />
+      <div id="conversationList" class="conversation-list"></div>
+    </aside>
+
+    <main class="main-panel">
+      <section>
+        <h2>Text2SQL 表结构审核</h2>
+        <p>展示数据库检测到的库表与字段，可修改表含义、字段含义；表间关联由人工整理后提交，将仅以此喂给大模型。</p>
+        <button type="button" id="schemaLoadBtn">加载表结构</button>
+        <div id="schemaStatus" class="error"></div>
+        <div id="schemaContent" class="schema-section" style="display:none;"></div>
+        <div id="schemaSubmitArea" style="display:none; margin-top: 0.5rem;">
+          <button type="button" id="schemaSubmitBtn">保存修改</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>文档上传与解析</h2>
+        <div class="upload-box">
+          <input type="file" id="file" accept=".pdf,.doc,.docx,.txt,.md" />
+          <label for="file">点击选择文件上传（将调用 MinerU 解析）</label>
+        </div>
+        <div id="uploadStatus" class="error"></div>
+        <div id="parseResult" class="parse-result" style="display:none;"></div>
+        <div id="confirmArea" class="confirm-upload" style="display:none;">
+          <p>请对比上方解析结果，确认无误或修改后点击确认上传到知识库。</p>
+          <button type="button" id="confirmBtn">确认上传到 Milvus</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>对话</h2>
+        <div class="chat-box">
+          <input type="text" id="input" placeholder="输入问题（闲聊或知识问答）" />
+          <button type="button" id="send">发送</button>
+        </div>
+        <div id="messages" class="messages"></div>
+      </section>
+
+      <section>
+        <h2>问答效果监控</h2>
+        <div class="analytics-panel">
+          <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+            <button type="button" id="loadAnalyticsBtn" class="btn-small">刷新分析面板</button>
+            <input type="number" id="analyticsDays" class="conversation-search" style="max-width:160px; margin-top:0;" min="1" value="7" placeholder="统计天数" />
+          </div>
+          <div id="analyticsStatus" class="error" style="margin-top:0.5rem;"></div>
+          <div id="analyticsContent" style="display:none;"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>运行状态监控</h2>
+        <div class="analytics-panel">
+          <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+            <button type="button" id="loadOpsStatusBtn" class="btn-small">刷新运行状态</button>
+          </div>
+          <div id="opsStatus" class="error" style="margin-top:0.5rem;"></div>
+          <div id="opsContent" style="display:none;"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const API = "http://localhost:8000";
+    const CONVERSATION_ID_KEY = "kb_agent_conversation_id";
+    const OPS_AUTO_REFRESH_MS = 10000;
+    let currentTaskId = null;
+    let conversationId = localStorage.getItem(CONVERSATION_ID_KEY) || null;  // 同会话复用，实现多轮与隔离
+    let conversations = [];
+    let conversationSearch = "";
+    let opsAutoRefreshTimer = null;
+    const FEEDBACK_TAG_OPTIONS = ["答非所问", "证据不充分", "像在猜", "政策理解有误", "没有解决问题", "希望转人工"];
+
+    document.getElementById("file").addEventListener("change", async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      const status = document.getElementById("uploadStatus");
+      const parseResult = document.getElementById("parseResult");
+      const confirmArea = document.getElementById("confirmArea");
+      status.textContent = "上传中…";
+      parseResult.style.display = "none";
+      confirmArea.style.display = "none";
+      const fd = new FormData();
+      fd.append("file", file);
+      try {
+        const r = await fetch(API + "/doc/upload", { method: "POST", body: fd });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "上传失败");
+        currentTaskId = data.task_id;
+        parseResult.textContent = "原文摘要:\n" + (data.full_text || "").slice(0, 2000) + "\n\n---\n解析分段数: " + (data.chunks?.length || 0);
+        parseResult.style.display = "block";
+        confirmArea.style.display = "block";
+        status.textContent = "解析完成，请对比后确认上传。";
+      } catch (err) {
+        status.textContent = err.message || "上传失败";
+      }
+    });
+
+    document.getElementById("confirmBtn").addEventListener("click", async () => {
+      if (!currentTaskId) return;
+      try {
+        const r = await fetch(API + "/doc/confirm_upload", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ task_id: currentTaskId }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "上传失败");
+        document.getElementById("uploadStatus").textContent = "已上传 " + (data.uploaded || 0) + " 条到 Milvus。";
+      } catch (err) {
+        document.getElementById("uploadStatus").textContent = err.message || "确认上传失败";
+      }
+    });
+
+    function addMsg(role, text, options = {}) {
+      const div = document.createElement("div");
+      div.className = "msg " + role;
+      const content = document.createElement("div");
+      content.className = "msg-content";
+      content.textContent = text;
+      div.appendChild(content);
+      if (role === "assistant" && options.observationId) {
+        div.appendChild(createFeedbackControls({
+          observationId: options.observationId,
+          feedbackRating: options.feedbackRating || "",
+          feedbackTags: options.feedbackTags || [],
+          feedbackText: options.feedbackText || "",
+        }));
+      }
+      document.getElementById("messages").appendChild(div);
+      div.scrollIntoView({ behavior: "smooth", block: "end" });
+      return div;
+    }
+
+    function createFeedbackControls(options = {}) {
+      const wrap = document.createElement("div");
+      wrap.className = "msg-actions";
+      const observationId = options.observationId;
+      const currentRating = options.feedbackRating || "";
+      const currentTags = options.feedbackTags || [];
+      const currentText = options.feedbackText || "";
+
+      const upBtn = document.createElement("button");
+      upBtn.type = "button";
+      upBtn.className = "feedback-btn" + (currentRating === "up" ? " active" : "");
+      upBtn.textContent = "👍 有帮助";
+      upBtn.addEventListener("click", async () => {
+        await submitFeedback({ observationId, rating: "up", tags: [], freeText: "" });
+      });
+      wrap.appendChild(upBtn);
+
+      const downBtn = document.createElement("button");
+      downBtn.type = "button";
+      downBtn.className = "feedback-btn" + (currentRating === "down" ? " active" : "");
+      downBtn.textContent = "👎 需改进";
+      downBtn.addEventListener("click", async () => {
+        const defaultTagText = currentTags.length ? currentTags.join("、") : FEEDBACK_TAG_OPTIONS.join("、");
+        const tagInput = window.prompt("请输入反馈标签，可填写多个，使用逗号分隔。\n建议标签：" + defaultTagText, currentTags.join(","));
+        if (tagInput == null) return;
+        const textInput = window.prompt("可补充说明问题点（选填）", currentText || "");
+        if (textInput == null) return;
+        const tags = tagInput.split(/[，,]/).map(s => s.trim()).filter(Boolean);
+        await submitFeedback({ observationId, rating: "down", tags, freeText: (textInput || "").trim() });
+      });
+      wrap.appendChild(downBtn);
+
+      const status = document.createElement("span");
+      status.className = "feedback-status";
+      status.textContent = currentRating === "up"
+        ? "已点赞"
+        : currentRating === "down"
+          ? ("已反馈" + (currentTags.length ? "：" + currentTags.join("、") : ""))
+          : "可对这条回答做反馈";
+      wrap.appendChild(status);
+      return wrap;
+    }
+
+    async function submitFeedback({ observationId, rating, tags, freeText }) {
+      if (!conversationId || !observationId) return;
+      try {
+        const r = await fetch(API + "/qa/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            observation_id: observationId,
+            conversation_id: conversationId,
+            rating,
+            tags: tags || [],
+            free_text: freeText || "",
+          }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "提交反馈失败");
+        await loadConversationHistory();
+        await loadQaAnalytics();
+      } catch (err) {
+        window.alert(err.message || "提交反馈失败");
+      }
+    }
+
+    function clearMessages() {
+      document.getElementById("messages").innerHTML = "";
+    }
+
+    function renderHistory(messages) {
+      clearMessages();
+      (messages || []).forEach(m => {
+        if (!m || !m.role) return;
+        addMsg(m.role === "user" ? "user" : "assistant", m.content || "", {
+          observationId: m.observation_id || "",
+          feedbackRating: m.feedback_rating || "",
+          feedbackTags: m.feedback_tags || [],
+          feedbackText: m.feedback_text || "",
+        });
+      });
+    }
+
+    async function loadConversationHistory() {
+      if (!conversationId) return;
+      try {
+        const r = await fetch(API + "/chat/history?conversation_id=" + encodeURIComponent(conversationId));
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "加载历史失败");
+        renderHistory(data.messages || []);
+      } catch (err) {
+        console.warn("加载会话历史失败", err);
+      }
+    }
+
+    function renderQaAnalytics(data) {
+      const content = document.getElementById("analyticsContent");
+      const summary = data?.summary || {};
+      const badCases = data?.bad_cases || [];
+      const feedbackTags = data?.feedback_tags || [];
+      const scenarios = data?.scenarios || [];
+      content.innerHTML = `
+        <div class="analytics-summary">
+          <div class="analytics-card">总问答数<strong>${summary.total_questions || 0}</strong></div>
+          <div class="analytics-card">成功数<strong>${summary.success_count || 0}</strong></div>
+          <div class="analytics-card">平均耗时<strong>${summary.avg_latency_ms || 0} ms</strong></div>
+          <div class="analytics-card">差评数<strong>${summary.negative_feedback_count || 0}</strong></div>
+          <div class="analytics-card">低关联数<strong>${summary.low_grounding_count || 0}</strong></div>
+          <div class="analytics-card">重生成数<strong>${summary.regenerated_count || 0}</strong></div>
+        </div>
+        <div class="analytics-list">
+          <h3>近期疑似效果不佳案例</h3>
+          <ul>
+            ${badCases.length ? badCases.map(item => `<li><strong>${escapeHtml(item.question || "")}</strong><br/>标签：${escapeHtml(item.quality_label || "")}；grounding=${escapeHtml(String(item.grounding_score ?? 0))}；反馈=${escapeHtml(item.rating || "无")} ${escapeHtml((item.tags || []).join("、"))}</li>`).join("") : "<li>暂无数据</li>"}
+          </ul>
+        </div>
+        <div class="analytics-list">
+          <h3>反馈标签分布</h3>
+          <ul>
+            ${feedbackTags.length ? feedbackTags.map(item => `<li>${escapeHtml(item.tag)}：${escapeHtml(String(item.count))}</li>`).join("") : "<li>暂无数据</li>"}
+          </ul>
+        </div>
+        <div class="analytics-list">
+          <h3>命中场景模板</h3>
+          <ul>
+            ${scenarios.length ? scenarios.map(item => `<li>${escapeHtml(item.scenario)}：${escapeHtml(String(item.count))}</li>`).join("") : "<li>暂无数据</li>"}
+          </ul>
+        </div>
+      `;
+      content.style.display = "block";
+    }
+
+    async function loadQaAnalytics() {
+      const status = document.getElementById("analyticsStatus");
+      const content = document.getElementById("analyticsContent");
+      const days = Math.max(1, parseInt(document.getElementById("analyticsDays").value || "7", 10) || 7);
+      status.textContent = "加载中…";
+      content.style.display = "none";
+      try {
+        const r = await fetch(API + "/qa/analytics?days=" + encodeURIComponent(days) + "&limit=10");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "加载分析失败");
+        renderQaAnalytics(data);
+        status.textContent = "";
+      } catch (err) {
+        status.textContent = err.message || "加载分析失败";
+      }
+    }
+
+    function statusCardClass(ok, warn = false) {
+      if (ok) return "ops-card ok";
+      if (warn) return "ops-card warn";
+      return "ops-card bad";
+    }
+
+    function renderOpsStatus(health, router) {
+      const content = document.getElementById("opsContent");
+      const endpoints = router?.endpoints || [];
+      content.innerHTML = `
+        <div class="ops-summary">
+          <div class="${statusCardClass(health?.status === "ok")}">
+            <div class="label">健康检查</div>
+            <div class="value">${escapeHtml(health?.status || "unknown")}</div>
+          </div>
+          <div class="${statusCardClass((router?.healthy_endpoint_count || 0) > 0, (router?.endpoint_count || 0) > 0)}">
+            <div class="label">可用路由节点</div>
+            <div class="value">${escapeHtml(String(router?.healthy_endpoint_count || 0))} / ${escapeHtml(String(router?.endpoint_count || 0))}</div>
+          </div>
+          <div class="${statusCardClass(!(router?.all_circuits_open), (router?.endpoint_count || 0) > 0)}">
+            <div class="label">熔断状态</div>
+            <div class="value">${router?.all_circuits_open ? "全部熔断" : "正常"}</div>
+          </div>
+        </div>
+        <div class="analytics-list">
+          <h3>节点详情</h3>
+          <ul>
+            ${endpoints.length ? endpoints.map(item => `
+              <li>
+                <strong>${escapeHtml(item.name || "unnamed")}</strong>
+                <br/>base_url=${escapeHtml(item.base_url || "")}
+                <br/>weight=${escapeHtml(String(item.weight ?? 0))}，inflight=${escapeHtml(String(item.inflight ?? 0))}，failures=${escapeHtml(String(item.failures ?? 0))}
+                <br/>circuit_open=${escapeHtml(String(!!item.circuit_open))}，seconds_until_retry=${escapeHtml(String(item.seconds_until_retry ?? 0))}
+              </li>
+            `).join("") : "<li>暂无节点信息</li>"}
+          </ul>
+        </div>
+      `;
+      content.style.display = "block";
+    }
+
+    async function loadOpsStatus() {
+      const status = document.getElementById("opsStatus");
+      const content = document.getElementById("opsContent");
+      status.textContent = "加载中…";
+      content.style.display = "none";
+      try {
+        const [healthResp, routerResp] = await Promise.all([
+          fetch(API + "/health"),
+          fetch(API + "/llm/router/status"),
+        ]);
+        const health = await healthResp.json();
+        const router = await routerResp.json();
+        if (!healthResp.ok) throw new Error(health.detail || "健康检查加载失败");
+        if (!routerResp.ok) throw new Error(router.detail || "路由状态加载失败");
+        renderOpsStatus(health, router);
+        status.textContent = "";
+      } catch (err) {
+        status.textContent = err.message || "加载运行状态失败";
+      }
+    }
+
+    function startOpsAutoRefresh() {
+      if (opsAutoRefreshTimer) window.clearInterval(opsAutoRefreshTimer);
+      opsAutoRefreshTimer = window.setInterval(() => {
+        if (document.hidden) return;
+        loadOpsStatus();
+      }, OPS_AUTO_REFRESH_MS);
+    }
+
+    function formatUpdatedAt(s) {
+      if (!s) return "";
+      const d = new Date(s);
+      if (Number.isNaN(d.getTime())) return "";
+      return d.toLocaleString();
+    }
+
+    function renderConversationList() {
+      const el = document.getElementById("conversationList");
+      el.innerHTML = "";
+      const filtered = (conversations || []).filter(item => {
+        if (!conversationSearch) return true;
+        return (item.title || "").toLowerCase().includes(conversationSearch.toLowerCase());
+      });
+      if (!filtered.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty-conversations";
+        empty.textContent = conversations.length
+          ? "没有匹配的会话。"
+          : "还没有历史对话，点击“新建对话”后开始提问。";
+        el.appendChild(empty);
+        return;
+      }
+      filtered.forEach(item => {
+        const card = document.createElement("div");
+        card.className = "conversation-item" + (item.conversation_id === conversationId ? " active" : "");
+        card.innerHTML = `
+          <div class="conversation-row">
+            <div class="conversation-meta">
+              <div class="conversation-title">${escapeHtml(item.title || "新对话")}</div>
+              <div class="conversation-time">${escapeHtml(formatUpdatedAt(item.updated_at || ""))}</div>
+            </div>
+            <div class="conversation-actions">
+              <button type="button" data-action="rename" title="重命名">改名</button>
+              <button type="button" data-action="delete" class="delete" title="删除">删</button>
+            </div>
+          </div>
+        `;
+        card.addEventListener("click", async () => {
+          conversationId = item.conversation_id;
+          persistConversationId();
+          renderConversationList();
+          await loadConversationHistory();
+        });
+        card.querySelector('[data-action="rename"]').addEventListener("click", async (e) => {
+          e.stopPropagation();
+          await renameConversation(item);
+        });
+        card.querySelector('[data-action="delete"]').addEventListener("click", async (e) => {
+          e.stopPropagation();
+          await deleteConversation(item);
+        });
+        el.appendChild(card);
+      });
+    }
+
+    async function loadConversationList() {
+      try {
+        const r = await fetch(API + "/chat/conversations");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "加载会话列表失败");
+        conversations = data.conversations || [];
+        renderConversationList();
+      } catch (err) {
+        console.warn("加载会话列表失败", err);
+      }
+    }
+
+    async function renameConversation(item) {
+      const nextTitle = window.prompt("请输入新的会话标题", item.title || "新对话");
+      if (nextTitle == null) return;
+      const title = nextTitle.trim();
+      if (!title) return;
+      try {
+        const r = await fetch(API + "/chat/conversations/title", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ conversation_id: item.conversation_id, title }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "重命名失败");
+        await loadConversationList();
+      } catch (err) {
+        window.alert(err.message || "重命名失败");
+      }
+    }
+
+    async function deleteConversation(item) {
+      if (!window.confirm(`确定删除会话「${item.title || "新对话"}」吗？`)) return;
+      try {
+        const r = await fetch(API + "/chat/conversations/" + encodeURIComponent(item.conversation_id), {
+          method: "DELETE",
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "删除失败");
+        if (conversationId === item.conversation_id) {
+          conversationId = null;
+          persistConversationId();
+          clearMessages();
+        }
+        await loadConversationList();
+      } catch (err) {
+        window.alert(err.message || "删除失败");
+      }
+    }
+
+    function persistConversationId() {
+      if (conversationId) localStorage.setItem(CONVERSATION_ID_KEY, conversationId);
+      else localStorage.removeItem(CONVERSATION_ID_KEY);
+    }
+
+    // ---------- Text2SQL 表结构审核 ----------
+    let schemaData = { tables: [], relations: [] };
+
+    document.getElementById("schemaLoadBtn").addEventListener("click", async () => {
+      const status = document.getElementById("schemaStatus");
+      const content = document.getElementById("schemaContent");
+      const submitArea = document.getElementById("schemaSubmitArea");
+      status.textContent = "加载中…";
+      content.style.display = "none";
+      try {
+        const r = await fetch(API + "/text2sql/schema");
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "加载失败");
+        schemaData = { tables: data.tables || [], relations: data.relations || [] };
+        renderSchema();
+        content.style.display = "block";
+        submitArea.style.display = "block";
+        status.textContent = "加载成功，可编辑表/列含义及表间关联后保存。";
+      } catch (err) {
+        status.textContent = err.message || "加载失败";
+      }
+    });
+
+    function renderSchema() {
+      const el = document.getElementById("schemaContent");
+      el.innerHTML = "";
+
+      schemaData.tables.forEach((t, ti) => {
+        const div = document.createElement("div");
+        div.className = "schema-table";
+        div.innerHTML = `
+          <h3>表: ${escapeHtml(t.name)}</h3>
+          <p style="margin:0.5rem 1rem;"><label>表含义 <input type="text" data-table-comment="${escapeHtml(t.name)}" value="${escapeHtml(t.comment || "")}" placeholder="如：进出口统计表" class="table-comment" /></label></p>
+          <table><thead><tr><th>列名</th><th>类型</th><th>含义</th></tr></thead><tbody></tbody></table>
+        `;
+        const tbody = div.querySelector("tbody");
+        (t.columns || []).forEach((c, ci) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td><input type="text" value="${escapeHtml(c.name)}" readonly /></td>
+            <td><input type="text" value="${escapeHtml(c.dtype)}" readonly /></td>
+            <td><input type="text" data-table="${escapeHtml(t.name)}" data-column="${escapeHtml(c.name)}" value="${escapeHtml(c.comment || "")}" placeholder="字段含义" class="column-comment" /></td>
+          `;
+          tbody.appendChild(tr);
+        });
+        el.appendChild(div);
+      });
+
+      const relDiv = document.createElement("div");
+      relDiv.className = "schema-table";
+      relDiv.innerHTML = `
+        <h3>表间关联（人工整理，将仅以此喂给大模型）</h3>
+        <p style="margin:0.5rem 1rem; font-size:0.9rem; color:#666;">每行一条关联：左表.左列 = 右表.右列，多表查询时会强制按此 JOIN，严禁笛卡尔积。</p>
+        <table class="relations-table"><thead><tr><th>左表</th><th>左列</th><th>右表</th><th>右列</th><th></th></tr></thead><tbody id="relationsTbody"></tbody></table>
+        <div class="schema-actions"><button type="button" class="btn-small" id="addRelationBtn">+ 添加关联</button></div>
+      `;
+      const relTbody = relDiv.querySelector("#relationsTbody");
+      const rels = schemaData.relations || [];
+      if (rels.length === 0)
+        relTbody.appendChild(relationRow("", "", "", "", 0));
+      else
+        rels.forEach((r, i) => { relTbody.appendChild(relationRow(r.left_table, r.left_column, r.right_table, r.right_column, i)); });
+      el.appendChild(relDiv);
+
+      document.getElementById("addRelationBtn").addEventListener("click", () => {
+        relTbody.appendChild(relationRow("", "", "", "", schemaData.relations.length));
+      });
+    }
+
+    function relationRow(lt, lc, rt, rc, i) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td><input type="text" data-relation-left-table value="${escapeHtml(lt)}" placeholder="左表名" /></td>
+        <td><input type="text" data-relation-left-column value="${escapeHtml(lc)}" placeholder="左列名" /></td>
+        <td><input type="text" data-relation-right-table value="${escapeHtml(rt)}" placeholder="右表名" /></td>
+        <td><input type="text" data-relation-right-column value="${escapeHtml(rc)}" placeholder="右列名" /></td>
+        <td><button type="button" class="btn-small del" data-remove-relation>删除</button></td>
+      `;
+      tr.querySelector("[data-remove-relation]").addEventListener("click", () => tr.remove());
+      return tr;
+    }
+
+    function escapeHtml(s) {
+      if (s == null) return "";
+      const div = document.createElement("div");
+      div.textContent = s;
+      return div.innerHTML;
+    }
+
+    document.getElementById("schemaSubmitBtn").addEventListener("click", async () => {
+      const content = document.getElementById("schemaContent");
+      const table_comments = {};
+      const column_comments = {};
+      content.querySelectorAll(".table-comment").forEach(input => {
+        const name = input.dataset.tableComment;
+        if (name) table_comments[name] = input.value.trim();
+      });
+      content.querySelectorAll(".column-comment").forEach(input => {
+        const t = input.dataset.table, c = input.dataset.column;
+        if (t && c) {
+          if (!column_comments[t]) column_comments[t] = {};
+          column_comments[t][c] = input.value.trim();
+        }
+      });
+      const relations = [];
+      content.querySelectorAll("#relationsTbody tr").forEach(tr => {
+        const lt = tr.querySelector("[data-relation-left-table]")?.value?.trim();
+        const lc = tr.querySelector("[data-relation-left-column]")?.value?.trim();
+        const rt = tr.querySelector("[data-relation-right-table]")?.value?.trim();
+        const rc = tr.querySelector("[data-relation-right-column]")?.value?.trim();
+        if (lt && lc && rt && rc) relations.push({ left_table: lt, left_column: lc, right_table: rt, right_column: rc });
+      });
+      const status = document.getElementById("schemaStatus");
+      try {
+        const r = await fetch(API + "/text2sql/schema", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ table_comments, column_comments, relations }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "保存失败");
+        status.textContent = data.message || "已保存。";
+      } catch (err) {
+        status.textContent = err.message || "保存失败";
+      }
+    });
+
+    document.getElementById("send").addEventListener("click", async () => {
+      const input = document.getElementById("input");
+      const text = input.value?.trim();
+      if (!text) return;
+      addMsg("user", text);
+      input.value = "";
+      try {
+        const r = await fetch(API + "/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text, conversation_id: conversationId || undefined }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || "请求失败");
+        conversationId = data.conversation_id;
+        persistConversationId();
+        addMsg("assistant", data.reply || "", { observationId: data.observation_id || "" });
+        await loadConversationList();
+        await loadQaAnalytics();
+      } catch (err) {
+        addMsg("assistant", "错误: " + (err.message || "请求失败"));
+      }
+    });
+
+    document.getElementById("clearChat").addEventListener("click", () => {
+      conversationId = null;
+      persistConversationId();
+      clearMessages();
+      renderConversationList();
+    });
+
+    document.getElementById("conversationSearch").addEventListener("input", (e) => {
+      conversationSearch = e.target.value || "";
+      renderConversationList();
+    });
+
+    document.getElementById("loadAnalyticsBtn").addEventListener("click", loadQaAnalytics);
+    document.getElementById("loadOpsStatusBtn").addEventListener("click", loadOpsStatus);
+
+    loadConversationList().then(loadConversationHistory);
+    loadQaAnalytics();
+    loadOpsStatus();
+    startOpsAutoRefresh();
+  </script>
+</body>
+</html>

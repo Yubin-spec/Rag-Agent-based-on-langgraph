@@ -1,0 +1,35 @@
+# LangGraph & LangChain
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-core>=0.3.0
+
+# LLM：仅用 DeepSeek（通过 OpenAI 兼容接口），禁止使用 OpenAI 模型
+openai>=1.0.0
+langchain-openai>=0.2.0
+sentence-transformers>=3.0.0
+FlagEmbedding>=1.2.0
+
+# Vector DB & Retrieval
+pymilvus>=2.4.0
+rank_bm25>=0.2.2
+
+# Text2SQL / DB
+sqlalchemy>=2.0.0
+
+# Document (MinerU optional, basic version can use placeholder)
+# mineru  # uncomment when using MinerU
+
+# API & Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+
+# Cache
+redis>=5.0.0
+
+# Utils
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+pyyaml>=6.0.0
