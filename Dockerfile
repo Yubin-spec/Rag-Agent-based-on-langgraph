@@ -28,5 +28,5 @@ ENV PYTHONPATH=/app
 
 EXPOSE 8000
 
-# 生产环境不用 reload
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 生产环境：多 worker 时通过环境变量 UVICORN_WORKERS 指定（默认 1）
+CMD ["sh", "-c", "exec uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-1}"]

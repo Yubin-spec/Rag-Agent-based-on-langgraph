@@ -255,6 +255,74 @@ class KnowledgeEngine:
             else last_answer
         )
 
+    async def _generate_grounded_answer_async(
+        self,
+        question: str,
+        rag_result: RAGRetrieveResult,
+        trace: Optional[KnowledgeQueryTrace] = None,
+    ) -> str:
+        """
+        异步版：用 ainvoke 生成答案，不占线程池，便于高并发。逻辑与 _generate_grounded_answer 一致。
+        """
+        context = self._build_rag_context(rag_result)
+        if not context.strip():
+            if trace is not None:
+                trace.final_status = "rag_no_context"
+                trace.fallback_reason = "empty_context"
+            return "未找到相关知识，建议您换个问法或转人工客服。"
+
+        settings = get_settings()
+        min_score = float(getattr(settings, "rag_answer_grounding_min_score", 0.18))
+        max_times = max(1, int(getattr(settings, "rag_answer_max_regenerate_times", 3)))
+        selected_templates = select_prompt_templates(question)
+        scenario_guidance = render_prompt_template_guidance(question)
+        if trace is not None:
+            trace.scenario_templates = [item.name for item in selected_templates]
+        retry_note = ""
+        last_answer = ""
+        last_score = 0.0
+        for attempt in range(max_times):
+            try:
+                resp = await self._rag_chain.ainvoke(
+                    {
+                        "context": context,
+                        "question": question,
+                        "scenario_guidance": scenario_guidance,
+                        "retry_note": retry_note,
+                    }
+                )
+                answer_text = (resp.content or "").strip()
+            except Exception:
+                answer_text = ""
+            if not answer_text:
+                answer_text = "根据当前检索结果无法确认，建议您补充问题或转人工客服。"
+            score = self._answer_grounding_score(answer_text, rag_result)
+            has_citations = self._answer_has_evidence_citations(answer_text)
+            last_answer = answer_text
+            last_score = score
+            if trace is not None:
+                trace.grounding_score = score
+                trace.has_evidence_citations = has_citations
+                trace.regenerate_count = attempt
+            if score >= min_score and has_citations:
+                if trace is not None:
+                    trace.final_status = "rag_regenerated" if attempt > 0 else "rag_grounded"
+                return answer_text
+            citation_note = "上一版答案缺少证据编号，请在每个关键结论后补充 [证据N]。" if not has_citations else ""
+            retry_note = (
+                f"上一版答案与参考内容关联度过低（score={score:.3f} < {min_score:.3f}），"
+                "请仅保留能直接从参考内容中得到的事实，删除无法从参考内容明确支持的表述后重新回答。"
+                + citation_note
+            )
+        if trace is not None:
+            trace.final_status = "rag_fallback_unconfirmed"
+            trace.fallback_reason = "low_grounding_after_regeneration"
+        return (
+            "根据当前检索结果无法确认，建议您补充更具体的问题或转人工客服。"
+            if last_score < min_score
+            else last_answer
+        )
+
     def query(self, question: str) -> Tuple[str, Optional[str]]:
         """
         依次尝试 QA、Text2SQL、RAG，返回 (回复文案, 待确认 SQL 或 None)。
@@ -370,8 +438,49 @@ class KnowledgeEngine:
                 yield chunk
 
     async def aquery(self, question: str) -> Tuple[str, Optional[str]]:
-        """异步：在线程池中执行 query，不阻塞事件循环。返回 (回复文案, 待确认 SQL 或 None)。"""
-        return await asyncio.to_thread(self.query, question)
+        """
+        异步：分步执行，仅 CPU/同步 IO 用线程池，RAG 生成用 ainvoke 不占线程，支持高并发。
+        返回 (回复文案, 待确认 SQL 或 None)。
+        """
+        trace = self._reset_trace()
+        # 1) QA
+        answer = await asyncio.to_thread(self.qa.find, question)
+        if answer:
+            trace.route = "qa"
+            trace.final_status = "qa_hit"
+            return (answer, None)
+        # 2) Text2SQL
+        result = await asyncio.to_thread(self.text2sql.query, question)
+        if result is not None:
+            trace.route = "text2sql"
+            if isinstance(result, Text2SQLConfirmRequired):
+                trace.final_status = "text2sql_pending"
+                trace.pending_sql = True
+                return (result.message, result.sql)
+            trace.final_status = "text2sql_answer"
+            return (result, None)
+        # 3) RAG：检索在线程池，生成用 ainvoke
+        trace.route = "rag"
+        rag_result = await asyncio.to_thread(
+            self.rag.retrieve_with_validation,
+            question, top_k=10, use_rerank=True, rerank_top=5,
+        )
+        trace.retrieve_attempt = rag_result.attempt
+        trace.source_count = len(rag_result.chunks)
+        trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))
+        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))
+        if rag_result.evals:
+            trace.top_match_score = max(e.match_score for e in rag_result.evals if e is not None)
+            trace.top_normalized_score = max(e.normalized_score for e in rag_result.evals if e is not None)
+        if not rag_result.chunks:
+            trace.final_status = "rag_no_hit"
+            trace.fallback_reason = "no_retrieval_hit"
+            return ("未找到相关知识，建议您换个问法或转人工客服。", None)
+        answer_text = await self._generate_grounded_answer_async(question, rag_result, trace=trace)
+        sources_block = _format_sources(rag_result)
+        if sources_block:
+            return (answer_text + "\n\n" + sources_block, None)
+        return (answer_text, None)
 
     async def aquery_stream(
         self, question: str, pending_sql_out: Optional[List[str]] = None
@@ -427,7 +536,7 @@ class KnowledgeEngine:
                 yield chunk
             return
 
-        answer_text = await asyncio.to_thread(self._generate_grounded_answer, question, rag_result, trace)
+        answer_text = await self._generate_grounded_answer_async(question, rag_result, trace)
         for c in self._yield_text_chunked(answer_text):
             yield c
 

@@ -1,8 +1,10 @@
 # src/agents/supervisor.py
 """
 总控（Supervisor）节点：根据用户最后一句话路由到「闲聊」或「知识库」子智能体。
-使用的大模型仅限 DeepSeek（通过 src.llm.get_deepseek_llm），不调用 OpenAI。
+采用混合规则：规则预判（明显闲聊/明显知识库）→ 歧义时再调用 DeepSeek 推理。仅使用 DeepSeek，不调用 OpenAI。
 """
+from typing import Optional
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -14,6 +16,37 @@ from .context_summary import summarize_old_messages_async
 _settings = get_settings()
 # 仅使用 DeepSeek，禁止 OpenAI
 _llm = get_deepseek_llm(temperature=0)
+
+# ---------- 混合规则：规则命中则直接路由，否则交 LLM ----------
+# 命中任一词即判为知识库（海关/政策/数据等业务相关）
+KNOWLEDGE_KEYWORDS = (
+    "海关", "申报", "AEO", "政策", "材料", "查询", "数据", "进出口", "认证", "口岸",
+    "关税", "通关", "企业", "备案", "审批", "流程", "规定", "办法", "条例", "资质",
+)
+# 精确匹配则判为闲聊（打招呼/感谢/引导）
+CHAT_PHRASES = frozenset([
+    "你好", "您好", "嗨", "谢谢", "多谢", "感谢", "再见", "拜拜", "在吗", "有什么功能",
+    "怎么用", "帮助", "干啥的", "你是谁", "你好呀", "您好呀", "谢谢啊", "在", "好", "嗯",
+])
+
+
+def _rule_based_intent(last: str) -> Optional[str]:
+    """
+    规则预判：明显闲聊或明显知识库则直接返回路由，歧义返回 None 交 LLM。
+    """
+    if not last or not last.strip():
+        return "chat"
+    text = last.strip()
+    # 1) 含业务词 → knowledge
+    for kw in KNOWLEDGE_KEYWORDS:
+        if kw in text:
+            return "knowledge"
+    # 2) 纯闲聊短语（精确匹配）→ chat
+    if text in CHAT_PHRASES:
+        return "chat"
+    # 3) 歧义，交给 LLM
+    return None
+
 
 # 总控仅需输出一个路由词，故 temperature=0
 _SUPERVISOR_PROMPT = ChatPromptTemplate.from_messages([
@@ -65,16 +98,17 @@ async def _messages_for_llm_with_summary(state: AgentState) -> list:
 
 def supervisor_node(state: AgentState) -> dict:
     """
-    总控节点（同步）：根据当前对话决定下一跳（chat / knowledge / __end__）。
-    通过 DeepSeek 判断用户意图，仅返回路由目标，不调用 OpenAI。
+    总控节点（同步）：混合规则 + LLM。规则能判则直接路由，歧义时用 DeepSeek 判断。
     """
     last = _get_last_user_text(state)
     if not last:
         return {"next": "chat"}
+    intent = _rule_based_intent(last)
+    if intent is not None:
+        return {"next": intent}
 
     chain = _SUPERVISOR_PROMPT | _llm
     response = chain.invoke({"messages": _messages_for_llm(state)})
-    # 仅当回复明确包含 knowledge 时走知识库，其余（含 chat、模糊）走闲聊
     out = (response.content or "").strip().lower()
     if "knowledge" in out:
         next_action: NextAction = "knowledge"
@@ -91,12 +125,15 @@ def _is_retryable_error(e: Exception) -> bool:
 
 async def supervisor_node_async(state: AgentState) -> dict:
     """
-    总控节点（异步）：不阻塞事件循环，支持高并发。
+    总控节点（异步）：混合规则 + LLM。规则能判则直接路由不调模型，歧义时再调 DeepSeek。
     异常时返回需人工提示并结束本轮；可重试错误会重试若干次。
     """
     last = _get_last_user_text(state)
     if not last:
         return {"next": "chat"}
+    intent = _rule_based_intent(last)
+    if intent is not None:
+        return {"next": intent}
 
     chain = _SUPERVISOR_PROMPT | _llm
     max_retries = max(0, getattr(_settings, "agent_llm_retry_times", 2))

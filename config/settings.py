@@ -68,6 +68,7 @@ class Settings(BaseSettings):
     text2sql_database_uri: str = "sqlite:///./data/kb.db"
     text2sql_schema_refresh_interval_seconds: int = 3600  # 1 小时检测 schema 是否变更并重新扫描
     text2sql_schema_overrides_path: str = "./data/text2sql_schema_overrides.json"  # 人工审核的表/列含义及表间关联
+    text2sql_default_limit: int = 500  # SELECT 无 LIMIT 时自动追加的上限，避免大表全表扫；0 表示不自动加
 
     # ---------- MinerU 文档解析（本地部署版） ----------
     # MinerU 本地部署时填写本地服务地址，如 http://127.0.0.1:8001；为空则使用占位解析（仅文本+切块）
@@ -95,10 +96,21 @@ class Settings(BaseSettings):
     agent_llm_retry_times: int = 2  # LLM 调用失败时重试次数（如超时、5xx）
     agent_need_human_reply: str = "当前服务暂时异常，请稍后重试或转人工客服。"  # 节点异常时统一提示
 
+    # ---------- 异步高并发 ----------
+    # 线程池大小：asyncio.to_thread 使用的默认 executor 的 max_workers；0 表示使用 Python 默认（约 min(32, cpu+4)）
+    asyncio_thread_pool_workers: int = 0
+    # Uvicorn 进程 worker 数；仅在生产启动（无 reload）时生效，默认 1。>1 时需配合负载均衡「会话保持」使用（见 docs/ASYNC_CONCURRENCY.md）
+    uvicorn_workers: int = 7
+
     # ---------- 问答缓存（Redis） ----------
     redis_url: str = "redis://localhost:6379/0"  # 为空或连接失败时不使用缓存
     answer_cache_ttl_seconds: int = 86400  # 缓存 TTL，默认 24 小时
     answer_cache_enabled: bool = True  # 是否启用问答缓存
+    answer_cache_max_value_bytes: int = 0  # 单条答案最大缓存字节数，0 表示不限制；超长不写入避免占满内存
+    redis_max_connections: int = 10  # 连接池最大连接数，高并发时可调大
+    redis_socket_connect_timeout: float = 2.0  # 建连超时（秒）
+    redis_socket_timeout: float = 5.0  # 读写超时（秒）
+    redis_health_check_interval: int = 30  # 连接池健康检查间隔（秒），0 表示不检查
 
     # ---------- PostgreSQL 探活 ----------
     postgresql_keepalive_uri: str = ""  # 为空则不探活；设为 postgresql://... 时每分钟执行 SELECT 1 保持连接可用

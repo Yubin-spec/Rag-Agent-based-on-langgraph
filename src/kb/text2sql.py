@@ -3,8 +3,10 @@
 结构化数据查询：自然语言转 SQL，带 schema 读取/定时检测、意图学习、SQL 约束与校验、执行报错区分、答案生成。
 - 大模型仅限 DeepSeek（src.llm.get_deepseek_llm），不调用 OpenAI。
 - 只允许 SELECT；删除等需人工确认；SQL 语法错误时重试最多 3 次；多表必须按关联字段 JOIN，严禁笛卡尔积。
+- 时间范围不明确时：解析问句中的时间表述（今年、去年、最近N月等）为具体日期区间并注入 prompt，便于生成正确的 WHERE 条件。
 """
 import re
+from datetime import date, timedelta
 from typing import Optional, List, Tuple, Union
 from dataclasses import dataclass, field
 
@@ -49,6 +51,135 @@ def _normalize_question_for_intent(q: str) -> str:
     """用于意图缓存的问句归一化（去空格、小写、保留关键 token）。"""
     s = re.sub(r"\s+", "", q.strip().lower())
     return s[:200]
+
+
+# ---------- 时间范围解析：用户问句中的模糊时间 → 具体日期区间，注入 prompt ----------
+@dataclass
+class ResolvedTimeRange:
+    """解析出的时间范围，用于在 SQL 生成时约束日期列。"""
+    start_date: str  # YYYY-MM-DD
+    end_date: str
+    hint: str  # 如「去年」「最近三个月」
+
+
+def resolve_time_range_from_question(question: str, reference: Optional[date] = None) -> Optional[ResolvedTimeRange]:
+    """
+    从用户问句中解析时间范围。若识别到明确的时间表述则返回 (start, end, hint)，否则返回 None。
+    reference 默认为今天，用于「今年」「上月」「最近N天」等相对时间。
+    """
+    ref = reference or date.today()
+    q = question.strip()
+
+    # 最近 N 天/月/年（优先匹配更具体的）
+    m = re.search(r"最近\s*(\d+)\s*天", q)
+    if m:
+        n = min(int(m.group(1)), 366)
+        start = ref - timedelta(days=n)
+        return ResolvedTimeRange(start.isoformat(), ref.isoformat(), f"最近{m.group(1)}天")
+
+    m = re.search(r"最近\s*(\d+)\s*个?月", q)
+    if m:
+        n = min(int(m.group(1)), 24)
+        y, mo = ref.year, ref.month
+        mo -= n
+        while mo <= 0:
+            mo += 12
+            y -= 1
+        start = date(y, mo, 1)
+        return ResolvedTimeRange(start.isoformat(), ref.isoformat(), f"最近{m.group(1)}个月")
+
+    m = re.search(r"最近\s*(\d+)\s*年", q)
+    if m:
+        n = min(int(m.group(1)), 10)
+        start = date(ref.year - n, 1, 1)
+        return ResolvedTimeRange(start.isoformat(), ref.isoformat(), f"最近{m.group(1)}年")
+
+    # 今年、去年、前年
+    if "今年" in q:
+        return ResolvedTimeRange(
+            date(ref.year, 1, 1).isoformat(),
+            date(ref.year, 12, 31).isoformat(),
+            "今年",
+        )
+    if "去年" in q or "上年" in q:
+        y = ref.year - 1
+        return ResolvedTimeRange(date(y, 1, 1).isoformat(), date(y, 12, 31).isoformat(), "去年")
+    if "前年" in q:
+        y = ref.year - 2
+        return ResolvedTimeRange(date(y, 1, 1).isoformat(), date(y, 12, 31).isoformat(), "前年")
+
+    # 本月、上月
+    if "本月" in q or "这个月" in q:
+        start = date(ref.year, ref.month, 1)
+        if ref.month == 12:
+            end = date(ref.year, 12, 31)
+        else:
+            end = date(ref.year, ref.month + 1, 1) - timedelta(days=1)
+        return ResolvedTimeRange(start.isoformat(), end.isoformat(), "本月")
+    if "上月" in q or "上个月" in q:
+        if ref.month == 1:
+            y, mo = ref.year - 1, 12
+        else:
+            y, mo = ref.year, ref.month - 1
+        start = date(y, mo, 1)
+        if mo == 12:
+            end = date(y, 12, 31)
+        else:
+            end = date(y, mo + 1, 1) - timedelta(days=1)
+        return ResolvedTimeRange(start.isoformat(), end.isoformat(), "上月")
+
+    # 上半年、下半年（默认当年）
+    if "上半年" in q:
+        return ResolvedTimeRange(
+            date(ref.year, 1, 1).isoformat(),
+            date(ref.year, 6, 30).isoformat(),
+            "今年上半年",
+        )
+    if "下半年" in q:
+        return ResolvedTimeRange(
+            date(ref.year, 7, 1).isoformat(),
+            date(ref.year, 12, 31).isoformat(),
+            "今年下半年",
+        )
+
+    # 明确年份：2024年、2023年
+    m = re.search(r"(20\d{2})\s*年", q)
+    if m:
+        y = int(m.group(1))
+        if 2000 <= y <= 2100:
+            return ResolvedTimeRange(
+                date(y, 1, 1).isoformat(),
+                date(y, 12, 31).isoformat(),
+                f"{y}年",
+            )
+
+    # Q1/Q2/Q3/Q4（默认今年）
+    if "q1" in q.lower() or "一季度" in q or "第一季度" in q:
+        return ResolvedTimeRange(
+            date(ref.year, 1, 1).isoformat(),
+            date(ref.year, 3, 31).isoformat(),
+            "今年第一季度",
+        )
+    if "q2" in q.lower() or "二季度" in q or "第二季度" in q:
+        return ResolvedTimeRange(
+            date(ref.year, 4, 1).isoformat(),
+            date(ref.year, 6, 30).isoformat(),
+            "今年第二季度",
+        )
+    if "q3" in q.lower() or "三季度" in q or "第三季度" in q:
+        return ResolvedTimeRange(
+            date(ref.year, 7, 1).isoformat(),
+            date(ref.year, 9, 30).isoformat(),
+            "今年第三季度",
+        )
+    if "q4" in q.lower() or "四季度" in q or "第四季度" in q:
+        return ResolvedTimeRange(
+            date(ref.year, 10, 1).isoformat(),
+            date(ref.year, 12, 31).isoformat(),
+            "今年第四季度",
+        )
+
+    return None
 
 
 # ---------- 意图学习：根据历史成功查询记录，推荐使用的表 ----------
@@ -136,6 +267,21 @@ def _validate_sql_syntax(sql: str, database_uri: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
+def _ensure_limit(sql: str, default_limit: int) -> str:
+    """
+    SELECT 若无 LIMIT 且 default_limit > 0，则追加 LIMIT N，避免大表全表扫描。
+    已有 LIMIT 或非 SELECT 不修改。
+    """
+    if default_limit <= 0:
+        return sql
+    s = sql.strip().rstrip(";")
+    if not s.upper().startswith("SELECT"):
+        return sql
+    if re.search(r"\bLIMIT\s+\d+", s, re.IGNORECASE):
+        return sql
+    return s + f" LIMIT {default_limit}"
+
+
 def _execute_sql(sql: str, database_uri: str) -> ExecuteResult:
     """执行 SQL 并返回结果；用于 SELECT 或人工确认后的 DELETE/UPDATE。区分字段/表错误与其它异常。"""
     try:
@@ -152,11 +298,22 @@ def _execute_sql(sql: str, database_uri: str) -> ExecuteResult:
 
 
 # ---------- Prompt 与生成 ----------
-def _build_schema_block(schema_text: str, suggested_tables: Optional[List[str]] = None) -> str:
-    """schema_text 即 context：内含表结构、表/列含义、人工整理的表间关联（表间关联部分会强制校验）。"""
+def _build_schema_block(
+    schema_text: str,
+    suggested_tables: Optional[List[str]] = None,
+    time_range: Optional[ResolvedTimeRange] = None,
+) -> str:
+    """schema_text 即 context：内含表结构、表/列含义、人工整理的表间关联；可选注入时间范围与建议表。"""
     parts = [schema_text]
     if suggested_tables:
         parts.append("\n根据历史类似问题，建议优先考虑的表: " + ", ".join(suggested_tables))
+    if time_range:
+        parts.append(
+            f"\n【时间范围】用户问句中的时间已解析为：开始 {time_range.start_date}，结束 {time_range.end_date}（对应「{time_range.hint}」）。"
+            "生成 SQL 时请对日期/时间类型列使用该范围过滤，例如 WHERE 日期列 >= '{start}' AND 日期列 <= '{end}'。".format(
+                start=time_range.start_date, end=time_range.end_date
+            )
+        )
     return "\n".join(parts)
 
 
@@ -282,7 +439,8 @@ class Text2SQL:
         # 表关联放在 context 里喂给大模型：schema_text 内含「表间关联」列表（仅人工整理），作为 system 的 {schema_block}
         schema_text = self._schema_cache.get_schema()
         suggested_tables = self._intent_store.suggest_tables(question)
-        schema_block = _build_schema_block(schema_text, suggested_tables)
+        time_range = resolve_time_range_from_question(question)
+        schema_block = _build_schema_block(schema_text, suggested_tables, time_range)
         # 人工关联列表用于后续校验：多表 SQL 必须使用其中至少一条，否则拒绝
         overrides = load_schema_overrides(self._settings.text2sql_schema_overrides_path)
         human_relations = overrides_to_relations(overrides.get("relations") or [])
@@ -323,7 +481,32 @@ class Text2SQL:
         else:
             return f"多次尝试后仍无法生成合法 SQL。最后错误：{last_syntax_error}"
 
+        # LIMIT 保护：无 LIMIT 的 SELECT 自动追加上限，避免大表全表扫
+        default_limit = max(0, getattr(self._settings, "text2sql_default_limit", 0))
+        sql = _ensure_limit(sql, default_limit)
+
         ex = _execute_sql(sql, uri)
+        # 执行错误（列名/表名不匹配等）时重试 1 次：把错误注入 prompt 让模型修正
+        if not ex.ok and ex.error_type == "field_mismatch":
+            schema_block = schema_block + f"\n\n上一轮执行错误：{ex.error_message}\n请修正列名或表名后只输出一条 SELECT。"
+            try:
+                out = self._chain_sql.invoke({"schema_block": schema_block, "question": question})
+                raw = (out.content or "").strip()
+                if "CANNOT_ANSWER" not in raw:
+                    sql_retry = re.sub(r"^```\w*\n?", "", raw)
+                    sql_retry = re.sub(r"\n?```\s*$", "", sql_retry).strip()
+                    if sql_retry:
+                        ok1, _ = _validate_sql_select_only(sql_retry)
+                        ok2, _ = _validate_sql_syntax(sql_retry, uri)
+                        ok3, _ = _validate_sql_uses_relations(sql_retry, human_relations)
+                        if ok1 and ok2 and ok3:
+                            sql_retry = _ensure_limit(sql_retry, default_limit)
+                            ex = _execute_sql(sql_retry, uri)
+                            if ex.ok:
+                                sql = sql_retry
+            except Exception:
+                pass
+
         if not ex.ok:
             if ex.error_type == "field_mismatch":
                 return f"查询失败（字段或表不匹配）：{ex.error_message}"

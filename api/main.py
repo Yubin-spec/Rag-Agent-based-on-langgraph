@@ -43,7 +43,7 @@ from src.agents.supervisor import supervisor_node_async
 from src.agents.chat_agent import chat_agent_stream_async
 from src.kb.engine import KnowledgeEngine
 from src.kb.schema_loader import read_db_schema, load_schema_overrides, save_schema_overrides
-from src.answer_cache import get_cached_answer, set_cached_answer
+from src.answer_cache import get_cached_answer, set_cached_answer, close_redis_connection
 from src.chat_history import (
     load_messages as chat_history_load,
     append_messages as chat_history_append,
@@ -124,9 +124,16 @@ async def _postgresql_keepalive_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：启动时建对话历史表（若配置）、启动 PostgreSQL 探活任务，关闭时取消。"""
+    """应用生命周期：启动时建对话历史表（若配置）、可选设置线程池大小、启动 PostgreSQL 探活任务，关闭时取消。"""
     keepalive_task = None
     settings = get_settings()
+    # 异步高并发：可选扩大 to_thread 使用的线程池，避免大量并发时排队
+    n = getattr(settings, "asyncio_thread_pool_workers", 0)
+    if n > 0:
+        from concurrent.futures import ThreadPoolExecutor
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=n))
+        logger.info("asyncio 默认线程池已设置为 max_workers=%s", n)
     chat_uri = (getattr(settings, "chat_history_postgresql_uri", None) or "").strip()
     if chat_uri and "postgresql" in chat_uri.lower():
         await asyncio.to_thread(chat_history_ensure_table, chat_uri)
@@ -140,6 +147,7 @@ async def lifespan(app: FastAPI):
         keepalive_task = asyncio.create_task(_postgresql_keepalive_loop())
         logger.info("PostgreSQL 探活已启动，间隔 %s 秒", getattr(settings, "postgresql_keepalive_interval_seconds", 60))
     yield
+    await close_redis_connection()
     if keepalive_task and not keepalive_task.done():
         keepalive_task.cancel()
         try:

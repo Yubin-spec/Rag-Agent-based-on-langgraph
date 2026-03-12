@@ -11,6 +11,9 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    # 多 worker 时建议负载均衡做「会话保持」（同一 conversation_id 打到同一 worker）
+    environment:
+      - UVICORN_WORKERS=${UVICORN_WORKERS:-1}
     # 使用本 compose 的 Redis 时，在 .env 中设置 REDIS_URL=redis://redis:6379/0
     volumes:
       # 持久化：SQLite、上传文件、Schema 覆盖、高频 QA 数据

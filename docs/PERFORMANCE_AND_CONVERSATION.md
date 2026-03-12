@@ -33,6 +33,7 @@
   - 总控、闲聊在**异步路径**下使用 `_messages_for_llm_with_summary`，同步路径仍仅送最近 N 轮。
 - **配置**：`llm_context_window_turns = 10`、`llm_context_summarize_old = true`（可环境变量 `LLM_CONTEXT_SUMMARIZE_OLD` 关闭摘要）。
 - **知识库节点**：只用「当前这一条用户问题」做 QA/Text2SQL/RAG，不依赖历史消息，无需改。
+- **总控意图**：采用混合规则 + LLM（规则能判则直接路由，歧义时再调 DeepSeek），规则命中时不调用大模型，降低延迟与 token 消耗；详见 [意图与路由](INTENT_AND_ROUTING.md)。
 
 ### 2.4 异步与低延迟
 
