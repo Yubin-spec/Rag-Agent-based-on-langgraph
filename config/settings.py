@@ -107,6 +107,11 @@ class Settings(BaseSettings):
     answer_cache_ttl_seconds: int = 86400  # 缓存 TTL，默认 24 小时
     answer_cache_enabled: bool = True  # 是否启用问答缓存
     answer_cache_max_value_bytes: int = 0  # 单条答案最大缓存字节数，0 表示不限制；超长不写入避免占满内存
+    # 热 key：进程内 LRU 本地缓存条数，0 表示关闭；命中则不打 Redis，减轻热 key 压力
+    answer_cache_local_max_entries: int = 0
+    answer_cache_local_ttl_seconds: int = 60  # 本地缓存 TTL（秒），仅当 local_max_entries>0 时有效
+    # 防击穿：单飞锁分桶数，同一问题仅一个协程回源，其余等待后读缓存；建议 256～1024
+    answer_cache_single_flight_buckets: int = 256
     redis_max_connections: int = 10  # 连接池最大连接数，高并发时可调大
     redis_socket_connect_timeout: float = 2.0  # 建连超时（秒）
     redis_socket_timeout: float = 5.0  # 读写超时（秒）

@@ -43,7 +43,7 @@ from src.agents.supervisor import supervisor_node_async
 from src.agents.chat_agent import chat_agent_stream_async
 from src.kb.engine import KnowledgeEngine
 from src.kb.schema_loader import read_db_schema, load_schema_overrides, save_schema_overrides
-from src.answer_cache import get_cached_answer, set_cached_answer, close_redis_connection
+from src.answer_cache import answer_lock, get_cached_answer, set_cached_answer, close_redis_connection
 from src.chat_history import (
     load_messages as chat_history_load,
     append_messages as chat_history_append,
@@ -102,7 +102,7 @@ def _postgresql_ping(uri: str) -> None:
             conn.execute(text("SELECT 1"))
         engine.dispose()
     except Exception as e:
-        logger.warning("PostgreSQL 探活失败: %s", e)
+        logger.warning("PostgreSQL 探活失败（下次探活会重试）: %s", e)
 
 
 async def _postgresql_keepalive_loop() -> None:
@@ -119,7 +119,7 @@ async def _postgresql_keepalive_loop() -> None:
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.warning("PostgreSQL 探活任务异常: %s", e)
+            logger.warning("PostgreSQL 探活任务异常（下次探活会重试）: %s", e)
 
 
 @asynccontextmanager
@@ -920,68 +920,49 @@ async def chat(request: Request, req: ChatRequest):
             )
             return ChatResponse(reply=reply_exec, conversation_id=conversation_id, observation_id=observation_id)
 
-    messages = [HumanMessage(content=req.message)]
-    try:
-        result = await asyncio.wait_for(
-            graph.ainvoke({"messages": messages}, config),
-            timeout=float(getattr(settings, "agent_request_timeout_seconds", 120)),
-        )
-    except asyncio.TimeoutError:
-        observation_id = str(uuid.uuid4())
-        reply_text = "请求处理超时，您可以重新发送或转人工客服。"
-        await _save_qa_observation_async(
-            _build_observation_payload(
-                observation_id=observation_id,
-                thread_id=thread_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                question=req.message,
-                answer=reply_text,
-                route="timeout",
-                response_mode="sync",
-                success=False,
-                latency_ms=int((time.perf_counter() - started_at) * 1000),
-                fallback_reason="timeout",
-            )
-        )
-        return ChatResponse(
-            reply=reply_text,
-            conversation_id=conversation_id,
-            observation_id=observation_id,
-        )
-    except asyncio.CancelledError:
-        observation_id = str(uuid.uuid4())
-        reply_text = "请求已取消。"
-        await _save_qa_observation_async(
-            _build_observation_payload(
-                observation_id=observation_id,
-                thread_id=thread_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                question=req.message,
-                answer=reply_text,
-                route="cancelled",
-                response_mode="sync",
-                success=False,
-                latency_ms=int((time.perf_counter() - started_at) * 1000),
-                fallback_reason="cancelled",
-            )
-        )
-        return ChatResponse(
-            reply=reply_text,
-            conversation_id=conversation_id,
-            observation_id=observation_id,
-        )
-    # 图返回 __interrupt__ 表示进入人工节点：把提示语返回用户，并记录 thread_id 以便下次先 resume
-    if result.get("__interrupt__"):
-        interrupts = result["__interrupt__"]
-        if interrupts:
+    # 防击穿：同一问题仅一个协程回源，持锁后再次查缓存再决定是否走图
+    async with answer_lock(req.message):
+        cached = await get_cached_answer(req.message)
+        if cached is not None:
             observation_id = str(uuid.uuid4())
-            payload = getattr(interrupts[0], "value", interrupts[0])
-            reply = payload.get("human_message", payload) if isinstance(payload, dict) else str(payload)
-            _interrupted_threads.add(thread_id)
-            await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
-            reply_text = reply or "已转人工客服，请稍候。"
+            if hasattr(graph, "aupdate_state"):
+                await graph.aupdate_state(
+                    config,
+                    {"messages": [HumanMessage(content=req.message), AIMessage(content=cached)]},
+                )
+            else:
+                await asyncio.to_thread(
+                    graph.update_state,
+                    config,
+                    {"messages": [HumanMessage(content=req.message), AIMessage(content=cached)]},
+                )
+            await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)
+            await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [HumanMessage(content=req.message), AIMessage(content=cached)])
+            await _save_qa_observation_async(
+                _build_observation_payload(
+                    observation_id=observation_id,
+                    thread_id=thread_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    question=req.message,
+                    answer=cached,
+                    route="cache",
+                    response_mode="sync",
+                    success=True,
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    used_cache=True,
+                )
+            )
+            return ChatResponse(reply=cached, conversation_id=conversation_id, observation_id=observation_id)
+        messages = [HumanMessage(content=req.message)]
+        try:
+            result = await asyncio.wait_for(
+                graph.ainvoke({"messages": messages}, config),
+                timeout=float(getattr(settings, "agent_request_timeout_seconds", 120)),
+            )
+        except asyncio.TimeoutError:
+            observation_id = str(uuid.uuid4())
+            reply_text = "请求处理超时，您可以重新发送或转人工客服。"
             await _save_qa_observation_async(
                 _build_observation_payload(
                     observation_id=observation_id,
@@ -990,55 +971,108 @@ async def chat(request: Request, req: ChatRequest):
                     user_id=user_id,
                     question=req.message,
                     answer=reply_text,
-                    route="human",
+                    route="timeout",
                     response_mode="sync",
                     success=False,
                     latency_ms=int((time.perf_counter() - started_at) * 1000),
-                    fallback_reason="human_handoff",
+                    fallback_reason="timeout",
                 )
             )
-            return ChatResponse(reply=reply_text, conversation_id=conversation_id, observation_id=observation_id)
-    # 知识库节点若生成了删除/修改类 SQL 且未执行，会放入 state.pending_sql，这里写入全局待确认表
-    if result.get("pending_sql"):
-        _pending_sql[thread_id] = result["pending_sql"]
-        await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
-    last_msg = None
-    for m in result.get("messages", []):
-        if isinstance(m, AIMessage):
-            last_msg = m
-    reply = (last_msg.content if last_msg else "抱歉，未生成回复。").strip()
-    observation_id = str(uuid.uuid4())
-    route = (result.get("route") or ("knowledge" if result.get("qa_trace") else "chat")).strip()
-    qa_trace = result.get("qa_trace") or None
-    if getattr(settings, "answer_cache_enabled", True) and reply:
-        try:
-            await set_cached_answer(req.message, reply)
-        except Exception:
-            pass
-    await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)
-    # 长期记忆：本轮 user + assistant 追加写入 PostgreSQL
-    last_two = result.get("messages") or []
-    if len(last_two) >= 2:
-        await asyncio.to_thread(_persist_chat_messages_sync, thread_id, last_two[-2:])
-    await _save_qa_observation_async(
-        _build_observation_payload(
-            observation_id=observation_id,
-            thread_id=thread_id,
-            conversation_id=conversation_id,
-            user_id=user_id,
-            question=req.message,
-            answer=reply,
-            route=route,
-            response_mode="sync",
-            success=bool(reply),
-            latency_ms=int((time.perf_counter() - started_at) * 1000),
-            pending_sql=bool(result.get("pending_sql")),
+            return ChatResponse(
+                reply=reply_text,
+                conversation_id=conversation_id,
+                observation_id=observation_id,
+            )
+        except asyncio.CancelledError:
+            observation_id = str(uuid.uuid4())
+            reply_text = "请求已取消。"
+            await _save_qa_observation_async(
+                _build_observation_payload(
+                    observation_id=observation_id,
+                    thread_id=thread_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    question=req.message,
+                    answer=reply_text,
+                    route="cancelled",
+                    response_mode="sync",
+                    success=False,
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    fallback_reason="cancelled",
+                )
+            )
+            return ChatResponse(
+                reply=reply_text,
+                conversation_id=conversation_id,
+                observation_id=observation_id,
+            )
+        # 图返回 __interrupt__ 表示进入人工节点：把提示语返回用户，并记录 thread_id 以便下次先 resume
+        if result.get("__interrupt__"):
+            interrupts = result["__interrupt__"]
+            if interrupts:
+                observation_id = str(uuid.uuid4())
+                payload = getattr(interrupts[0], "value", interrupts[0])
+                reply = payload.get("human_message", payload) if isinstance(payload, dict) else str(payload)
+                _interrupted_threads.add(thread_id)
+                await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+                reply_text = reply or "已转人工客服，请稍候。"
+                await _save_qa_observation_async(
+                    _build_observation_payload(
+                        observation_id=observation_id,
+                        thread_id=thread_id,
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        question=req.message,
+                        answer=reply_text,
+                        route="human",
+                        response_mode="sync",
+                        success=False,
+                        latency_ms=int((time.perf_counter() - started_at) * 1000),
+                        fallback_reason="human_handoff",
+                    )
+                )
+                return ChatResponse(reply=reply_text, conversation_id=conversation_id, observation_id=observation_id)
+        # 知识库节点若生成了删除/修改类 SQL 且未执行，会放入 state.pending_sql，这里写入全局待确认表
+        if result.get("pending_sql"):
+            _pending_sql[thread_id] = result["pending_sql"]
+            await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+        last_msg = None
+        for m in result.get("messages", []):
+            if isinstance(m, AIMessage):
+                last_msg = m
+        reply = (last_msg.content if last_msg else "抱歉，未生成回复。").strip()
+        observation_id = str(uuid.uuid4())
+        route = (result.get("route") or ("knowledge" if result.get("qa_trace") else "chat")).strip()
+        qa_trace = result.get("qa_trace") or None
+        if getattr(settings, "answer_cache_enabled", True) and reply:
+            try:
+                await set_cached_answer(req.message, reply)
+            except Exception:
+                pass
+        await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)
+        # 长期记忆：本轮 user + assistant 追加写入 PostgreSQL
+        last_two = result.get("messages") or []
+        if len(last_two) >= 2:
+            await asyncio.to_thread(_persist_chat_messages_sync, thread_id, last_two[-2:])
+        await _save_qa_observation_async(
+            _build_observation_payload(
+                observation_id=observation_id,
+                thread_id=thread_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                question=req.message,
+                answer=reply,
+                route=route,
+                response_mode="sync",
+                success=bool(reply),
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                pending_sql=bool(result.get("pending_sql")),
+                trace=qa_trace,
+                fallback_reason=(qa_trace or {}).get("fallback_reason", ""),
+            ),
             trace=qa_trace,
-            fallback_reason=(qa_trace or {}).get("fallback_reason", ""),
-        ),
-        trace=qa_trace,
-    )
-    return ChatResponse(reply=reply, conversation_id=conversation_id, observation_id=observation_id)
+        )
+        return ChatResponse(reply=reply, conversation_id=conversation_id, observation_id=observation_id)
 
 
 async def _chat_stream_generator(
@@ -1173,114 +1207,149 @@ async def _chat_stream_generator(
             yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'observation_id': observation_id}, ensure_ascii=False)}\n\n"
             return
 
-    try:
-        snapshot = await graph.aget_state(config) if hasattr(graph, "aget_state") else await asyncio.to_thread(graph.get_state, config)
-        current = (snapshot.values or {}).get("messages") or []
-    except Exception:
-        current = []
-    new_messages = list(current) + [HumanMessage(content=message)]
-    new_state = {"messages": new_messages}
-
-    # 总控路由：仅当明确为 knowledge 时走知识库流式，否则走闲聊流式
-    next_action = (await supervisor_node_async(new_state)).get("next", "chat")
-    if next_action != "knowledge":
-        next_action = "chat"
-
-    full_chunks: list = []
-    try:
-        qa_trace = None
-        if next_action == "chat":
-            async for chunk in chat_agent_stream_async(new_state):
-                full_chunks.append(chunk)
-                yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
-        else:
-            engine = KnowledgeEngine()
-            pending_holder: list = []
-            async for chunk in engine.aquery_stream(message, pending_sql_out=pending_holder):
-                full_chunks.append(chunk)
-                yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
-            qa_trace = engine.get_last_trace()
-            # 知识库若生成了待确认 SQL，通过 pending_holder 带回，写入 _pending_sql 供对话内确认
-            if pending_holder:
-                _pending_sql[thread_id] = pending_holder[0]
-                await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
-        full_reply = "".join(full_chunks) if full_chunks else ""
-        observation_id = str(uuid.uuid4())
-        if full_reply:
+    # 防击穿：同一问题仅一个协程回源，持锁后再次查缓存再决定是否走图
+    async with answer_lock(message):
+        cached = await get_cached_answer(message)
+        if cached is not None:
+            observation_id = str(uuid.uuid4())
+            if cached:
+                yield f"data: {json.dumps({'text': cached[0:1]}, ensure_ascii=False)}\n\n"
+                rest = cached[1:]
+                chunk_size = 64
+                for i in range(0, len(rest), chunk_size):
+                    yield f"data: {json.dumps({'text': rest[i:i + chunk_size]}, ensure_ascii=False)}\n\n"
             if hasattr(graph, "aupdate_state"):
-                await graph.aupdate_state(
-                    config,
-                    {"messages": [HumanMessage(content=message), AIMessage(content=full_reply)]},
-                )
+                await graph.aupdate_state(config, {"messages": [HumanMessage(content=message), AIMessage(content=cached)]})
             else:
-                await asyncio.to_thread(
-                    graph.update_state,
-                    config,
-                    {"messages": [HumanMessage(content=message), AIMessage(content=full_reply)]},
-                )
-            if getattr(settings_stream, "answer_cache_enabled", True):
-                try:
-                    await set_cached_answer(message, full_reply)
-                except Exception:
-                    pass
+                await asyncio.to_thread(graph.update_state, config, {"messages": [HumanMessage(content=message), AIMessage(content=cached)]})
             await _persist_conversation_session(thread_id, conversation_id, user_id, message)
-            await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [HumanMessage(content=message), AIMessage(content=full_reply)])
-        route = "chat" if next_action == "chat" else "knowledge"
-        await _save_qa_observation_async(
-            _build_observation_payload(
-                observation_id=observation_id,
-                thread_id=thread_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                question=message,
-                answer=full_reply,
-                route=route,
-                response_mode="stream",
-                success=bool(full_reply),
-                latency_ms=int((time.perf_counter() - started_at) * 1000),
-                pending_sql=bool(qa_trace and qa_trace.get("pending_sql")),
+            await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [HumanMessage(content=message), AIMessage(content=cached)])
+            await _save_qa_observation_async(
+                _build_observation_payload(
+                    observation_id=observation_id,
+                    thread_id=thread_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    question=message,
+                    answer=cached,
+                    route="cache",
+                    response_mode="stream",
+                    success=True,
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    used_cache=True,
+                )
+            )
+            yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'observation_id': observation_id}, ensure_ascii=False)}\n\n"
+            return
+
+        try:
+            snapshot = await graph.aget_state(config) if hasattr(graph, "aget_state") else await asyncio.to_thread(graph.get_state, config)
+            current = (snapshot.values or {}).get("messages") or []
+        except Exception:
+            current = []
+        new_messages = list(current) + [HumanMessage(content=message)]
+        new_state = {"messages": new_messages}
+
+        # 总控路由：仅当明确为 knowledge 时走知识库流式，否则走闲聊流式
+        next_action = (await supervisor_node_async(new_state)).get("next", "chat")
+        if next_action != "knowledge":
+            next_action = "chat"
+
+        full_chunks: list = []
+        try:
+            qa_trace = None
+            if next_action == "chat":
+                async for chunk in chat_agent_stream_async(new_state):
+                    full_chunks.append(chunk)
+                    yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+            else:
+                engine = KnowledgeEngine()
+                pending_holder: list = []
+                async for chunk in engine.aquery_stream(message, pending_sql_out=pending_holder):
+                    full_chunks.append(chunk)
+                    yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+                qa_trace = engine.get_last_trace()
+                # 知识库若生成了待确认 SQL，通过 pending_holder 带回，写入 _pending_sql 供对话内确认
+                if pending_holder:
+                    _pending_sql[thread_id] = pending_holder[0]
+                    await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+            full_reply = "".join(full_chunks) if full_chunks else ""
+            observation_id = str(uuid.uuid4())
+            if full_reply:
+                if hasattr(graph, "aupdate_state"):
+                    await graph.aupdate_state(
+                        config,
+                        {"messages": [HumanMessage(content=message), AIMessage(content=full_reply)]},
+                    )
+                else:
+                    await asyncio.to_thread(
+                        graph.update_state,
+                        config,
+                        {"messages": [HumanMessage(content=message), AIMessage(content=full_reply)]},
+                    )
+                if getattr(settings_stream, "answer_cache_enabled", True):
+                    try:
+                        await set_cached_answer(message, full_reply)
+                    except Exception:
+                        pass
+                await _persist_conversation_session(thread_id, conversation_id, user_id, message)
+                await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [HumanMessage(content=message), AIMessage(content=full_reply)])
+            route = "chat" if next_action == "chat" else "knowledge"
+            await _save_qa_observation_async(
+                _build_observation_payload(
+                    observation_id=observation_id,
+                    thread_id=thread_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    question=message,
+                    answer=full_reply,
+                    route=route,
+                    response_mode="stream",
+                    success=bool(full_reply),
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    pending_sql=bool(qa_trace and qa_trace.get("pending_sql")),
+                    trace=qa_trace,
+                    fallback_reason=(qa_trace or {}).get("fallback_reason", ""),
+                ),
                 trace=qa_trace,
-                fallback_reason=(qa_trace or {}).get("fallback_reason", ""),
-            ),
-            trace=qa_trace,
-        )
-        yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'observation_id': observation_id}, ensure_ascii=False)}\n\n"
-    except asyncio.CancelledError:
-        observation_id = str(uuid.uuid4())
-        await _save_qa_observation_async(
-            _build_observation_payload(
-                observation_id=observation_id,
-                thread_id=thread_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                question=message,
-                answer="请求已取消。",
-                route="cancelled",
-                response_mode="stream",
-                success=False,
-                latency_ms=int((time.perf_counter() - started_at) * 1000),
-                fallback_reason="cancelled",
             )
-        )
-        yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'cancelled': True, 'observation_id': observation_id}, ensure_ascii=False)}\n\n"
-    except Exception as e:
-        observation_id = str(uuid.uuid4())
-        await _save_qa_observation_async(
-            _build_observation_payload(
-                observation_id=observation_id,
-                thread_id=thread_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                question=message,
-                answer=str(e),
-                route="stream_error",
-                response_mode="stream",
-                success=False,
-                latency_ms=int((time.perf_counter() - started_at) * 1000),
-                fallback_reason="stream_exception",
+            yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'observation_id': observation_id}, ensure_ascii=False)}\n\n"
+        except asyncio.CancelledError:
+            observation_id = str(uuid.uuid4())
+            await _save_qa_observation_async(
+                _build_observation_payload(
+                    observation_id=observation_id,
+                    thread_id=thread_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    question=message,
+                    answer="请求已取消。",
+                    route="cancelled",
+                    response_mode="stream",
+                    success=False,
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    fallback_reason="cancelled",
+                )
             )
-        )
-        yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'cancelled': True, 'observation_id': observation_id}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            observation_id = str(uuid.uuid4())
+            await _save_qa_observation_async(
+                _build_observation_payload(
+                    observation_id=observation_id,
+                    thread_id=thread_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    question=message,
+                    answer=str(e),
+                    route="stream_error",
+                    response_mode="stream",
+                    success=False,
+                    latency_ms=int((time.perf_counter() - started_at) * 1000),
+                    fallback_reason="stream_exception",
+                )
+            )
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
 
 
 class ConfirmSqlRequest(BaseModel):

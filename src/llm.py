@@ -195,7 +195,7 @@ class _DeepSeekEndpointPool:
             current_inflight = state.inflight
             weight = state.config.weight
             failures = state.failures
-        logger.info(
+        logger.debug(
             "LLM endpoint selected: name=%s inflight=%s weight=%s weighted_load=%.3f failures=%s",
             state.config.name or "unknown",
             current_inflight,
@@ -213,7 +213,7 @@ class _DeepSeekEndpointPool:
             state.failures = 0
             state.opened_until = 0.0
             current_inflight = state.inflight
-        logger.info(
+        logger.debug(
             "LLM endpoint success: name=%s inflight=%s circuit_recovered=%s",
             state.config.name or "unknown",
             current_inflight,

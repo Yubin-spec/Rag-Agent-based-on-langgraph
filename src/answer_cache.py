@@ -6,12 +6,17 @@
 - 断线重连：连接/读写失败时置空客户端，下次调用时懒加载重建。
 - 单条价值长度限制：超长答案不写入，避免占满内存。
 - 生命周期：应用关闭时主动关闭连接池，避免连接泄漏。
+- 热 key：可选进程内 LRU 本地缓存，命中则不再打 Redis，降低热 key 压力。
+- 防击穿：同一问题缓存未命中时，仅一个协程回源计算，其余等待后复用结果（单飞锁）。
 """
 import asyncio
 import hashlib
 import logging
 import re
-from typing import Any, Optional
+import time
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from typing import Any, List, Optional
 
 from config import get_settings
 
@@ -22,6 +27,14 @@ _MAX_QUESTION_LEN = 500
 
 _redis: Any = None
 _redis_lock = asyncio.Lock()
+
+# 本地热 key 缓存：key -> (value, expiry_ts)，按访问顺序做 LRU，容量与 TTL 可配置
+_local_cache: Optional[OrderedDict] = None
+_local_cache_lock = asyncio.Lock()
+
+# 防击穿：按 key 分桶的锁，同一问题只有一个协程回源，其余等待后读缓存
+_single_flight_locks: List[asyncio.Lock] = []
+_single_flight_initialized = False
 
 
 def _normalize_question(question: str) -> str:
@@ -36,6 +49,81 @@ def _cache_key(question: str) -> str:
     norm = _normalize_question(question)
     h = hashlib.sha256(norm.encode("utf-8")).hexdigest()[:32]
     return f"{_CACHE_KEY_PREFIX}{h}"
+
+
+def _ensure_single_flight_locks() -> List[asyncio.Lock]:
+    """按配置初始化防击穿分桶锁（仅首次调用时创建）。"""
+    global _single_flight_locks, _single_flight_initialized
+    if _single_flight_initialized:
+        return _single_flight_locks
+    n = max(1, min(4096, getattr(get_settings(), "answer_cache_single_flight_buckets", 256)))
+    _single_flight_locks = [asyncio.Lock() for _ in range(n)]
+    _single_flight_initialized = True
+    return _single_flight_locks
+
+
+def _get_single_flight_lock(question: str) -> asyncio.Lock:
+    """根据问题得到对应的单飞锁（同一问题同一把锁，不同问题可能同桶）。"""
+    key = _cache_key(question)
+    locks = _ensure_single_flight_locks()
+    return locks[hash(key) % len(locks)]
+
+
+async def _get_local_cache() -> Optional[OrderedDict]:
+    """若启用本地热 key 缓存，返回 LRU OrderedDict（key -> (value, expiry_ts)），否则返回 None。"""
+    global _local_cache
+    settings = get_settings()
+    max_entries = max(0, getattr(settings, "answer_cache_local_max_entries", 0))
+    if max_entries <= 0:
+        return None
+    async with _local_cache_lock:
+        if _local_cache is None:
+            _local_cache = OrderedDict()
+        return _local_cache
+
+
+def _local_cache_ttl_seconds() -> int:
+    return max(1, getattr(get_settings(), "answer_cache_local_ttl_seconds", 60))
+
+
+def _local_cache_max_entries() -> int:
+    return max(0, getattr(get_settings(), "answer_cache_local_max_entries", 0))
+
+
+async def _local_get(key: str) -> Optional[str]:
+    """从本地缓存读取，过期或不存在返回 None。"""
+    cache = await _get_local_cache()
+    if cache is None:
+        return None
+    async with _local_cache_lock:
+        entry = cache.get(key)
+        if entry is None:
+            return None
+        value, expiry_ts = entry
+        if time.time() > expiry_ts:
+            cache.pop(key, None)
+            return None
+        cache.move_to_end(key)  # LRU
+        return value
+
+
+async def _local_set(key: str, value: str) -> None:
+    """写入本地缓存，并做容量与过期清理。"""
+    cache = await _get_local_cache()
+    if cache is None:
+        return
+    ttl = _local_cache_ttl_seconds()
+    max_entries = _local_cache_max_entries()
+    async with _local_cache_lock:
+        now = time.time()
+        # 先删过期
+        to_del = [k for k, (_, exp) in cache.items() if exp < now]
+        for k in to_del:
+            cache.pop(k, None)
+        cache[key] = (value, now + ttl)
+        cache.move_to_end(key)
+        while len(cache) > max_entries:
+            cache.popitem(last=False)
 
 
 def _is_redis_connection_error(e: Exception) -> bool:
@@ -78,7 +166,7 @@ async def _get_redis():
             )
             return _redis
         except Exception as e:
-            logger.warning("Redis 连接失败，问答缓存将不可用: %s", e)
+            logger.exception("Redis 连接失败，问答缓存将不可用: %s", e)
             return None
 
 
@@ -103,16 +191,22 @@ async def close_redis_connection() -> None:
 async def get_cached_answer(question: str) -> Optional[str]:
     """
     根据归一化问题查缓存，命中则返回答案，否则返回 None。
+    若启用本地热 key 缓存，先查本地再查 Redis；本地命中可减轻 Redis 热 key 压力。
     Redis 不可用或断线时返回 None，不抛错；断线时会置空客户端以便下次重连。
     """
     if not (question or "").strip():
         return None
+    key = _cache_key(question)
+    local_val = await _local_get(key)
+    if local_val is not None:
+        return local_val
     client = await _get_redis()
     if client is None:
         return None
     try:
-        key = _cache_key(question)
         value = await client.get(key)
+        if value is not None and _local_cache_max_entries() > 0:
+            await _local_set(key, value)
         return value
     except Exception as e:
         if _is_redis_connection_error(e):
@@ -125,7 +219,7 @@ async def get_cached_answer(question: str) -> Optional[str]:
 
 async def set_cached_answer(question: str, answer: str) -> None:
     """
-    将问题→答案写入 Redis，TTL 使用配置的 answer_cache_ttl_seconds。
+    将问题→答案写入 Redis（及可选本地热 key 缓存），TTL 使用配置的 answer_cache_ttl_seconds。
     若配置了 answer_cache_max_value_bytes 且答案超长则跳过写入。
     Redis 不可用或断线时不写入、不抛错；断线时会置空客户端以便下次重连。
     """
@@ -138,12 +232,14 @@ async def set_cached_answer(question: str, answer: str) -> None:
         if len(answer_bytes) > max_bytes:
             logger.debug("答案长度 %s 超过 answer_cache_max_value_bytes=%s，跳过写入缓存", len(answer_bytes), max_bytes)
             return
+    key = _cache_key(question)
+    if _local_cache_max_entries() > 0:
+        await _local_set(key, answer)
     client = await _get_redis()
     if client is None:
         return
     try:
         ttl = max(60, getattr(settings, "answer_cache_ttl_seconds", 86400))
-        key = _cache_key(question)
         await client.set(key, answer, ex=ttl)
     except Exception as e:
         if _is_redis_connection_error(e):
@@ -151,3 +247,14 @@ async def set_cached_answer(question: str, answer: str) -> None:
             logger.warning("Redis 写缓存失败（已置空客户端以便重连）: %s", e)
         else:
             logger.debug("Redis set 异常: %s", e)
+
+
+@asynccontextmanager
+async def answer_lock(question: str):
+    """
+    防击穿：同一问题缓存未命中时，仅持锁的协程回源计算并写缓存，其余协程等待后再次读缓存。
+    用法：在 get_cached_answer 未命中后，用 async with answer_lock(question): 包裹「再查一次缓存 + 计算 + set_cached_answer」。
+    """
+    lock = _get_single_flight_lock(question)
+    async with lock:
+        yield
