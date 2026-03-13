@@ -137,16 +137,25 @@ class KnowledgeEngine:
         return deepcopy(self._last_trace.to_dict())
 
     def _build_rag_context(self, rag_result: RAGRetrieveResult) -> str:
-        """将检索到的父/子块拼成带编号的生成上下文，便于模型引用 [证据N]。"""
+        """将检索到的父/子块拼成带编号的生成上下文，便于模型引用 [证据N]。若配置了 rag_max_context_chars 则从前往后累加，超出则丢弃末尾 chunk。"""
+        from config import get_settings
+        max_chars = max(0, getattr(get_settings(), "rag_max_context_chars", 0))
+        sep = "\n\n---\n\n"
         context_parts = []
+        total = 0
         for i, c in enumerate(rag_result.chunks, 1):
             parent = (c.parent_content or "").strip()
             content = (c.content or "").strip()
             if parent and parent != content:
-                context_parts.append(f"[证据{i}]\n[背景]\n{parent}\n[片段]\n{content}")
+                part = f"[证据{i}]\n[背景]\n{parent}\n[片段]\n{content}"
             else:
-                context_parts.append(f"[证据{i}]\n{content}")
-        return "\n\n---\n\n".join(context_parts)
+                part = f"[证据{i}]\n{content}"
+            add_len = len(part) + (len(sep) if context_parts else 0)
+            if max_chars > 0 and total + add_len > max_chars:
+                break
+            context_parts.append(part)
+            total += add_len
+        return sep.join(context_parts)
 
     def _normalize_answer_for_eval(self, answer_text: str) -> str:
         """去掉结构化标签和证据编号，避免影响答案-文档相关度计算。"""

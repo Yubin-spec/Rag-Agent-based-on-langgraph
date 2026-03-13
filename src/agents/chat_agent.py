@@ -9,33 +9,43 @@ from langchain_core.prompts import ChatPromptTemplate
 from config import get_settings
 from src.llm import get_deepseek_llm
 from .state import AgentState
-from .context_summary import summarize_old_messages_async
+from .context_summary import summarize_old_messages_async, truncate_messages_for_context
 
 _settings = get_settings()
 _llm = get_deepseek_llm(temperature=0.7)
 
 
 def _messages_for_llm(state: AgentState) -> list:
-    """取最近 llm_context_window_turns 轮消息喂给闲聊 LLM，与 supervisor 窗口逻辑一致。"""
+    """取最近 llm_context_window_turns 轮消息，并按条做字符截断后喂给闲聊 LLM。"""
     max_turns = _settings.llm_context_window_turns
     messages = state.get("messages") or []
     if len(messages) <= max_turns * 2:
-        return messages
-    return list(messages[-max_turns * 2 :])
+        raw = messages
+    else:
+        raw = list(messages[-max_turns * 2 :])
+    return truncate_messages_for_context(
+        raw,
+        max_chars_old=getattr(_settings, "llm_context_max_chars_per_message_old", 0),
+        max_chars_latest=getattr(_settings, "llm_context_max_chars_per_message_latest", 0),
+    )
 
 
 async def _messages_for_llm_with_summary(state: AgentState) -> list:
-    """若启用旧对话摘要，则返回【历史对话摘要】+ 最近 N 轮；否则仅最近 N 轮。"""
+    """若启用旧对话摘要则返回【历史对话摘要】+ 最近 N 轮，并按条做字符截断以节省上下文。"""
     max_turns = _settings.llm_context_window_turns
     messages = state.get("messages") or []
     if len(messages) <= max_turns * 2:
-        return messages
-    old_messages = list(messages[: -max_turns * 2])
-    recent = list(messages[-max_turns * 2 :])
-    summary = await summarize_old_messages_async(old_messages)
-    if summary:
-        return [SystemMessage(content="【历史对话摘要】\n" + summary)] + recent
-    return recent
+        raw = list(messages)
+    else:
+        old_messages = list(messages[: -max_turns * 2])
+        recent = list(messages[-max_turns * 2 :])
+        summary = await summarize_old_messages_async(old_messages)
+        raw = [SystemMessage(content="【历史对话摘要】\n" + summary)] + recent if summary else recent
+    return truncate_messages_for_context(
+        raw,
+        max_chars_old=getattr(_settings, "llm_context_max_chars_per_message_old", 0),
+        max_chars_latest=getattr(_settings, "llm_context_max_chars_per_message_latest", 0),
+    )
 
 _CHAT_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """你是海关12360智能客服的闲聊与引导助手。负责：

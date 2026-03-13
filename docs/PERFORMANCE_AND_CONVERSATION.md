@@ -24,14 +24,14 @@
   `"本轮对话已达 15 轮，建议您新开对话窗口以获得更好体验。"`
 - **配置**：`config.settings.max_conversation_turns = 15`（可环境变量 `MAX_CONVERSATION_TURNS` 覆盖）。
 
-### 2.3 上下文与历史管理（省 token + 旧对话摘要）
+### 2.3 上下文与历史管理（省 token + 旧对话摘要 + 单条消息截断）
 
 - **存储**：图状态中保留**完整**本轮对话的所有消息（最多 15 轮）。
-- **喂给大模型**：总控、闲聊节点采用「**旧对话摘要 + 最近 N 轮**」：
-  - **窗口外旧消息**：若启用 `llm_context_summarize_old`（默认 true），则对 `messages[:-2*N]` 做一次 LLM 摘要（2～5 句话），以「【历史对话摘要】」形式与最近 N 轮一并送入 LLM，避免早期信息丢失。
-  - **最近 N 轮**：`messages[-2*N:]` 全量保留不压缩，即窗口内仍是原文。
-  - 总控、闲聊在**异步路径**下使用 `_messages_for_llm_with_summary`，同步路径仍仅送最近 N 轮。
-- **配置**：`llm_context_window_turns = 10`、`llm_context_summarize_old = true`（可环境变量 `LLM_CONTEXT_SUMMARIZE_OLD` 关闭摘要）。
+- **喂给大模型**：总控、闲聊节点采用「**旧对话摘要 + 最近 N 轮**」，并对每条消息做**字符上限截断**（详见 [上下文节省方案](CONTEXT_SAVING.md)）：
+  - **窗口外旧消息**：若启用 `llm_context_summarize_old`（默认 true），则对 `messages[:-2*N]` 做一次 LLM 摘要（2～5 句话），以「【历史对话摘要】」形式与最近 N 轮一并送入 LLM。
+  - **最近 N 轮**：`messages[-2*N:]` 在送入前按 `llm_context_max_chars_per_message_old` / `llm_context_max_chars_per_message_latest` 做单条截断，避免长消息撑爆上下文。
+  - 总控、闲聊在**异步路径**下使用 `_messages_for_llm_with_summary`，同步路径仍仅送最近 N 轮（同样会做截断）。
+- **配置**：`llm_context_window_turns = 10`、`llm_context_summarize_old = true`；`llm_context_max_chars_per_message_old = 600`（历史轮单条上限）、`llm_context_max_chars_per_message_latest = 0`（当前轮不截断）。
 - **知识库节点**：只用「当前这一条用户问题」做 QA/Text2SQL/RAG，不依赖历史消息，无需改。
 - **总控意图**：采用混合规则 + LLM（规则能判则直接路由，歧义时再调 DeepSeek），规则命中时不调用大模型，降低延迟与 token 消耗；详见 [意图与路由](INTENT_AND_ROUTING.md)。
 

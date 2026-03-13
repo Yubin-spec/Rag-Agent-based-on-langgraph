@@ -47,9 +47,15 @@ from src.answer_cache import answer_lock, get_cached_answer, set_cached_answer, 
 from src.chat_history import (
     load_messages as chat_history_load,
     append_messages as chat_history_append,
+    dispose_engines as chat_history_dispose_engines,
+    dispose_async_pools as chat_history_dispose_async_pools,
     ensure_table_if_configured as chat_history_ensure_table,
+    load_messages_async as chat_history_load_messages_async,
+    append_messages_async as chat_history_append_messages_async,
     load_runtime_state as chat_history_load_runtime_state,
+    load_runtime_state_async as chat_history_load_runtime_state_async,
     save_runtime_state as chat_history_save_runtime_state,
+    save_runtime_state_async as chat_history_save_runtime_state_async,
     upsert_conversation_session as chat_history_upsert_conversation_session,
     list_conversation_sessions as chat_history_list_conversation_sessions,
     get_conversation_session as chat_history_get_conversation_session,
@@ -148,6 +154,8 @@ async def lifespan(app: FastAPI):
         logger.info("PostgreSQL 探活已启动，间隔 %s 秒", getattr(settings, "postgresql_keepalive_interval_seconds", 60))
     yield
     await close_redis_connection()
+    chat_history_dispose_engines()
+    await chat_history_dispose_async_pools()
     if keepalive_task and not keepalive_task.done():
         keepalive_task.cancel()
         try:
@@ -182,7 +190,18 @@ async def _ensure_state_from_db(graph, config: dict, thread_id: str) -> None:
     uri = (getattr(settings, "chat_history_postgresql_uri", None) or "").strip()
     if not uri or "postgresql" not in uri.lower():
         return
-    runtime_state = await asyncio.to_thread(chat_history_load_runtime_state, uri, thread_id)
+    use_asyncpg = getattr(settings, "chat_history_use_asyncpg", False)
+    load_limit = max(0, getattr(settings, "chat_history_load_max_messages", 0))
+    try:
+        if use_asyncpg:
+            runtime_state = await chat_history_load_runtime_state_async(uri, thread_id)
+            db_messages = await chat_history_load_messages_async(uri, thread_id, load_limit)
+        else:
+            runtime_state = await asyncio.to_thread(chat_history_load_runtime_state, uri, thread_id)
+            db_messages = await asyncio.to_thread(chat_history_load, uri, thread_id, load_limit)
+    except Exception:
+        runtime_state = await asyncio.to_thread(chat_history_load_runtime_state, uri, thread_id)
+        db_messages = await asyncio.to_thread(chat_history_load, uri, thread_id, load_limit)
     pending_sql = (runtime_state.get("pending_sql") or "").strip()
     if pending_sql:
         _pending_sql[thread_id] = pending_sql
@@ -192,7 +211,6 @@ async def _ensure_state_from_db(graph, config: dict, thread_id: str) -> None:
         _interrupted_threads.add(thread_id)
     else:
         _interrupted_threads.discard(thread_id)
-    db_messages = await asyncio.to_thread(chat_history_load, uri, thread_id)
     if not db_messages:
         return
     try:
@@ -216,6 +234,21 @@ def _persist_chat_messages_sync(thread_id: str, messages: list) -> None:
     chat_history_append(uri, thread_id, messages)
 
 
+async def _persist_chat_messages(thread_id: str, messages: list) -> None:
+    """将本轮消息写入长期记忆；若启用 asyncpg 则异步写入，否则 to_thread 同步。"""
+    settings = get_settings()
+    uri = (getattr(settings, "chat_history_postgresql_uri", None) or "").strip()
+    if not uri or "postgresql" not in uri.lower() or not messages:
+        return
+    if getattr(settings, "chat_history_use_asyncpg", False):
+        try:
+            await chat_history_append_messages_async(uri, thread_id, messages)
+        except Exception:
+            await asyncio.to_thread(chat_history_append, uri, thread_id, messages)
+    else:
+        await asyncio.to_thread(chat_history_append, uri, thread_id, messages)
+
+
 def _persist_runtime_state_sync(thread_id: str) -> None:
     """将待确认 SQL 与 interrupt 暂停态同步保存到 PostgreSQL。"""
     settings = get_settings()
@@ -228,6 +261,23 @@ def _persist_runtime_state_sync(thread_id: str) -> None:
         _pending_sql.get(thread_id),
         thread_id in _interrupted_threads,
     )
+
+
+async def _persist_runtime_state(thread_id: str) -> None:
+    """将待确认 SQL 与 interrupt 暂停态写入长期记忆；若启用 asyncpg 则异步写入。"""
+    settings = get_settings()
+    uri = (getattr(settings, "chat_history_postgresql_uri", None) or "").strip()
+    if not uri or "postgresql" not in uri.lower():
+        return
+    pending_sql = _pending_sql.get(thread_id)
+    interrupted = thread_id in _interrupted_threads
+    if getattr(settings, "chat_history_use_asyncpg", False):
+        try:
+            await chat_history_save_runtime_state_async(uri, thread_id, pending_sql, interrupted)
+        except Exception:
+            await asyncio.to_thread(chat_history_save_runtime_state, uri, thread_id, pending_sql, interrupted)
+    else:
+        await asyncio.to_thread(chat_history_save_runtime_state, uri, thread_id, pending_sql, interrupted)
 
 
 async def _resume_if_interrupted(graph, config: dict, thread_id: str, timeout_seconds: float) -> None:
@@ -245,9 +295,9 @@ async def _resume_if_interrupted(graph, config: dict, thread_id: str, timeout_se
             if isinstance(m, AIMessage):
                 last_ai = m
         if last_ai is not None:
-            await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [last_ai])
+            await _persist_chat_messages( thread_id, [last_ai])
         _interrupted_threads.discard(thread_id)
-        await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+        await _persist_runtime_state(thread_id)
     except Exception as e:
         logger.warning("恢复人工介入会话失败: %s", e)
 
@@ -821,7 +871,7 @@ async def chat(request: Request, req: ChatRequest):
                     {"messages": [HumanMessage(content=req.message), AIMessage(content=cached)]},
                 )
             await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)
-            await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [HumanMessage(content=req.message), AIMessage(content=cached)])
+            await _persist_chat_messages( thread_id, [HumanMessage(content=req.message), AIMessage(content=cached)])
             await _save_qa_observation_async(
                 _build_observation_payload(
                     observation_id=observation_id,
@@ -842,7 +892,7 @@ async def chat(request: Request, req: ChatRequest):
     # 对话内「确认执行」：从 _pending_sql 取出该会话的待执行 SQL 并执行，结果写入图状态后返回
     if req.message.strip() in ("确认执行", "确认"):
         sql = _pending_sql.pop(thread_id, None)
-        await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+        await _persist_runtime_state(thread_id)
         if sql:
             observation_id = str(uuid.uuid4())
             try:
@@ -850,7 +900,7 @@ async def chat(request: Request, req: ChatRequest):
                 ex = await asyncio.to_thread(_execute_sql, sql, settings.text2sql_database_uri)
             except Exception as e:
                 _pending_sql[thread_id] = sql  # 放回以便重试
-                await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+                await _persist_runtime_state(thread_id)
                 reply_text = f"执行失败：{e}。请重试或转人工。"
                 await _save_qa_observation_async(
                     _build_observation_payload(
@@ -870,7 +920,7 @@ async def chat(request: Request, req: ChatRequest):
                 return ChatResponse(reply=reply_text, conversation_id=conversation_id, observation_id=observation_id)
             if not ex.ok:
                 _pending_sql[thread_id] = sql
-                await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+                await _persist_runtime_state(thread_id)
                 reply_text = f"执行失败：{ex.error_message}。请重试或转人工。"
                 await _save_qa_observation_async(
                     _build_observation_payload(
@@ -903,7 +953,7 @@ async def chat(request: Request, req: ChatRequest):
                     {"messages": [HumanMessage(content=req.message), AIMessage(content=reply_exec)]},
                 )
             await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)
-            await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [HumanMessage(content=req.message), AIMessage(content=reply_exec)])
+            await _persist_chat_messages( thread_id, [HumanMessage(content=req.message), AIMessage(content=reply_exec)])
             await _save_qa_observation_async(
                 _build_observation_payload(
                     observation_id=observation_id,
@@ -937,7 +987,7 @@ async def chat(request: Request, req: ChatRequest):
                     {"messages": [HumanMessage(content=req.message), AIMessage(content=cached)]},
                 )
             await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)
-            await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [HumanMessage(content=req.message), AIMessage(content=cached)])
+            await _persist_chat_messages( thread_id, [HumanMessage(content=req.message), AIMessage(content=cached)])
             await _save_qa_observation_async(
                 _build_observation_payload(
                     observation_id=observation_id,
@@ -1014,7 +1064,7 @@ async def chat(request: Request, req: ChatRequest):
                 payload = getattr(interrupts[0], "value", interrupts[0])
                 reply = payload.get("human_message", payload) if isinstance(payload, dict) else str(payload)
                 _interrupted_threads.add(thread_id)
-                await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+                await _persist_runtime_state(thread_id)
                 reply_text = reply or "已转人工客服，请稍候。"
                 await _save_qa_observation_async(
                     _build_observation_payload(
@@ -1035,7 +1085,7 @@ async def chat(request: Request, req: ChatRequest):
         # 知识库节点若生成了删除/修改类 SQL 且未执行，会放入 state.pending_sql，这里写入全局待确认表
         if result.get("pending_sql"):
             _pending_sql[thread_id] = result["pending_sql"]
-            await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+            await _persist_runtime_state(thread_id)
         last_msg = None
         for m in result.get("messages", []):
             if isinstance(m, AIMessage):
@@ -1053,7 +1103,7 @@ async def chat(request: Request, req: ChatRequest):
         # 长期记忆：本轮 user + assistant 追加写入 PostgreSQL
         last_two = result.get("messages") or []
         if len(last_two) >= 2:
-            await asyncio.to_thread(_persist_chat_messages_sync, thread_id, last_two[-2:])
+            await _persist_chat_messages( thread_id, last_two[-2:])
         await _save_qa_observation_async(
             _build_observation_payload(
                 observation_id=observation_id,
@@ -1095,13 +1145,13 @@ async def _chat_stream_generator(
     if message.strip() in ("确认执行", "确认") and thread_id in _pending_sql:
         sql = _pending_sql.pop(thread_id)
         observation_id = str(uuid.uuid4())
-        await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+        await _persist_runtime_state(thread_id)
         try:
             from src.kb.text2sql import _execute_sql
             ex = await asyncio.to_thread(_execute_sql, sql, settings_stream.text2sql_database_uri)
         except Exception as e:
             _pending_sql[thread_id] = sql
-            await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+            await _persist_runtime_state(thread_id)
             reply_text = f"执行失败：{e}。请重试或转人工。"
             await _save_qa_observation_async(
                 _build_observation_payload(
@@ -1123,7 +1173,7 @@ async def _chat_stream_generator(
             return
         if not ex.ok:
             _pending_sql[thread_id] = sql
-            await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+            await _persist_runtime_state(thread_id)
             reply_text = f"执行失败：{ex.error_message}。请重试或转人工。"
             await _save_qa_observation_async(
                 _build_observation_payload(
@@ -1150,7 +1200,7 @@ async def _chat_stream_generator(
         else:
             await asyncio.to_thread(graph.update_state, config, {"messages": [HumanMessage(content=message), AIMessage(content=reply_exec)]})
         await _persist_conversation_session(thread_id, conversation_id, user_id, message)
-        await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [HumanMessage(content=message), AIMessage(content=reply_exec)])
+        await _persist_chat_messages( thread_id, [HumanMessage(content=message), AIMessage(content=reply_exec)])
         await _save_qa_observation_async(
             _build_observation_payload(
                 observation_id=observation_id,
@@ -1188,7 +1238,7 @@ async def _chat_stream_generator(
             else:
                 await asyncio.to_thread(graph.update_state, config, {"messages": [HumanMessage(content=message), AIMessage(content=cached)]})
             await _persist_conversation_session(thread_id, conversation_id, user_id, message)
-            await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [HumanMessage(content=message), AIMessage(content=cached)])
+            await _persist_chat_messages( thread_id, [HumanMessage(content=message), AIMessage(content=cached)])
             await _save_qa_observation_async(
                 _build_observation_payload(
                     observation_id=observation_id,
@@ -1223,7 +1273,7 @@ async def _chat_stream_generator(
             else:
                 await asyncio.to_thread(graph.update_state, config, {"messages": [HumanMessage(content=message), AIMessage(content=cached)]})
             await _persist_conversation_session(thread_id, conversation_id, user_id, message)
-            await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [HumanMessage(content=message), AIMessage(content=cached)])
+            await _persist_chat_messages( thread_id, [HumanMessage(content=message), AIMessage(content=cached)])
             await _save_qa_observation_async(
                 _build_observation_payload(
                     observation_id=observation_id,
@@ -1272,7 +1322,7 @@ async def _chat_stream_generator(
                 # 知识库若生成了待确认 SQL，通过 pending_holder 带回，写入 _pending_sql 供对话内确认
                 if pending_holder:
                     _pending_sql[thread_id] = pending_holder[0]
-                    await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+                    await _persist_runtime_state(thread_id)
             full_reply = "".join(full_chunks) if full_chunks else ""
             observation_id = str(uuid.uuid4())
             if full_reply:
@@ -1293,7 +1343,7 @@ async def _chat_stream_generator(
                     except Exception:
                         pass
                 await _persist_conversation_session(thread_id, conversation_id, user_id, message)
-                await asyncio.to_thread(_persist_chat_messages_sync, thread_id, [HumanMessage(content=message), AIMessage(content=full_reply)])
+                await _persist_chat_messages( thread_id, [HumanMessage(content=message), AIMessage(content=full_reply)])
             route = "chat" if next_action == "chat" else "knowledge"
             await _save_qa_observation_async(
                 _build_observation_payload(
@@ -1368,7 +1418,7 @@ async def text2sql_confirm_execute(request: Request, body: ConfirmSqlRequest):
     thread_id = _thread_id(user_id, body.conversation_id)
     await _ensure_state_from_db(get_graph(), {"configurable": {"thread_id": thread_id}}, thread_id)
     sql = _pending_sql.pop(thread_id, None)
-    await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+    await _persist_runtime_state(thread_id)
     if not sql:
         raise HTTPException(
             status_code=400,
@@ -1381,11 +1431,11 @@ async def text2sql_confirm_execute(request: Request, body: ConfirmSqlRequest):
         ex = await asyncio.to_thread(_execute_sql, sql, uri)
     except Exception as e:
         _pending_sql[thread_id] = sql
-        await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+        await _persist_runtime_state(thread_id)
         raise HTTPException(status_code=500, detail=f"执行失败：{e}")
     if not ex.ok:
         _pending_sql[thread_id] = sql
-        await asyncio.to_thread(_persist_runtime_state_sync, thread_id)
+        await _persist_runtime_state(thread_id)
         raise HTTPException(status_code=400, detail=ex.error_message or "SQL 执行失败")
     if ex.rows is None or len(ex.rows) == 0:
         return {"ok": True, "message": "已执行，影响 0 行。", "rows_affected": 0}

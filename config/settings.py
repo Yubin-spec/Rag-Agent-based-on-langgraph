@@ -63,6 +63,8 @@ class Settings(BaseSettings):
     rag_default_chunk_size: int = 512
     rag_answer_grounding_min_score: float = 0.18  # 最终答案与检索文档的最低关联度，低于该值视为可能幻觉
     rag_answer_max_regenerate_times: int = 3  # 最终答案与文档关联度低时，最多重生成 3 次
+    # 注入生成阶段的检索上下文总字符数上限，0 表示不限制；超出则从末尾丢弃 chunk，控制 token
+    rag_max_context_chars: int = 0
 
     # ---------- Text2SQL ----------
     text2sql_database_uri: str = "sqlite:///./data/kb.db"
@@ -90,6 +92,11 @@ class Settings(BaseSettings):
     max_conversation_turns: int = 15  # 单对话最多轮数，超过后提示新开对话
     llm_context_window_turns: int = 10  # 喂给大模型的最近轮数（节省 token），窗口内全量保留不压缩
     llm_context_summarize_old: bool = True  # 是否将窗口外的旧对话压缩为摘要后一并喂给大模型（避免早期信息丢失）
+    # 单条消息字符上限（约等于 token 控制）：历史消息超过则截断，当前轮用户输入不截断
+    llm_context_max_chars_per_message_old: int = 600  # 历史轮每条消息最大字符数，0 表示不截断
+    llm_context_max_chars_per_message_latest: int = 0   # 当前轮用户消息最大字符数，0 表示不截断
+    # 旧对话摘要时送入 LLM 的对话文本最大字符数，0 表示不限制（默认 8000）
+    llm_context_summary_input_max_chars: int = 8000
 
     # ---------- 异常与人工介入 ----------
     agent_request_timeout_seconds: int = 120  # 单次请求超时，超时后可提示用户打断或转人工
@@ -124,6 +131,14 @@ class Settings(BaseSettings):
     # ---------- 对话长期记忆（PostgreSQL） ----------
     chat_history_postgresql_uri: str = ""  # 为空则仅用内存（MemorySaver）；设为 postgresql://... 时对话历史落库，进程重启后可恢复
     qa_monitoring_postgresql_uri: str = ""  # 问答效果监控与用户反馈分析库；为空时回退到 chat_history_postgresql_uri
+    # 加载时只取最近 N 条消息注入短期记忆，0 表示全量加载；可减少长会话的加载量与反序列化
+    chat_history_load_max_messages: int = 0
+    # 写入 chat_history 时单条 content 最大字符数，0 表示不截断（仍受 DB TEXT 限制）
+    chat_history_max_content_chars: int = 0
+    # 短期记忆：Redis checkpointer URL（需 Redis 带 RedisJSON/RediSearch，如 Redis 8+ 或 Stack）；为空则用进程内 MemorySaver
+    chat_checkpointer_redis_url: str = ""
+    # 长期记忆：True 时使用 asyncpg 异步读写（不占线程池），需安装 asyncpg；False 时用同步 SQLAlchemy + to_thread
+    chat_history_use_asyncpg: bool = False
 
     class Config:
         env_file = ".env"

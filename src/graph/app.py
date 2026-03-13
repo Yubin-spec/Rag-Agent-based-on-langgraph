@@ -4,7 +4,9 @@ LangGraph 多智能体图：Supervisor 模式 + 人工介入（interrupt）。
 流程：START → 总控(supervisor) → 条件边(chat | knowledge | human) → 对应子节点 → END。
 chat、knowledge 异常时可路由到 human；human 节点内调用 interrupt(payload) 暂停，
 调用方从 result["__interrupt__"] 取 payload 展示，恢复时用 Command(resume=...) 继续执行。
+短期记忆：可选 Redis checkpointer（chat_checkpointer_redis_url）实现多 worker 共享状态，否则 MemorySaver。
 """
+import logging
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -14,9 +16,28 @@ from src.agents.chat_agent import chat_agent_node_async
 from src.agents.knowledge_agent import knowledge_agent_node_async
 from src.agents.human_agent import human_handoff_node_async
 
+logger = logging.getLogger(__name__)
+
 # 全局图单例与检查点，避免重复编译（异步节点，支持 ainvoke 高性能并发）
 _graph = None
 _checkpointer = None
+
+
+def _make_checkpointer():
+    """若配置了 chat_checkpointer_redis_url 则尝试使用 Redis checkpointer，否则 MemorySaver。"""
+    from config import get_settings
+    url = (getattr(get_settings(), "chat_checkpointer_redis_url", None) or "").strip()
+    if not url:
+        return MemorySaver()
+    try:
+        from langgraph.checkpoint.redis import RedisSaver
+        saver = RedisSaver.from_conn_string(url)
+        saver.setup()
+        logger.info("短期记忆已使用 Redis checkpointer（多 worker 可共享状态）")
+        return saver
+    except Exception as e:
+        logger.warning("Redis checkpointer 不可用，回退 MemorySaver: %s", e)
+        return MemorySaver()
 
 
 def _route_after_sub(state: AgentState) -> str:
@@ -62,11 +83,11 @@ def create_graph(*, checkpointer=None):
 
 def get_graph():
     """
-    获取全局编译后的 LangGraph 单例，使用 MemorySaver 做 thread_id 维度的状态持久化。
+    获取全局编译后的 LangGraph 单例。按配置使用 Redis checkpointer（多 worker 共享）或 MemorySaver。
     多轮对话依赖此检查点恢复 messages 等状态。
     """
     global _graph, _checkpointer
     if _graph is None:
-        _checkpointer = MemorySaver()
+        _checkpointer = _make_checkpointer()
         _graph = create_graph(checkpointer=_checkpointer)
     return _graph
