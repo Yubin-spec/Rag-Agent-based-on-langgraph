@@ -22,11 +22,14 @@ if __name__ == "__main__":
         uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
     else:
         from config import get_settings
-        workers = max(1, get_settings().uvicorn_workers)
+        s = get_settings()
+        workers = max(1, s.uvicorn_workers)
+        shutdown = max(0, getattr(s, "graceful_shutdown_timeout_seconds", 30))
         uvicorn.run(
             "api.main:app",
             host="0.0.0.0",
             port=8000,
             workers=workers,
             reload=False,
+            timeout_graceful_shutdown=shutdown,
         )

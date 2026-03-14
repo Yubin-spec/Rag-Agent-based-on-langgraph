@@ -81,13 +81,17 @@
 | `config/settings.py` | `max_conversation_turns`、`llm_context_window_turns`、`llm_context_summarize_old`、`chat_history_postgresql_uri` |
 | `src/llm.py` | DeepSeek 统一接入、多 endpoint 负载均衡、异常熔断 |
 | `api/main.py` | 用 `conversation_id` 作 `thread_id`；15 轮校验；长期记忆加载/落库；异步图调用；返回 `conversation_id` |
-| `src/chat_history.py` | 从 PostgreSQL 加载/追加对话历史；建表 |
+| `src/chat_history.py` | 从 PostgreSQL 加载/追加对话历史；建表（通过 `db_resilience` 管理连接韧性） |
+| `src/db_resilience.py` | 数据库连接池复用、重试、熔断、降级（详见 [数据库韧性](DB_RESILIENCE.md)） |
 | `src/qa_monitoring.py` | 问答观测、RAG 追踪、用户反馈、汇总分析 |
 | `src/agents/context_summary.py` | 对窗口外旧消息做 LLM 摘要，供总控/闲聊带入上下文 |
 | `src/agents/supervisor.py` | `_messages_for_llm_with_summary`：摘要 + 最近 N 轮再调 LLM |
 | `src/agents/chat_agent.py` | 同上，闲聊节点摘要 + 最近 N 轮（含流式） |
 | `src/kb/prompt_templates.py` | 海关 40+ 场景化 Prompt 模板与关键词匹配 |
 | `src/kb/engine.py` | RAG 证据编号、低关联重生成、最终来源展示 |
+| `src/doc/validation.py` | 文档解析校验：多格式表格/结构/chunk_id 校验（详见 [文档解析与校验](DOC_PARSING_AND_VALIDATION.md)） |
+| `src/doc/mineru_client.py` | 文档解析：MinerU 对接、结构化 chunk_id 生成 |
+| `src/doc/milvus_upload.py` | Milvus 写入：含结构化元数据字段 |
 | `frontend/index.html` | 请求体用 `conversation_id`，保存并复用返回的 `conversation_id` |
 
 ---

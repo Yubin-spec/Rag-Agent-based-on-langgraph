@@ -6,12 +6,24 @@
   - 重排模型：仅 BGE Reranker Large（BAAI/bge-reranker-large），本地部署/本地加载，不调用远程 API；
   - 大模型不在此模块调用，由 kb.engine 使用 DeepSeek。
 """
+import hashlib
+import threading
+import time
+from collections import OrderedDict
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 from config import get_settings
 from .retrieval_eval import evaluate_retrieval, RetrievalEvalResult
 from .embedding_loader import get_bge_embedding, get_bge_reranker
+
+_rag_cache: Optional[OrderedDict] = None
+_rag_cache_lock = threading.Lock()
+
+
+def _rag_cache_key(query: str, total_k: int, use_rerank: bool, rerank_top: int) -> str:
+    h = hashlib.sha256(f"{query}|{total_k}|{use_rerank}|{rerank_top}".encode()).hexdigest()[:32]
+    return f"rag:v1:{h}"
 
 
 def _get_settings():
@@ -75,15 +87,12 @@ class RAGRetriever:
         self._reranker = get_bge_reranker()
 
     def _init_milvus(self) -> None:
-        """连接 Milvus 并加载配置的 collection（向量检索用）。"""
-        try:
-            from pymilvus import connections, Collection
-            s = _get_settings()
-            connections.connect(uri=s.milvus_uri)
-            self._milvus_collection = Collection(s.milvus_collection)
-            self._milvus_collection.load()
-        except Exception:
-            self._milvus_collection = None
+        """通过 db_resilience 连接 Milvus（支持重试 + 熔断 + 懒重连）。"""
+        from src.db_resilience import get_milvus_collection
+        s = _get_settings()
+        self._milvus_collection = get_milvus_collection(
+            s.milvus_uri, s.milvus_collection,
+        )
 
     def _init_bm25(self) -> None:
         """BM25 索引需由 build_bm25_from_docs 在有文档时构建，此处仅置空。"""
@@ -97,32 +106,48 @@ class RAGRetriever:
         return self._embedding.encode(texts).tolist()
 
     def _vector_search(self, query: str, top_k: int) -> List[dict]:
-        """Milvus HNSW 向量检索，返回含 content、parent_content、score、source=vector 的 dict 列表。"""
-        if not self._milvus_collection or not self._embedding:
+        """
+        Milvus HNSW 向量检索，返回含 content、parent_content、score、source=vector 的 dict 列表。
+        连接断开时自动重连重试，熔断后降级返回空列表。
+        """
+        if not self._embedding:
             return []
         qv = self.embed([query])
         if not qv:
             return []
+
+        s = _get_settings()
         search_params = {"metric_type": "IP", "params": {"nprobe": 64}}
-        results = self._milvus_collection.search(
-            data=qv,
-            anns_field="embedding",
-            param=search_params,
-            limit=top_k,
-            output_fields=["content", "parent_content", "doc_id", "chunk_id"],
+
+        def _do_search(coll):
+            results = coll.search(
+                data=qv,
+                anns_field="embedding",
+                param=search_params,
+                limit=top_k,
+                output_fields=["content", "parent_content", "doc_id", "chunk_id"],
+            )
+            out = []
+            for hits in results:
+                for h in hits:
+                    out.append({
+                        "content": h.entity.get("content") or "",
+                        "parent_content": h.entity.get("parent_content") or "",
+                        "score": float(h.score),
+                        "source": "vector",
+                        "chunk_id": h.entity.get("chunk_id") or "",
+                        "doc_id": h.entity.get("doc_id") or "",
+                    })
+            return out
+
+        from src.db_resilience import milvus_operation_with_retry
+        return milvus_operation_with_retry(
+            s.milvus_uri, s.milvus_collection,
+            _do_search,
+            retries=1,
+            critical=False,
+            default=[],
         )
-        out = []
-        for hits in results:
-            for h in hits:
-                out.append({
-                    "content": h.entity.get("content") or "",
-                    "parent_content": h.entity.get("parent_content") or "",
-                    "score": float(h.score),
-                    "source": "vector",
-                    "chunk_id": h.entity.get("chunk_id") or "",
-                    "doc_id": h.entity.get("doc_id") or "",
-                })
-        return out
 
     def _bm25_search(self, query: str, top_k: int) -> List[dict]:
         """BM25 全文检索（按字 tokenize），返回 content、score、source=bm25 的 dict 列表。"""
@@ -156,14 +181,47 @@ class RAGRetriever:
         use_rerank: bool = True,
         rerank_top: int = 5,
     ) -> List[dict]:
-        """按配置比例（默认 3:7）取 BM25 与向量结果，合并后使用 BGE Reranker 重排。"""
+        """按配置比例（默认 3:7）取 BM25 与向量结果，合并后使用 BGE Reranker 重排。支持进程内 LRU 缓存。"""
+        global _rag_cache
+        s = _get_settings()
+        max_entries = max(0, getattr(s, "rag_retrieval_cache_max_entries", 0))
+        ttl = max(1, getattr(s, "rag_retrieval_cache_ttl_seconds", 300))
+        if max_entries > 0:
+            key = _rag_cache_key(query, total_k, use_rerank, rerank_top)
+            with _rag_cache_lock:
+                if _rag_cache is None:
+                    _rag_cache = OrderedDict()
+                entry = _rag_cache.get(key)
+                if entry is not None:
+                    cached, expiry = entry
+                    if time.time() < expiry:
+                        _rag_cache.move_to_end(key)
+                        return cached
+                    _rag_cache.pop(key, None)
+        combined = self._merge_3_7_impl(query, total_k, use_rerank, rerank_top)
+        if max_entries > 0 and combined:
+            with _rag_cache_lock:
+                if _rag_cache is None:
+                    _rag_cache = OrderedDict()
+                _rag_cache[key] = (combined, time.time() + ttl)
+                _rag_cache.move_to_end(key)
+                while len(_rag_cache) > max_entries:
+                    _rag_cache.popitem(last=False)
+        return combined
+
+    def _merge_3_7_impl(
+        self,
+        query: str,
+        total_k: int,
+        use_rerank: bool = True,
+        rerank_top: int = 5,
+    ) -> List[dict]:
+        """实际检索逻辑（供 _merge_3_7 调用，可被缓存包装）。"""
         s = _get_settings()
         bm25_k = max(1, int(round(total_k * s.rag_bm25_ratio)))
         vector_k = max(1, int(round(total_k * s.rag_vector_ratio)))
-        # 多取一些以便合并去重后仍有足够数量
         vector_raw = self._vector_search(query, vector_k + 10)
         bm25_raw = self._bm25_search(query, bm25_k + 5)
-        # 按来源比例取
         bm25_take = bm25_raw[:bm25_k]
         vector_take = vector_raw[:vector_k]
         combined = bm25_take + vector_take

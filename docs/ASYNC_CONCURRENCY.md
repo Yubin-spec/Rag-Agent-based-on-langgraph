@@ -19,8 +19,11 @@
 | **知识库 aquery** | 分步：to_thread(QA/Text2SQL/检索) + await RAG 生成 | 仅 CPU/同步 IO 用线程；RAG 答案生成用 `_rag_chain.ainvoke`。 |
 | **知识库 aquery_stream** | to_thread(QA/Text2SQL/检索) + await _generate_grounded_answer_async | 同上，流式下 RAG 生成也不占线程。 |
 | **文档上传** | `parse_file_async`（httpx） | MinerU 走异步 HTTP + 信号量。 |
-| **确认上传** | `to_thread(uploader.upload_parse_result)` | 向量化与写 Milvus 在线程池。 |
-| **对话历史 / 监控** | `to_thread(chat_history_*)` / `to_thread(qa_monitoring_*)` | 同步 SQLAlchemy/psycopg2 在线程池。 |
+| **文档校验** | `to_thread(validate_parse_result)` | 多格式校验（Markdown/PDF/Word）在线程池，详见 [文档解析与校验](DOC_PARSING_AND_VALIDATION.md)。 |
+| **确认上传** | `to_thread(uploader.upload_parse_result)` | 向量化与写 Milvus 在线程池，通过 `db_resilience` 管理 Milvus 连接（重试 + 熔断 + 懒重连）。 |
+| **API 限流** | 中间件 `api_concurrency_limit_middleware` | `api_max_concurrent_requests`>0 时限制并发，超限排队。 |
+| **健康检查** | `/health`、`/health/ready` | 探测 DB/Redis/Milvus/LLM，返回熔断状态；ready 任一不可用返回 503。 |
+| **对话历史 / 监控** | `to_thread(chat_history_*)` / `to_thread(qa_monitoring_*)` | 同步 SQLAlchemy 在线程池，通过 `db_resilience` 统一管理连接池、重试与熔断（详见 [数据库韧性](DB_RESILIENCE.md)）。 |
 
 ## 3. 线程池与配置
 
@@ -42,9 +45,9 @@
   - **run.py**：设置环境变量 `RELOAD=0`，worker 数由配置 `uvicorn_workers`（或环境变量 `UVICORN_WORKERS`）决定，例如 `UVICORN_WORKERS=4 RELOAD=0 python run.py`。
   - **命令行**：`uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4`（生产勿加 `--reload`）。
   - **Docker**：在 `.env` 或 `docker-compose` 中设置 `UVICORN_WORKERS=4`，镜像内 CMD 已按该变量启动。
-- **注意**：每个 worker 是独立进程，内存中的图状态（MemorySaver）、`_parse_cache`、`_pending_sql`、`_interrupted_threads` 不共享。若同一会话的请求被不同 worker 处理，会拿不到上一轮的图状态。因此**多 worker 时建议在负载均衡上做「会话保持」**（按 `conversation_id` 或 cookie 做 sticky session），使同一会话始终打到同一 worker。若需跨 worker 共享状态，需将 LangGraph 的 checkpointer 改为 Redis 等外部存储（如 langgraph-checkpoint-redis）。
+- **注意**：每个 worker 是独立进程，内存中的图状态（MemorySaver）不共享。若配置 **`shared_state_redis_url`**，则解析缓存、待确认 SQL、人工中断状态会存 Redis，**多 worker 间共享**；未配置时上述状态仅进程内有效。多 worker 时仍建议负载均衡做「会话保持」，使同一会话的图状态命中同一 worker；LangGraph 的 checkpointer 可改为 Redis（如 langgraph-checkpoint-redis）实现图状态跨进程。
 
 ## 6. 可选后续优化
 
-- **PostgreSQL 异步驱动**：将 `chat_history` / `qa_monitoring` 改为 asyncpg 或 SQLAlchemy 2.0 async，可进一步减少对线程池的占用。
-- **Milvus 异步客户端**：若官方提供 async SDK，RAG 检索可改为全异步，进一步减少 to_thread 使用。
+- **PostgreSQL 异步驱动**：`chat_history` 已支持 asyncpg（`chat_history_use_asyncpg=true`），可减少 to_thread 占用。
+- **Milvus 异步客户端**：若官方提供 async SDK，RAG 检索可改为全异步，进一步减少 to_thread。当前 Milvus 通过 `db_resilience` 管理（重试、熔断、懒重连），详见 [数据库韧性](DB_RESILIENCE.md)。

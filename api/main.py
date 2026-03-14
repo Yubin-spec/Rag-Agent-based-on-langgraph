@@ -38,12 +38,13 @@ import uuid
 from config import get_settings
 from src.doc.mineru_client import MinerUClient, ParseResult, ChunkItem
 from src.doc.milvus_upload import MilvusUploader
+from src.doc.validation import validate_parse_result
 from src.graph.app import get_graph
 from src.agents.supervisor import supervisor_node_async
 from src.agents.chat_agent import chat_agent_stream_async
 from src.kb.engine import KnowledgeEngine
 from src.kb.schema_loader import read_db_schema, load_schema_overrides, save_schema_overrides
-from src.answer_cache import answer_lock, get_cached_answer, set_cached_answer, close_redis_connection
+from src.answer_cache import answer_lock, get_cached_answer, set_cached_answer, close_redis_connection, redis_ping
 from src.chat_history import (
     load_messages as chat_history_load,
     append_messages as chat_history_append,
@@ -77,6 +78,9 @@ from src.qa_monitoring import (
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.types import Command
 from src.llm import get_deepseek_llm, get_deepseek_router_status, get_last_deepseek_endpoint_name
+from src.db_resilience import get_all_breaker_status, milvus_ping
+from src import shared_state as shared_state_module
+from src.shared_state import close_shared_state_redis
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +115,19 @@ def _postgresql_ping(uri: str) -> None:
         logger.warning("PostgreSQL 探活失败（下次探活会重试）: %s", e)
 
 
+def _postgresql_ping_returns_bool(uri: str) -> bool:
+    """PostgreSQL 探活，返回是否成功（供健康检查使用）。"""
+    try:
+        from sqlalchemy import create_engine, text
+        engine = create_engine(uri, pool_pre_ping=True, pool_size=1, max_overflow=0)
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        engine.dispose()
+        return True
+    except Exception:
+        return False
+
+
 async def _postgresql_keepalive_loop() -> None:
     """后台任务：每分钟对配置的 PostgreSQL 执行一次探活，保持数据库在线可用。"""
     settings = get_settings()
@@ -130,9 +147,13 @@ async def _postgresql_keepalive_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：启动时建对话历史表（若配置）、可选设置线程池大小、启动 PostgreSQL 探活任务，关闭时取消。"""
+    """应用生命周期：启动时建对话历史表（若配置）、可选设置线程池大小、启动 PostgreSQL 探活任务、API 限流，关闭时取消。"""
     keepalive_task = None
     settings = get_settings()
+    limit = max(0, getattr(settings, "api_max_concurrent_requests", 0))
+    app.state.api_semaphore = asyncio.Semaphore(limit) if limit > 0 else None
+    if limit > 0:
+        logger.info("API 全局限流已启用: max_concurrent=%d", limit)
     # 异步高并发：可选扩大 to_thread 使用的线程池，避免大量并发时排队
     n = getattr(settings, "asyncio_thread_pool_workers", 0)
     if n > 0:
@@ -154,6 +175,7 @@ async def lifespan(app: FastAPI):
         logger.info("PostgreSQL 探活已启动，间隔 %s 秒", getattr(settings, "postgresql_keepalive_interval_seconds", 60))
     yield
     await close_redis_connection()
+    await close_shared_state_redis()
     chat_history_dispose_engines()
     await chat_history_dispose_async_pools()
     if keepalive_task and not keepalive_task.done():
@@ -173,12 +195,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 内存中暂存解析结果，供对比/自定义后确认上传（生产可改为 Redis/DB）
-_parse_cache: dict[str, ParseResult] = {}
-# 待人工确认执行的 SQL，key=conversation_id，确认执行后删除（生产可改为 Redis/DB）
-_pending_sql: dict[str, str] = {}
-# 因 interrupt() 处于人工介入暂停的会话，下次请求时先 resume 再处理新消息（生产可改为 Redis）
-_interrupted_threads: set[str] = set()
+
+@app.middleware("http")
+async def api_concurrency_limit_middleware(request: Request, call_next):
+    """API 全局限流：超过 api_max_concurrent_requests 时排队等待；若配置为 0 则不限流。"""
+    sem = getattr(app.state, "api_semaphore", None)
+    if sem is None:
+        return await call_next(request)
+    async with sem:
+        return await call_next(request)
+
+# 解析缓存、待确认 SQL、人工中断状态：由 shared_state 统一提供（内存或 Redis，见 shared_state_redis_url）
 
 
 async def _ensure_state_from_db(graph, config: dict, thread_id: str) -> None:
@@ -204,13 +231,13 @@ async def _ensure_state_from_db(graph, config: dict, thread_id: str) -> None:
         db_messages = await asyncio.to_thread(chat_history_load, uri, thread_id, load_limit)
     pending_sql = (runtime_state.get("pending_sql") or "").strip()
     if pending_sql:
-        _pending_sql[thread_id] = pending_sql
+        await shared_state_module.set_pending_sql(thread_id, pending_sql)
     else:
-        _pending_sql.pop(thread_id, None)
+        await shared_state_module.pop_pending_sql(thread_id)
     if runtime_state.get("interrupted"):
-        _interrupted_threads.add(thread_id)
+        await shared_state_module.add_interrupted(thread_id)
     else:
-        _interrupted_threads.discard(thread_id)
+        await shared_state_module.discard_interrupted(thread_id)
     if not db_messages:
         return
     try:
@@ -249,18 +276,15 @@ async def _persist_chat_messages(thread_id: str, messages: list) -> None:
         await asyncio.to_thread(chat_history_append, uri, thread_id, messages)
 
 
-def _persist_runtime_state_sync(thread_id: str) -> None:
-    """将待确认 SQL 与 interrupt 暂停态同步保存到 PostgreSQL。"""
+async def _persist_runtime_state_sync(thread_id: str) -> None:
+    """将待确认 SQL 与 interrupt 暂停态同步保存到 PostgreSQL（需先 await 获取共享状态）。"""
     settings = get_settings()
     uri = (getattr(settings, "chat_history_postgresql_uri", None) or "").strip()
     if not uri or "postgresql" not in uri.lower():
         return
-    chat_history_save_runtime_state(
-        uri,
-        thread_id,
-        _pending_sql.get(thread_id),
-        thread_id in _interrupted_threads,
-    )
+    pending_sql = await shared_state_module.get_pending_sql(thread_id)
+    interrupted = await shared_state_module.is_interrupted(thread_id)
+    await asyncio.to_thread(chat_history_save_runtime_state, uri, thread_id, pending_sql, interrupted)
 
 
 async def _persist_runtime_state(thread_id: str) -> None:
@@ -269,8 +293,8 @@ async def _persist_runtime_state(thread_id: str) -> None:
     uri = (getattr(settings, "chat_history_postgresql_uri", None) or "").strip()
     if not uri or "postgresql" not in uri.lower():
         return
-    pending_sql = _pending_sql.get(thread_id)
-    interrupted = thread_id in _interrupted_threads
+    pending_sql = await shared_state_module.get_pending_sql(thread_id)
+    interrupted = await shared_state_module.is_interrupted(thread_id)
     if getattr(settings, "chat_history_use_asyncpg", False):
         try:
             await chat_history_save_runtime_state_async(uri, thread_id, pending_sql, interrupted)
@@ -282,7 +306,7 @@ async def _persist_runtime_state(thread_id: str) -> None:
 
 async def _resume_if_interrupted(graph, config: dict, thread_id: str, timeout_seconds: float) -> None:
     """若会话处于人工介入暂停态，则先 resume；成功后同时清理内存与 PostgreSQL 中的暂停标记。"""
-    if thread_id not in _interrupted_threads:
+    if not await shared_state_module.is_interrupted(thread_id):
         return
     try:
         result = await asyncio.wait_for(
@@ -296,7 +320,7 @@ async def _resume_if_interrupted(graph, config: dict, thread_id: str, timeout_se
                 last_ai = m
         if last_ai is not None:
             await _persist_chat_messages( thread_id, [last_ai])
-        _interrupted_threads.discard(thread_id)
+        await shared_state_module.discard_interrupted(thread_id)
         await _persist_runtime_state(thread_id)
     except Exception as e:
         logger.warning("恢复人工介入会话失败: %s", e)
@@ -475,10 +499,68 @@ class SchemaOverridesBody(BaseModel):
     relations: List[SchemaRelation] = []
 
 
+async def _health_probe_details() -> dict:
+    """探测各依赖健康状态，供 /health 与 /health/ready 使用。"""
+    settings = get_settings()
+    details = {}
+    # PostgreSQL（对话历史）
+    chat_uri = (getattr(settings, "chat_history_postgresql_uri", None) or "").strip()
+    if chat_uri and "postgresql" in chat_uri.lower():
+        ok = await asyncio.to_thread(_postgresql_ping_returns_bool, chat_uri)
+        details["postgresql_chat"] = "ok" if ok else "unreachable"
+    # PostgreSQL（问答监控，若与 chat 不同则单独探测）
+    qa_uri = _qa_monitoring_uri(settings)
+    if qa_uri and "postgresql" in qa_uri.lower() and qa_uri != chat_uri:
+        ok = await asyncio.to_thread(_postgresql_ping_returns_bool, qa_uri)
+        details["postgresql_qa_monitoring"] = "ok" if ok else "unreachable"
+    # Redis
+    if getattr(settings, "answer_cache_enabled", True) and (getattr(settings, "redis_url", "") or "").strip():
+        ok = await redis_ping()
+        details["redis"] = "ok" if ok else "unreachable"
+    # Milvus
+    milvus_uri = (getattr(settings, "milvus_uri", "") or "").strip()
+    if milvus_uri:
+        ok = milvus_ping(milvus_uri)
+        details["milvus"] = "ok" if ok else "unreachable"
+    # LLM（至少一个 endpoint 可用）
+    router_status = get_deepseek_router_status()
+    healthy = router_status.get("healthy_endpoint_count", 0)
+    all_open = router_status.get("all_circuits_open", False)
+    details["llm"] = "ok" if healthy > 0 else ("degraded" if all_open else "no_endpoints")
+    return details
+
+
 @app.get("/health")
-def health():
-    """健康检查，供负载均衡或容器探针使用。"""
-    return {"status": "ok"}
+async def health():
+    """
+    健康检查，供负载均衡或容器 liveness 探针使用。
+    探测 DB/Redis/Milvus/LLM，返回 status: ok | degraded 及 details。
+    """
+    details = await _health_probe_details()
+    failures = [k for k, v in details.items() if v not in ("ok",)]
+    status = "degraded" if failures else "ok"
+    result = {"status": status, "details": details}
+    if failures:
+        result["unhealthy"] = {k: details[k] for k in failures}
+    result["breakers"] = get_all_breaker_status()
+    return result
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """
+    深度就绪检查，供 K8s readiness 探针使用。
+    仅对已配置的依赖做检查；任一已配置依赖不可用时返回 503。
+    """
+    details = await _health_probe_details()
+    unhealthy = [k for k, v in details.items() if v not in ("ok",)]
+    if unhealthy:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "unhealthy": unhealthy, "details": details},
+        )
+    return {"status": "ready", "details": details}
 
 
 @app.get("/llm/router/status", response_model=LLMRouterStatusResponse)
@@ -523,14 +605,25 @@ async def doc_upload(request: Request, file: UploadFile = File(...)):
     await asyncio.to_thread(_write, path, content)
     client = MinerUClient()
     result = await client.parse_file_async(file.filename or path, content)
+    report = await asyncio.to_thread(
+        validate_parse_result, result.full_text, result.chunks,
+        file_path=result.original_path,
+    )
     cache_key = _parse_cache_key(user_id, result.task_id)
-    _parse_cache[cache_key] = result
+    await shared_state_module.set_parse_result(cache_key, result)
     return {
         "task_id": result.task_id,
         "original_path": result.original_path,
+        "doc_name": result.doc_name,
         "full_text": result.full_text[:5000],
         "chunks": [c.model_dump() for c in result.chunks],
         "raw_markdown": (result.raw_markdown or "")[:5000],
+        "validation": {
+            "passed": report.passed,
+            "summary": report.summary(),
+            "errors": [{"category": i.category, "message": i.message, "chunk_index": i.chunk_index} for i in report.errors],
+            "warnings": [{"category": i.category, "message": i.message, "chunk_index": i.chunk_index} for i in report.warnings],
+        },
     }
 
 
@@ -543,9 +636,9 @@ async def confirm_upload(request: Request, body: ConfirmUploadRequest):
     """
     user_id = _user_id_from_request(request, body.user_id)
     cache_key = _parse_cache_key(user_id, body.task_id)
-    if cache_key not in _parse_cache:
+    base = await shared_state_module.get_parse_result(cache_key)
+    if base is None:
         raise HTTPException(status_code=404, detail="task_id 不存在或已过期")
-    base = _parse_cache[cache_key]
     if body.chunks is not None and len(body.chunks) > 0:
         result = ParseResult(
             task_id=base.task_id,
@@ -553,13 +646,37 @@ async def confirm_upload(request: Request, body: ConfirmUploadRequest):
             full_text=base.full_text,
             chunks=body.chunks,
             raw_markdown=base.raw_markdown,
+            doc_name=base.doc_name,
         )
     else:
         result = base
+    report = await asyncio.to_thread(
+        validate_parse_result, result.full_text, result.chunks,
+        file_path=result.original_path,
+    )
+    if not report.passed:
+        return {
+            "uploaded": 0,
+            "task_id": body.task_id,
+            "validation": {
+                "passed": False,
+                "summary": report.summary(),
+                "errors": [{"category": i.category, "message": i.message, "chunk_index": i.chunk_index} for i in report.errors],
+                "warnings": [{"category": i.category, "message": i.message, "chunk_index": i.chunk_index} for i in report.warnings],
+            },
+        }
     uploader = MilvusUploader()
     count = await asyncio.to_thread(uploader.upload_parse_result, result)
-    del _parse_cache[cache_key]  # 确认后移除，避免重复确认
-    return {"uploaded": count, "task_id": body.task_id}
+    await shared_state_module.delete_parse_result(cache_key)
+    return {
+        "uploaded": count,
+        "task_id": body.task_id,
+        "validation": {
+            "passed": True,
+            "summary": report.summary(),
+            "warnings": [{"category": i.category, "message": i.message, "chunk_index": i.chunk_index} for i in report.warnings],
+        },
+    }
 
 
 @app.get("/text2sql/schema")
@@ -889,9 +1006,9 @@ async def chat(request: Request, req: ChatRequest):
             )
             return ChatResponse(reply=cached, conversation_id=conversation_id, observation_id=observation_id)
 
-    # 对话内「确认执行」：从 _pending_sql 取出该会话的待执行 SQL 并执行，结果写入图状态后返回
+    # 对话内「确认执行」：从共享状态取出该会话的待执行 SQL 并执行，结果写入图状态后返回
     if req.message.strip() in ("确认执行", "确认"):
-        sql = _pending_sql.pop(thread_id, None)
+        sql = await shared_state_module.pop_pending_sql(thread_id)
         await _persist_runtime_state(thread_id)
         if sql:
             observation_id = str(uuid.uuid4())
@@ -899,7 +1016,7 @@ async def chat(request: Request, req: ChatRequest):
                 from src.kb.text2sql import _execute_sql
                 ex = await asyncio.to_thread(_execute_sql, sql, settings.text2sql_database_uri)
             except Exception as e:
-                _pending_sql[thread_id] = sql  # 放回以便重试
+                await shared_state_module.set_pending_sql(thread_id, sql)  # 放回以便重试
                 await _persist_runtime_state(thread_id)
                 reply_text = f"执行失败：{e}。请重试或转人工。"
                 await _save_qa_observation_async(
@@ -919,7 +1036,7 @@ async def chat(request: Request, req: ChatRequest):
                 )
                 return ChatResponse(reply=reply_text, conversation_id=conversation_id, observation_id=observation_id)
             if not ex.ok:
-                _pending_sql[thread_id] = sql
+                await shared_state_module.set_pending_sql(thread_id, sql)
                 await _persist_runtime_state(thread_id)
                 reply_text = f"执行失败：{ex.error_message}。请重试或转人工。"
                 await _save_qa_observation_async(
@@ -1063,7 +1180,7 @@ async def chat(request: Request, req: ChatRequest):
                 observation_id = str(uuid.uuid4())
                 payload = getattr(interrupts[0], "value", interrupts[0])
                 reply = payload.get("human_message", payload) if isinstance(payload, dict) else str(payload)
-                _interrupted_threads.add(thread_id)
+                await shared_state_module.add_interrupted(thread_id)
                 await _persist_runtime_state(thread_id)
                 reply_text = reply or "已转人工客服，请稍候。"
                 await _save_qa_observation_async(
@@ -1082,9 +1199,9 @@ async def chat(request: Request, req: ChatRequest):
                     )
                 )
                 return ChatResponse(reply=reply_text, conversation_id=conversation_id, observation_id=observation_id)
-        # 知识库节点若生成了删除/修改类 SQL 且未执行，会放入 state.pending_sql，这里写入全局待确认表
+        # 知识库节点若生成了删除/修改类 SQL 且未执行，会放入 state.pending_sql，这里写入共享状态
         if result.get("pending_sql"):
-            _pending_sql[thread_id] = result["pending_sql"]
+            await shared_state_module.set_pending_sql(thread_id, result["pending_sql"])
             await _persist_runtime_state(thread_id)
         last_msg = None
         for m in result.get("messages", []):
@@ -1134,7 +1251,7 @@ async def _chat_stream_generator(
 ):
     """
     流式对话的 SSE 生成器：先出首字再逐 chunk；路由与 LLM 均异步，不阻塞事件循环。
-    thread_id：图状态与 _pending_sql 的键（含 user_id）；conversation_id 仅用于 SSE 的 done 事件给前端。
+    thread_id：图状态与共享状态（待确认 SQL）的键（含 user_id）；conversation_id 仅用于 SSE 的 done 事件给前端。
     顺序：确认执行分支 → 缓存命中 → 总控路由 → chat/knowledge 流式输出 → 写状态与缓存 → done。
     """
     settings_stream = get_settings()
@@ -1142,15 +1259,16 @@ async def _chat_stream_generator(
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
     # 流式下的「确认执行」：执行待确认 SQL 并流式返回结果，然后发送 done
-    if message.strip() in ("确认执行", "确认") and thread_id in _pending_sql:
-        sql = _pending_sql.pop(thread_id)
+    pending_sql_val = await shared_state_module.get_pending_sql(thread_id)
+    if message.strip() in ("确认执行", "确认") and pending_sql_val:
+        sql = await shared_state_module.pop_pending_sql(thread_id)
         observation_id = str(uuid.uuid4())
         await _persist_runtime_state(thread_id)
         try:
             from src.kb.text2sql import _execute_sql
             ex = await asyncio.to_thread(_execute_sql, sql, settings_stream.text2sql_database_uri)
         except Exception as e:
-            _pending_sql[thread_id] = sql
+            await shared_state_module.set_pending_sql(thread_id, sql)
             await _persist_runtime_state(thread_id)
             reply_text = f"执行失败：{e}。请重试或转人工。"
             await _save_qa_observation_async(
@@ -1172,7 +1290,7 @@ async def _chat_stream_generator(
             yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'observation_id': observation_id}, ensure_ascii=False)}\n\n"
             return
         if not ex.ok:
-            _pending_sql[thread_id] = sql
+            await shared_state_module.set_pending_sql(thread_id, sql)
             await _persist_runtime_state(thread_id)
             reply_text = f"执行失败：{ex.error_message}。请重试或转人工。"
             await _save_qa_observation_async(
@@ -1319,9 +1437,9 @@ async def _chat_stream_generator(
                     full_chunks.append(chunk)
                     yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
                 qa_trace = engine.get_last_trace()
-                # 知识库若生成了待确认 SQL，通过 pending_holder 带回，写入 _pending_sql 供对话内确认
+                # 知识库若生成了待确认 SQL，通过 pending_holder 带回，写入共享状态供对话内确认
                 if pending_holder:
-                    _pending_sql[thread_id] = pending_holder[0]
+                    await shared_state_module.set_pending_sql(thread_id, pending_holder[0])
                     await _persist_runtime_state(thread_id)
             full_reply = "".join(full_chunks) if full_chunks else ""
             observation_id = str(uuid.uuid4())
@@ -1417,7 +1535,7 @@ async def text2sql_confirm_execute(request: Request, body: ConfirmSqlRequest):
     user_id = _user_id_from_request(request, body.user_id)
     thread_id = _thread_id(user_id, body.conversation_id)
     await _ensure_state_from_db(get_graph(), {"configurable": {"thread_id": thread_id}}, thread_id)
-    sql = _pending_sql.pop(thread_id, None)
+    sql = await shared_state_module.pop_pending_sql(thread_id)
     await _persist_runtime_state(thread_id)
     if not sql:
         raise HTTPException(
@@ -1430,11 +1548,11 @@ async def text2sql_confirm_execute(request: Request, body: ConfirmSqlRequest):
         from src.kb.text2sql import _execute_sql
         ex = await asyncio.to_thread(_execute_sql, sql, uri)
     except Exception as e:
-        _pending_sql[thread_id] = sql
+        await shared_state_module.set_pending_sql(thread_id, sql)
         await _persist_runtime_state(thread_id)
         raise HTTPException(status_code=500, detail=f"执行失败：{e}")
     if not ex.ok:
-        _pending_sql[thread_id] = sql
+        await shared_state_module.set_pending_sql(thread_id, sql)
         await _persist_runtime_state(thread_id)
         raise HTTPException(status_code=400, detail=ex.error_message or "SQL 执行失败")
     if ex.rows is None or len(ex.rows) == 0:
@@ -1590,8 +1708,8 @@ async def delete_chat_conversation(request: Request, conversation_id: str, user_
     qa_monitor_uri = _qa_monitoring_uri(settings)
     if qa_monitor_uri and "postgresql" in qa_monitor_uri.lower():
         await asyncio.to_thread(qa_monitoring_delete_conversation_data, qa_monitor_uri, conversation_id, actual_user_id)
-    _pending_sql.pop(thread_id, None)
-    _interrupted_threads.discard(thread_id)
+    await shared_state_module.pop_pending_sql(thread_id)
+    await shared_state_module.discard_interrupted(thread_id)
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
     try:

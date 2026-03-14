@@ -20,14 +20,20 @@
 3. `IntentStore.suggest_tables()` may append likely tables.
 4. `resolve_time_range_from_question()` may append a resolved date range.
 5. `_chain_sql.invoke()` generates SQL.
-6. Validation runs in this order:
+6. **`_sanitize_and_extract_sql(raw)`** cleans the LLM output before validation:
+   - Extracts SQL from code fences (` ```sql ... ``` `) or inline code (`` `SELECT ...` ``).
+   - Strips LLM preamble text ("以下是生成的SQL：" etc.) and locates the SQL keyword start.
+   - Removes garbled characters (zero-width, BOM, control chars).
+   - Converts Chinese punctuation to ASCII (`，` → `,`, `（` → `(`, etc.).
+   - Splits multi-statement output and takes the first statement.
+7. Validation runs in this order:
    - `_validate_sql_select_only()`
    - `_validate_sql_syntax()`
    - `_validate_sql_uses_relations()`
-7. `_ensure_limit()` appends a default `LIMIT` if configured and missing.
-8. `_execute_sql()` runs the SQL.
-9. If execution fails with `field_mismatch`, generation retries once with the error text appended.
-10. `_chain_answer.invoke()` formats the rows into natural language.
+8. `_ensure_limit()` appends a default `LIMIT` if configured and missing.
+9. `_execute_sql()` runs the SQL.
+10. If execution fails with `field_mismatch`, generation retries once with the error text appended.
+11. `_chain_answer.invoke()` formats the rows into natural language.
 
 ## Write Path Details
 
@@ -62,6 +68,8 @@ Important current nuance:
   Converts fuzzy time phrases into concrete date bounds.
 - `_build_schema_block(schema_text, suggested_tables, time_range)`
   Adds table hints and time-range hints to the schema prompt.
+- `_sanitize_and_extract_sql(raw)`
+  Extracts and cleans SQL from LLM output: code fences, inline code, garbled chars, Chinese punctuation, multi-statement splitting.
 - `_validate_sql_select_only(sql)`
   Blocks non-SELECT SQL from the auto-execute path.
 - `_validate_sql_syntax(sql, database_uri)`
@@ -155,7 +163,26 @@ Check:
 - `_execute_sql()`
 - field-mismatch retry logic in `Text2SQL.query()`
 
-### 5. Large queries are slow or expensive
+### 5. LLM output contains code blocks, garbled chars, or mixed text
+
+Likely causes:
+
+- Model wraps SQL in markdown code fences (` ```sql ... ``` `)
+- Model outputs Chinese punctuation (`，` `（` `）`) inside SQL
+- Zero-width characters or BOM from copy-paste or encoding issues
+- Model adds preamble text before the SQL ("以下是查询语句：")
+- Model outputs multiple SQL statements separated by semicolons
+
+Resolution:
+
+- `_sanitize_and_extract_sql()` handles all of these automatically.
+- If extraction still fails, check the raw LLM output in logs and add patterns to the function.
+
+Check:
+
+- `_sanitize_and_extract_sql()` in `src/kb/text2sql.py`
+
+### 6. Large queries are slow or expensive
 
 Likely causes:
 

@@ -52,7 +52,25 @@ Recommended handling:
 4. Keep the JSON shape stable so the frontend schema-review page still works.
 5. Mention whether the change affects existing overrides data.
 
-## Example 5: Reduce slow Text2SQL responses
+## Example 5: Fix garbled or code-fenced SQL output
+
+Task:
+The LLM wraps SQL in markdown code blocks, mixes in Chinese punctuation, or outputs preamble text before the SQL.
+
+Recommended handling:
+
+1. Inspect `_sanitize_and_extract_sql()` in `src/kb/text2sql.py`.
+2. Reproduce the issue: check what `raw` looks like before extraction (add temporary logging if needed).
+3. Common patterns already handled:
+   - ` ```sql\nSELECT ...\n``` ` → extracts inner SQL.
+   - `以下是查询语句：SELECT ...` → strips preamble, locates SQL keyword.
+   - `SELECT id，name FROM t` → converts `，` to `,`.
+   - Zero-width chars / BOM → removed.
+   - `SELECT ...; SELECT ...` → takes first statement.
+4. If a new pattern appears, add it to the function rather than patching individual call sites.
+5. Verify that CANNOT_ANSWER detection still works (it runs before extraction).
+
+## Example 6: Reduce slow Text2SQL responses
 
 Task:
 The user reports Text2SQL is slow on large schemas.

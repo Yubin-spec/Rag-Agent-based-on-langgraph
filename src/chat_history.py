@@ -6,12 +6,21 @@
 - `chat_runtime_state`：存储待确认 SQL、人工介入暂停态等流程状态；
 - 请求开始时若内存无该会话状态则从 DB 加载并注入；
 - 每轮结束后将本轮 user+assistant 追加写入 DB，并同步更新运行时状态。
-- 连接池：按 uri 复用 Engine，避免每次 create_engine/dispose，提升并发下 DB 访问性能。
+- 连接韧性：通过 db_resilience 统一管理连接池复用、重试、熔断与降级。
 """
 import logging
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+
+from src.db_resilience import (
+    get_engine,
+    safe_connection,
+    dispose_all_engines,
+    get_async_pool,
+    safe_async_connection,
+    dispose_all_async_pools,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,37 +28,21 @@ _TABLE_NAME = "chat_history"
 _STATE_TABLE_NAME = "chat_runtime_state"
 _SESSION_TABLE_NAME = "chat_sessions"
 
-_engines: Dict[str, Any] = {}
-
 
 def _get_engine(uri: str):
-    """按 uri 复用 SQLAlchemy Engine，避免每次建连与销毁。"""
-    global _engines
-    key = (uri or "").strip()
-    if not key:
-        raise ValueError("chat_history uri is empty")
-    if key not in _engines:
-        from sqlalchemy import create_engine
-        _engines[key] = create_engine(key, pool_pre_ping=True, pool_size=5, max_overflow=10)
-    return _engines[key]
+    """按 uri 复用 SQLAlchemy Engine（委托 db_resilience）。"""
+    return get_engine(uri)
 
 
 def dispose_engines() -> None:
     """释放所有缓存的 Engine（应用关闭时调用，避免连接泄漏）。"""
-    global _engines
-    for uri, eng in list(_engines.items()):
-        try:
-            eng.dispose()
-        except Exception as e:
-            logger.debug("dispose chat_history engine %s: %s", uri[:50], e)
-    _engines.clear()
+    dispose_all_engines()
 
 
 def _ensure_table(uri: str) -> None:
     """创建长期记忆所需的 PostgreSQL 表（若不存在）。"""
     from sqlalchemy import text
-    engine = _get_engine(uri)
-    with engine.connect() as conn:
+    with safe_connection(uri, retries=3, retry_delay=1.0, critical=True) as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS chat_history (
                 id         SERIAL PRIMARY KEY,
@@ -96,18 +89,21 @@ def load_messages(uri: str, thread_id: str, limit: int = 0) -> List[BaseMessage]
     """
     从 PostgreSQL 按 thread_id 读取历史消息，按 id 升序，转为 HumanMessage/AIMessage 列表。
     limit > 0 时只取最近 limit 条（按 id 升序），用于减少长会话加载量。
+    连接失败时降级返回空列表（不阻断对话流程）。
     """
     from sqlalchemy import text
-    engine = _get_engine(uri)
     out: List[BaseMessage] = []
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                logger.warning("加载对话历史降级：数据库不可用，返回空历史")
+                return out
             if limit > 0:
                 rows = conn.execute(
                     text("SELECT role, content FROM chat_history WHERE thread_id = :tid ORDER BY id DESC LIMIT :lim"),
                     {"tid": thread_id[:512], "lim": limit},
                 ).fetchall()
-                rows = list(reversed(rows))  # 恢复为按 id 升序（时间顺序）
+                rows = list(reversed(rows))
             else:
                 rows = conn.execute(
                     text("SELECT role, content FROM chat_history WHERE thread_id = :tid ORDER BY id"),
@@ -152,8 +148,10 @@ def append_messages(uri: str, thread_id: str, messages: List[BaseMessage]) -> No
         return
 
     try:
-        with engine.connect() as conn:
-            # 最近一轮重复写入抑制：若最后 N 条消息与当前待写入内容完全一致，则认为是重试/重复提交，跳过写入。
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                logger.warning("写入对话历史降级：数据库不可用，本轮消息未持久化")
+                return
             recent_rows = conn.execute(
                 text(
                     "SELECT role, content FROM chat_history WHERE thread_id = :tid ORDER BY id DESC LIMIT :n"
@@ -176,11 +174,12 @@ def append_messages(uri: str, thread_id: str, messages: List[BaseMessage]) -> No
 
 
 def load_runtime_state(uri: str, thread_id: str) -> dict:
-    """加载会话运行时状态：待确认 SQL、人工介入暂停态。"""
+    """加载会话运行时状态：待确认 SQL、人工介入暂停态。连接失败时降级返回默认值。"""
     from sqlalchemy import text
-    engine = _get_engine(uri)
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                return {"pending_sql": None, "interrupted": False}
             row = conn.execute(
                 text(
                     f"SELECT pending_sql, interrupted FROM {_STATE_TABLE_NAME} WHERE thread_id = :tid"
@@ -206,9 +205,11 @@ def save_runtime_state(
 ) -> None:
     """保存会话运行时状态，确保服务重启后仍可恢复待确认 SQL 与 interrupt 状态。"""
     from sqlalchemy import text
-    engine = _get_engine(uri)
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                logger.warning("保存运行时状态降级：数据库不可用")
+                return
             conn.execute(
                 text(f"""
                     INSERT INTO {_STATE_TABLE_NAME} (thread_id, pending_sql, interrupted, updated_at)
@@ -239,10 +240,12 @@ def upsert_conversation_session(
 ) -> None:
     """创建或更新会话元数据，供前端左侧会话列表展示。"""
     from sqlalchemy import text
-    engine = _get_engine(uri)
     safe_title = (title or "新对话").strip()[:255] or "新对话"
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                logger.warning("保存会话元数据降级：数据库不可用")
+                return
             conn.execute(
                 text(f"""
                     INSERT INTO {_SESSION_TABLE_NAME} (thread_id, conversation_id, user_id, title, updated_at)
@@ -273,12 +276,13 @@ def upsert_conversation_session(
 
 
 def list_conversation_sessions(uri: str, user_id: Optional[str]) -> List[dict]:
-    """按更新时间倒序列出某用户的会话列表。未传 user_id 时仅返回匿名会话。"""
+    """按更新时间倒序列出某用户的会话列表。连接失败时降级返回空列表。"""
     from sqlalchemy import text
-    engine = _get_engine(uri)
     out: List[dict] = []
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                return out
             if user_id is None:
                 rows = conn.execute(
                     text(f"""
@@ -312,11 +316,12 @@ def list_conversation_sessions(uri: str, user_id: Optional[str]) -> List[dict]:
 
 
 def get_conversation_session(uri: str, thread_id: str) -> Optional[dict]:
-    """按 thread_id 读取单个会话元数据。"""
+    """按 thread_id 读取单个会话元数据。连接失败时降级返回 None。"""
     from sqlalchemy import text
-    engine = _get_engine(uri)
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                return None
             row = conn.execute(
                 text(f"""
                     SELECT conversation_id, user_id, title, updated_at
@@ -339,14 +344,15 @@ def get_conversation_session(uri: str, thread_id: str) -> Optional[dict]:
 
 
 def rename_conversation_session(uri: str, thread_id: str, title: str) -> bool:
-    """重命名会话标题。成功返回 True。"""
+    """重命名会话标题。成功返回 True。连接失败时降级返回 False。"""
     from sqlalchemy import text
-    engine = _get_engine(uri)
     safe_title = (title or "").strip()[:255]
     if not safe_title:
         return False
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                return False
             result = conn.execute(
                 text(f"""
                     UPDATE {_SESSION_TABLE_NAME}
@@ -365,9 +371,11 @@ def rename_conversation_session(uri: str, thread_id: str, title: str) -> bool:
 def delete_conversation_session(uri: str, thread_id: str) -> None:
     """删除某个会话的历史消息、运行时状态与会话元数据。"""
     from sqlalchemy import text
-    engine = _get_engine(uri)
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                logger.warning("删除会话降级：数据库不可用")
+                return
             conn.execute(text(f"DELETE FROM {_TABLE_NAME} WHERE thread_id = :thread_id"), {"thread_id": thread_id[:512]})
             conn.execute(text(f"DELETE FROM {_STATE_TABLE_NAME} WHERE thread_id = :thread_id"), {"thread_id": thread_id[:512]})
             conn.execute(text(f"DELETE FROM {_SESSION_TABLE_NAME} WHERE thread_id = :thread_id"), {"thread_id": thread_id[:512]})
@@ -376,55 +384,46 @@ def delete_conversation_session(uri: str, thread_id: str) -> None:
         logger.warning("删除会话失败: %s", e)
 
 
-# ---------- 异步长期记忆（asyncpg，可选） ----------
-_async_pools: Dict[str, Any] = {}
+# ---------- 异步长期记忆（asyncpg，可选，通过 db_resilience 管理连接池） ----------
 
 
 async def _get_async_pool(uri: str):
-    """按 uri 复用 asyncpg 连接池。"""
-    global _async_pools
-    key = (uri or "").strip()
-    if not key:
-        raise ValueError("chat_history uri is empty")
-    if key not in _async_pools:
-        try:
-            import asyncpg
-            _async_pools[key] = await asyncpg.create_pool(key, min_size=1, max_size=5, command_timeout=10)
-        except Exception as e:
-            logger.warning("asyncpg 连接池创建失败，将回退同步: %s", e)
-            raise
-    return _async_pools[key]
+    """按 uri 复用 asyncpg 连接池（委托 db_resilience，含重试）。"""
+    return await get_async_pool(uri)
 
 
 async def load_messages_async(uri: str, thread_id: str, limit: int = 0) -> List[BaseMessage]:
-    """异步从 PostgreSQL 加载历史消息，语义同 load_messages。"""
-    pool = await _get_async_pool(uri)
+    """异步从 PostgreSQL 加载历史消息。连接失败时降级返回空列表。"""
     out: List[BaseMessage] = []
     try:
-        if limit > 0:
-            rows = await pool.fetch(
-                "SELECT role, content FROM chat_history WHERE thread_id = $1 ORDER BY id DESC LIMIT $2",
-                thread_id[:512], limit,
-            )
-            rows = list(reversed(rows))
-        else:
-            rows = await pool.fetch(
-                "SELECT role, content FROM chat_history WHERE thread_id = $1 ORDER BY id",
-                thread_id[:512],
-            )
-        for row in rows:
-            role, content = row["role"], (row["content"] or "").strip()
-            if role in ("user", "human"):
-                out.append(HumanMessage(content=content))
+        async with safe_async_connection(uri, critical=False) as conn:
+            if conn is None:
+                logger.warning("加载对话历史降级(async)：数据库不可用")
+                return out
+            if limit > 0:
+                rows = await conn.fetch(
+                    "SELECT role, content FROM chat_history WHERE thread_id = $1 ORDER BY id DESC LIMIT $2",
+                    thread_id[:512], limit,
+                )
+                rows = list(reversed(rows))
             else:
-                out.append(AIMessage(content=content))
+                rows = await conn.fetch(
+                    "SELECT role, content FROM chat_history WHERE thread_id = $1 ORDER BY id",
+                    thread_id[:512],
+                )
+            for row in rows:
+                role, content = row["role"], (row["content"] or "").strip()
+                if role in ("user", "human"):
+                    out.append(HumanMessage(content=content))
+                else:
+                    out.append(AIMessage(content=content))
     except Exception as e:
         logger.warning("加载对话历史失败(async): %s", e)
     return out
 
 
 async def append_messages_async(uri: str, thread_id: str, messages: List[BaseMessage]) -> None:
-    """异步追加消息到 chat_history，语义同 append_messages（含 content 长度与重复抑制）。"""
+    """异步追加消息到 chat_history。连接失败时降级跳过（不阻断对话）。"""
     if not messages:
         return
     from config import get_settings
@@ -444,9 +443,11 @@ async def append_messages_async(uri: str, thread_id: str, messages: List[BaseMes
         payloads.append((role, content[:65535]))
     if not payloads:
         return
-    pool = await _get_async_pool(uri)
     try:
-        async with pool.acquire() as conn:
+        async with safe_async_connection(uri, critical=False) as conn:
+            if conn is None:
+                logger.warning("写入对话历史降级(async)：数据库不可用")
+                return
             recent = await conn.fetch(
                 "SELECT role, content FROM chat_history WHERE thread_id = $1 ORDER BY id DESC LIMIT $2",
                 thread_id[:512], len(payloads),
@@ -464,16 +465,18 @@ async def append_messages_async(uri: str, thread_id: str, messages: List[BaseMes
 
 
 async def load_runtime_state_async(uri: str, thread_id: str) -> dict:
-    """异步加载运行时状态，语义同 load_runtime_state。"""
-    pool = await _get_async_pool(uri)
+    """异步加载运行时状态。连接失败时降级返回默认值。"""
     try:
-        row = await pool.fetchrow(
-            f"SELECT pending_sql, interrupted FROM {_STATE_TABLE_NAME} WHERE thread_id = $1",
-            thread_id[:512],
-        )
-        if not row:
-            return {"pending_sql": None, "interrupted": False}
-        return {"pending_sql": row["pending_sql"], "interrupted": bool(row["interrupted"])}
+        async with safe_async_connection(uri, critical=False) as conn:
+            if conn is None:
+                return {"pending_sql": None, "interrupted": False}
+            row = await conn.fetchrow(
+                f"SELECT pending_sql, interrupted FROM {_STATE_TABLE_NAME} WHERE thread_id = $1",
+                thread_id[:512],
+            )
+            if not row:
+                return {"pending_sql": None, "interrupted": False}
+            return {"pending_sql": row["pending_sql"], "interrupted": bool(row["interrupted"])}
     except Exception as e:
         logger.warning("加载会话运行时状态失败(async): %s", e)
         return {"pending_sql": None, "interrupted": False}
@@ -482,10 +485,12 @@ async def load_runtime_state_async(uri: str, thread_id: str) -> dict:
 async def save_runtime_state_async(
     uri: str, thread_id: str, pending_sql: Optional[str], interrupted: bool,
 ) -> None:
-    """异步保存运行时状态，语义同 save_runtime_state。"""
-    pool = await _get_async_pool(uri)
+    """异步保存运行时状态。连接失败时降级跳过。"""
     try:
-        async with pool.acquire() as conn:
+        async with safe_async_connection(uri, critical=False) as conn:
+            if conn is None:
+                logger.warning("保存运行时状态降级(async)：数据库不可用")
+                return
             await conn.execute(
                 f"""
                 INSERT INTO {_STATE_TABLE_NAME} (thread_id, pending_sql, interrupted, updated_at)
@@ -501,13 +506,7 @@ async def save_runtime_state_async(
 
 async def dispose_async_pools() -> None:
     """关闭所有 asyncpg 连接池（应用关闭时调用）。"""
-    global _async_pools
-    for key, pool in list(_async_pools.items()):
-        try:
-            await pool.close()
-        except Exception as e:
-            logger.debug("关闭 asyncpg 池 %s: %s", key[:50], e)
-    _async_pools.clear()
+    await dispose_all_async_pools()
 
 
 def ensure_table_if_configured(uri: Optional[str]) -> None:

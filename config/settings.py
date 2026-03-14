@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     rag_answer_max_regenerate_times: int = 3  # 最终答案与文档关联度低时，最多重生成 3 次
     # 注入生成阶段的检索上下文总字符数上限，0 表示不限制；超出则从末尾丢弃 chunk，控制 token
     rag_max_context_chars: int = 0
+    # RAG 检索结果缓存：进程内 LRU 条数，0 表示关闭；相同 query 命中则跳过 Milvus+BM25
+    rag_retrieval_cache_max_entries: int = 0
+    rag_retrieval_cache_ttl_seconds: int = 300  # 仅当 max_entries>0 时有效
 
     # ---------- Text2SQL ----------
     text2sql_database_uri: str = "sqlite:///./data/kb.db"
@@ -83,6 +86,8 @@ class Settings(BaseSettings):
     mineru_concurrency_limit: int = 5
     # MinerU API 单次请求超时（秒）
     mineru_timeout_seconds: int = 120
+    # MinerU 请求失败时重试次数（5xx/超时/连接错误），0 表示不重试
+    mineru_retry_times: int = 2
 
     # ---------- 路径 ----------
     upload_dir: str = "./data/uploads"
@@ -108,6 +113,10 @@ class Settings(BaseSettings):
     asyncio_thread_pool_workers: int = 0
     # Uvicorn 进程 worker 数；仅在生产启动（无 reload）时生效，默认 1。>1 时需配合负载均衡「会话保持」使用（见 docs/ASYNC_CONCURRENCY.md）
     uvicorn_workers: int = 7
+    # API 全局限流：同时处理的请求数上限，0 表示不限制；超限返回 503
+    api_max_concurrent_requests: int = 0
+    # 优雅关闭：SIGTERM 后等待进行中请求完成的秒数
+    graceful_shutdown_timeout_seconds: int = 30
 
     # ---------- 问答缓存（Redis） ----------
     redis_url: str = "redis://localhost:6379/0"  # 为空或连接失败时不使用缓存
@@ -123,6 +132,21 @@ class Settings(BaseSettings):
     redis_socket_connect_timeout: float = 2.0  # 建连超时（秒）
     redis_socket_timeout: float = 5.0  # 读写超时（秒）
     redis_health_check_interval: int = 30  # 连接池健康检查间隔（秒），0 表示不检查
+    # Redis 哨兵（可选）：当两者均配置时，通过 Sentinel 获取 master 连接，忽略 redis_url 直连
+    redis_sentinel_service_name: str = ""  # 如 mymaster
+    redis_sentinel_nodes: str = ""  # 如 127.0.0.1:26379,127.0.0.1:26380
+
+    # ---------- 多 worker 共享状态（P3） ----------
+    # 当配置且 Redis 可用时，解析缓存、待确认 SQL、人工中断状态存 Redis，多进程/多 worker 共享
+    shared_state_redis_url: str = ""  # 为空则使用进程内内存（单 worker 或无需共享）
+
+    # ---------- 数据库连接池与熔断 ----------
+    postgresql_pool_size: int = 5
+    postgresql_max_overflow: int = 10
+    postgresql_pool_timeout: int = 10
+    postgresql_statement_timeout_ms: int = 0  # 单条 SQL 超时（毫秒），0 表示不限制
+    db_circuit_breaker_threshold: int = 5  # 连续失败达该次数后熔断
+    db_circuit_breaker_recovery_seconds: float = 30.0  # 熔断持续时间，到期后半开探测
 
     # ---------- PostgreSQL 探活 ----------
     postgresql_keepalive_uri: str = ""  # 为空则不探活；设为 postgresql://... 时每分钟执行 SELECT 1 保持连接可用

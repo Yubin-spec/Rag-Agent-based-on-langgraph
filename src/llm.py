@@ -352,19 +352,26 @@ class _DeepSeekChatRouter(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         last_error: Optional[Exception] = None
-        for state in self._pool.ordered_candidates():
+        candidates = self._pool.ordered_candidates()
+        retries = max(0, int(getattr(get_settings(), "agent_llm_retry_times", 2)))
+        for state in candidates:
             client = self._pool.get_client(state, self.model_name, self.temperature)
-            self._pool.acquire(state)
-            try:
-                _LAST_ENDPOINT_NAME.set(state.config.name or "")
-                result = client._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
-                self._pool.release_success(state)
-                return result
-            except Exception as exc:
-                self._pool.release_failure(state, exc)
-                last_error = exc
-                if not _is_retryable_error(exc):
-                    raise
+            for attempt in range(retries + 1 if len(candidates) == 1 else 1):
+                self._pool.acquire(state)
+                try:
+                    _LAST_ENDPOINT_NAME.set(state.config.name or "")
+                    result = client._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+                    self._pool.release_success(state)
+                    return result
+                except Exception as exc:
+                    self._pool.release_failure(state, exc)
+                    last_error = exc
+                    if not _is_retryable_error(exc):
+                        raise
+                    if attempt < retries and len(candidates) == 1:
+                        time.sleep(1.0 * (2 ** attempt))
+                        continue
+                    break
         if last_error is not None:
             raise last_error
         raise RuntimeError("未配置可用的 DeepSeek endpoint。")
@@ -376,20 +383,28 @@ class _DeepSeekChatRouter(BaseChatModel):
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> ChatResult:
+        import asyncio
         last_error: Optional[Exception] = None
-        for state in self._pool.ordered_candidates():
+        candidates = self._pool.ordered_candidates()
+        retries = max(0, int(getattr(get_settings(), "agent_llm_retry_times", 2)))
+        for state in candidates:
             client = self._pool.get_client(state, self.model_name, self.temperature)
-            self._pool.acquire(state)
-            try:
-                _LAST_ENDPOINT_NAME.set(state.config.name or "")
-                result = await client._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
-                self._pool.release_success(state)
-                return result
-            except Exception as exc:
-                self._pool.release_failure(state, exc)
-                last_error = exc
-                if not _is_retryable_error(exc):
-                    raise
+            for attempt in range(retries + 1 if len(candidates) == 1 else 1):
+                self._pool.acquire(state)
+                try:
+                    _LAST_ENDPOINT_NAME.set(state.config.name or "")
+                    result = await client._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+                    self._pool.release_success(state)
+                    return result
+                except Exception as exc:
+                    self._pool.release_failure(state, exc)
+                    last_error = exc
+                    if not _is_retryable_error(exc):
+                        raise
+                    if attempt < retries and len(candidates) == 1:
+                        await asyncio.sleep(1.0 * (2 ** attempt))
+                        continue
+                    break
         if last_error is not None:
             raise last_error
         raise RuntimeError("未配置可用的 DeepSeek endpoint。")
@@ -402,23 +417,29 @@ class _DeepSeekChatRouter(BaseChatModel):
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
         last_error: Optional[Exception] = None
-        for state in self._pool.ordered_candidates():
+        candidates = self._pool.ordered_candidates()
+        retries = max(0, int(getattr(get_settings(), "agent_llm_retry_times", 2)))
+        for state in candidates:
             client = self._pool.get_client(state, self.model_name, self.temperature)
-            self._pool.acquire(state)
-            yielded = False
-            try:
-                _LAST_ENDPOINT_NAME.set(state.config.name or "")
-                for chunk in client._stream(messages, stop=stop, run_manager=run_manager, **kwargs):
-                    yielded = True
-                    yield chunk
-                self._pool.release_success(state)
-                return
-            except Exception as exc:
-                self._pool.release_failure(state, exc)
-                last_error = exc
-                # 流式场景一旦已经开始输出，再切节点会打断上下文，直接抛出。
-                if yielded or not _is_retryable_error(exc):
-                    raise
+            for attempt in range(retries + 1 if len(candidates) == 1 else 1):
+                self._pool.acquire(state)
+                yielded = False
+                try:
+                    _LAST_ENDPOINT_NAME.set(state.config.name or "")
+                    for chunk in client._stream(messages, stop=stop, run_manager=run_manager, **kwargs):
+                        yielded = True
+                        yield chunk
+                    self._pool.release_success(state)
+                    return
+                except Exception as exc:
+                    self._pool.release_failure(state, exc)
+                    last_error = exc
+                    if yielded or not _is_retryable_error(exc):
+                        raise
+                    if attempt < retries and len(candidates) == 1:
+                        time.sleep(1.0 * (2 ** attempt))
+                        continue
+                    break
         if last_error is not None:
             raise last_error
         raise RuntimeError("未配置可用的 DeepSeek endpoint。")
@@ -430,23 +451,31 @@ class _DeepSeekChatRouter(BaseChatModel):
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
+        import asyncio
         last_error: Optional[Exception] = None
-        for state in self._pool.ordered_candidates():
+        candidates = self._pool.ordered_candidates()
+        retries = max(0, int(getattr(get_settings(), "agent_llm_retry_times", 2)))
+        for state in candidates:
             client = self._pool.get_client(state, self.model_name, self.temperature)
-            self._pool.acquire(state)
-            yielded = False
-            try:
-                _LAST_ENDPOINT_NAME.set(state.config.name or "")
-                async for chunk in client._astream(messages, stop=stop, run_manager=run_manager, **kwargs):
-                    yielded = True
-                    yield chunk
-                self._pool.release_success(state)
-                return
-            except Exception as exc:
-                self._pool.release_failure(state, exc)
-                last_error = exc
-                if yielded or not _is_retryable_error(exc):
-                    raise
+            for attempt in range(retries + 1 if len(candidates) == 1 else 1):
+                self._pool.acquire(state)
+                yielded = False
+                try:
+                    _LAST_ENDPOINT_NAME.set(state.config.name or "")
+                    async for chunk in client._astream(messages, stop=stop, run_manager=run_manager, **kwargs):
+                        yielded = True
+                        yield chunk
+                    self._pool.release_success(state)
+                    return
+                except Exception as exc:
+                    self._pool.release_failure(state, exc)
+                    last_error = exc
+                    if yielded or not _is_retryable_error(exc):
+                        raise
+                    if attempt < retries and len(candidates) == 1:
+                        await asyncio.sleep(1.0 * (2 ** attempt))
+                        continue
+                    break
         if last_error is not None:
             raise last_error
         raise RuntimeError("未配置可用的 DeepSeek endpoint。")

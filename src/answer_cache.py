@@ -139,31 +139,71 @@ def _is_redis_connection_error(e: Exception) -> bool:
     return False
 
 
+def _parse_sentinel_nodes(nodes_str: str):
+    """解析 redis_sentinel_nodes 字符串为 [(host, port), ...]。"""
+    out = []
+    for part in (nodes_str or "").strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            host, _, port_str = part.rpartition(":")
+            try:
+                out.append((host.strip(), int(port_str.strip())))
+            except ValueError:
+                continue
+        else:
+            out.append((part, 26379))
+    return out
+
+
 async def _get_redis():
     """
     懒加载全局 Redis 连接（redis.asyncio + 连接池）。
-    answer_cache_enabled 为 False 或 redis_url 为空时返回 None。
-    使用 Lock 保证并发下只建一次池。
+    当配置 redis_sentinel_service_name 与 redis_sentinel_nodes 时，通过 Sentinel 获取 master；
+    否则使用 redis_url 直连。
+    answer_cache_enabled 为 False 且未配 Sentinel 时返回 None。
     """
     global _redis
     if _redis is not None:
         return _redis
     settings = get_settings()
-    if not getattr(settings, "answer_cache_enabled", True) or not getattr(settings, "redis_url", "").strip():
+    if not getattr(settings, "answer_cache_enabled", True):
+        return None
+    sentinel_name = (getattr(settings, "redis_sentinel_service_name", None) or "").strip()
+    sentinel_nodes_str = (getattr(settings, "redis_sentinel_nodes", None) or "").strip()
+    use_sentinel = sentinel_name and sentinel_nodes_str
+    if not use_sentinel and not (getattr(settings, "redis_url", "") or "").strip():
         return None
     async with _redis_lock:
         if _redis is not None:
             return _redis
         try:
             from redis.asyncio import Redis
-            _redis = Redis.from_url(
-                settings.redis_url,
-                decode_responses=True,
-                socket_connect_timeout=getattr(settings, "redis_socket_connect_timeout", 2.0),
-                socket_timeout=getattr(settings, "redis_socket_timeout", 5.0),
-                health_check_interval=getattr(settings, "redis_health_check_interval", 30) or 0,
-                max_connections=getattr(settings, "redis_max_connections", 10),
-            )
+            if use_sentinel:
+                from redis.asyncio.sentinel import Sentinel
+                nodes = _parse_sentinel_nodes(sentinel_nodes_str)
+                if not nodes:
+                    raise ValueError("redis_sentinel_nodes 解析后为空")
+                sentinel = Sentinel(
+                    nodes,
+                    socket_timeout=getattr(settings, "redis_socket_connect_timeout", 2.0),
+                )
+                _redis = sentinel.master_for(
+                    sentinel_name,
+                    decode_responses=True,
+                    socket_timeout=getattr(settings, "redis_socket_timeout", 5.0),
+                )
+                logger.info("Redis 已通过 Sentinel 连接: service=%s", sentinel_name)
+            else:
+                _redis = Redis.from_url(
+                    settings.redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=getattr(settings, "redis_socket_connect_timeout", 2.0),
+                    socket_timeout=getattr(settings, "redis_socket_timeout", 5.0),
+                    health_check_interval=getattr(settings, "redis_health_check_interval", 30) or 0,
+                    max_connections=getattr(settings, "redis_max_connections", 10),
+                )
             return _redis
         except Exception as e:
             logger.exception("Redis 连接失败，问答缓存将不可用: %s", e)
@@ -186,6 +226,18 @@ async def close_redis_connection() -> None:
             except Exception as e:
                 logger.debug("关闭 Redis 连接时异常: %s", e)
             _redis = None
+
+
+async def redis_ping() -> bool:
+    """探活：若 Redis 已连接则执行 PING，返回是否成功。未配置或未连接时返回 False。"""
+    client = await _get_redis()
+    if client is None:
+        return False
+    try:
+        await client.ping()
+        return True
+    except Exception:
+        return False
 
 
 async def get_cached_answer(question: str) -> Optional[str]:

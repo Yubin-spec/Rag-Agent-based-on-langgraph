@@ -36,6 +36,132 @@ _SQL_MUST_SELECT = re.compile(r"^\s*SELECT\b", re.IGNORECASE | re.DOTALL)
 _SQL_DANGEROUS = re.compile(r"^\s*(DELETE|UPDATE|INSERT|TRUNCATE)\b", re.IGNORECASE | re.DOTALL)
 
 
+# ---------- SQL 格式清洗与提取 ----------
+
+# 代码块围栏：```sql ... ``` 或 ``` ... ```
+_CODE_FENCE_RE = re.compile(
+    r"```(?:\w*)\s*\n?(.*?)\n?\s*```",
+    re.DOTALL,
+)
+# 行内代码：`SELECT ...`
+_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+# LLM 常见前缀废话
+_LLM_PREFIX_RE = re.compile(
+    r"^(?:以下是|这是|生成的|对应的|SQL\s*[:：]|查询\s*[:：]|结果\s*[:：])\s*",
+    re.IGNORECASE,
+)
+# 非 ASCII 控制字符 / 零宽字符 / BOM 等乱码
+_GARBLED_CHARS_RE = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f"
+    r"\u200b-\u200f\u2028-\u202f\u2060\ufeff\ufffe\uffff]"
+)
+# 中文标点 → ASCII 标点（LLM 偶尔输出中文逗号/分号/括号）
+_CN_PUNCT_MAP = str.maketrans({
+    "，": ",", "；": ";", "（": "(", "）": ")", "：": ":",
+    "'": "'", "'": "'", """: "\"", """: "\"",
+})
+# 匹配 SQL 关键字开头（用于从混合文本中定位 SQL 起始位置）
+_SQL_KEYWORD_START_RE = re.compile(
+    r"(?:^|\n)\s*(SELECT|DELETE|UPDATE|INSERT|WITH)\b",
+    re.IGNORECASE,
+)
+# SQL 关键字集合（用于判断某行是否属于 SQL 语句的一部分）
+_SQL_CONTINUATION_RE = re.compile(
+    r"^\s*(?:SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|CROSS|ON|AND|OR|"
+    r"ORDER|GROUP|HAVING|LIMIT|OFFSET|UNION|EXCEPT|INTERSECT|AS|SET|VALUES|"
+    r"INTO|BETWEEN|LIKE|IN|IS|NOT|NULL|CASE|WHEN|THEN|ELSE|END|"
+    r"WITH|DELETE|UPDATE|INSERT|EXISTS|DISTINCT|ALL|ANY|ASC|DESC|"
+    r"COUNT|SUM|AVG|MAX|MIN|COALESCE|CAST|"
+    r"[A-Za-z_]\w*\s*[.,=<>!]|"  # column/table refs with operators
+    r"[A-Za-z_]\w*\.\w+|"  # table.column
+    r"\))",  # closing paren
+    re.IGNORECASE,
+)
+
+
+def _trim_trailing_non_sql(text: str) -> str:
+    """去除 SQL 末尾混入的自然语言解释行。"""
+    lines = text.split("\n")
+    end = len(lines)
+    while end > 1:
+        line = lines[end - 1].strip()
+        if not line:
+            end -= 1
+            continue
+        if _SQL_CONTINUATION_RE.match(line):
+            break
+        if any(line.startswith(ch) for ch in ("--", "/*")):
+            break
+        has_cjk = any("\u4e00" <= c <= "\u9fff" for c in line)
+        has_sql_kw = bool(re.search(r"\b(?:SELECT|FROM|WHERE|JOIN|AND|OR|ORDER|GROUP|LIMIT)\b", line, re.IGNORECASE))
+        if has_cjk and not has_sql_kw:
+            end -= 1
+            continue
+        break
+    return "\n".join(lines[:end]).strip()
+
+
+def _sanitize_and_extract_sql(raw: str) -> str:
+    """
+    从 LLM 原始输出中提取并清洗 SQL 语句。
+
+    处理场景：
+    1. 代码块围栏：```sql\\nSELECT ...\\n```
+    2. 行内代码：`SELECT ...`
+    3. 前后有解释文字，SQL 夹在中间
+    4. 中文标点混入（中文逗号、分号、括号）
+    5. 零宽字符 / BOM / 控制字符等乱码
+    6. 多条 SQL（取第一条 SELECT / 目标语句）
+    7. 尾部多余分号、空行、自然语言解释
+    """
+    if not raw:
+        return ""
+
+    text = raw.strip()
+
+    # 1. 代码块围栏提取（优先级最高）
+    fence_matches = _CODE_FENCE_RE.findall(text)
+    if fence_matches:
+        text = fence_matches[0].strip()
+    else:
+        # 2. 行内代码提取（整段只有一个行内代码且看起来像 SQL）
+        inline_matches = _INLINE_CODE_RE.findall(text)
+        if inline_matches:
+            for m in inline_matches:
+                if _SQL_KEYWORD_START_RE.search(m):
+                    text = m.strip()
+                    break
+
+    # 3. 去掉 LLM 常见前缀废话
+    text = _LLM_PREFIX_RE.sub("", text).strip()
+
+    # 4. 如果仍然不以 SQL 关键字开头，尝试从文本中定位 SQL 起始
+    if not _SQL_KEYWORD_START_RE.match(text):
+        m = _SQL_KEYWORD_START_RE.search(text)
+        if m:
+            text = text[m.start():].strip()
+
+    # 5. 去除 SQL 末尾混入的自然语言解释
+    text = _trim_trailing_non_sql(text)
+
+    # 6. 清理乱码字符
+    text = _GARBLED_CHARS_RE.sub("", text)
+
+    # 7. 中文标点 → ASCII
+    text = text.translate(_CN_PUNCT_MAP)
+
+    # 8. 多条 SQL 用分号分隔时，取第一条非空语句
+    if ";" in text:
+        parts = [p.strip() for p in text.split(";") if p.strip()]
+        if parts:
+            text = parts[0]
+
+    # 9. 去掉尾部分号和空白
+    text = text.rstrip(";").strip()
+
+    return text
+
+
 def _extract_tables_from_sql(sql: str) -> List[str]:
     """从 SQL 中提取涉及的表名（FROM / JOIN），用于意图学习。"""
     tables: List[str] = []
@@ -258,9 +384,9 @@ def _validate_sql_uses_relations(sql: str, relations: List[TableRelation]) -> Tu
 def _validate_sql_syntax(sql: str, database_uri: str) -> Tuple[bool, str]:
     """用 EXPLAIN 检查语法；SQLite 可用。返回 (是否合法, 错误信息)。"""
     try:
-        from sqlalchemy import create_engine, text
-        engine = create_engine(database_uri)
-        with engine.connect() as conn:
+        from sqlalchemy import text
+        from src.db_resilience import safe_connection
+        with safe_connection(database_uri, retries=1, retry_delay=0.3, critical=True) as conn:
             conn.execute(text(f"EXPLAIN QUERY PLAN {sql}"))
         return True, ""
     except Exception as e:
@@ -283,13 +409,15 @@ def _ensure_limit(sql: str, default_limit: int) -> str:
 
 
 def _execute_sql(sql: str, database_uri: str) -> ExecuteResult:
-    """执行 SQL 并返回结果；用于 SELECT 或人工确认后的 DELETE/UPDATE。区分字段/表错误与其它异常。"""
+    """执行 SQL 并返回结果；用于 SELECT 或人工确认后的 DELETE/UPDATE。区分字段/表错误与连接错误。"""
     try:
-        from sqlalchemy import create_engine, text
-        engine = create_engine(database_uri)
-        with engine.connect() as conn:
+        from sqlalchemy import text
+        from src.db_resilience import safe_connection
+        with safe_connection(database_uri, retries=1, retry_delay=0.3, critical=True) as conn:
             rows = conn.execute(text(sql)).fetchall()
             return ExecuteResult(ok=True, rows=[list(r) for r in rows])
+    except ConnectionError as e:
+        return ExecuteResult(ok=False, error_type="connection", error_message=f"数据库连接失败: {e}")
     except Exception as e:
         msg = str(e).lower()
         if "no such column" in msg or "no such table" in msg or "ambiguous" in msg:
@@ -409,8 +537,7 @@ class Text2SQL:
             raw = (out.content or "").strip()
             if "CANNOT_ANSWER" in raw:
                 return "无法根据当前表结构生成删除/修改语句，请转人工或补充条件。"
-            sql = re.sub(r"^```\w*\n?", "", raw)
-            sql = re.sub(r"\n?```\s*$", "", sql).strip()
+            sql = _sanitize_and_extract_sql(raw)
             if not sql:
                 return "涉及删除或修改数据的操作需要人工确认后才能执行。请转人工或在使用删除功能前再次确认。"
             if not _SQL_DANGEROUS.search(sql):
@@ -454,8 +581,7 @@ class Text2SQL:
                 raw = (out.content or "").strip()
                 if "CANNOT_ANSWER" in raw:
                     return None
-                sql = re.sub(r"^```\w*\n?", "", raw)
-                sql = re.sub(r"\n?```\s*$", "", sql).strip()
+                sql = _sanitize_and_extract_sql(raw)
                 if not sql:
                     continue
                 ok, err = _validate_sql_select_only(sql)
@@ -493,8 +619,7 @@ class Text2SQL:
                 out = self._chain_sql.invoke({"schema_block": schema_block, "question": question})
                 raw = (out.content or "").strip()
                 if "CANNOT_ANSWER" not in raw:
-                    sql_retry = re.sub(r"^```\w*\n?", "", raw)
-                    sql_retry = re.sub(r"\n?```\s*$", "", sql_retry).strip()
+                    sql_retry = _sanitize_and_extract_sql(raw)
                     if sql_retry:
                         ok1, _ = _validate_sql_select_only(sql_retry)
                         ok2, _ = _validate_sql_syntax(sql_retry, uri)

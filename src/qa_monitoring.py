@@ -24,10 +24,10 @@ _FEEDBACK_TABLE = "qa_feedback"
 def _ensure_table(uri: str) -> None:
     """创建问答监控与反馈分析所需的 PostgreSQL 表。"""
 
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import text
+    from src.db_resilience import safe_connection
 
-    engine = create_engine(uri, pool_pre_ping=True)
-    with engine.connect() as conn:
+    with safe_connection(uri, retries=3, retry_delay=1.0, critical=True) as conn:
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS {_OBS_TABLE} (
                 observation_id    VARCHAR(64) PRIMARY KEY,
@@ -104,7 +104,6 @@ def _ensure_table(uri: str) -> None:
             ON {_FEEDBACK_TABLE}(rating, created_at DESC)
         """))
         conn.commit()
-    engine.dispose()
 
 
 def ensure_table_if_configured(uri: Optional[str]) -> None:
@@ -119,18 +118,20 @@ def ensure_table_if_configured(uri: Optional[str]) -> None:
 
 
 def save_observation(uri: str, observation: dict[str, Any], trace: Optional[dict[str, Any]] = None) -> None:
-    """保存一条问答观测记录，并可选写入对应的 RAG 追踪信息。"""
+    """保存一条问答观测记录，并可选写入对应的 RAG 追踪信息。连接失败时降级跳过。"""
 
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import text
+    from src.db_resilience import safe_connection
 
-    engine = create_engine(uri, pool_pre_ping=True)
     obs = dict(observation or {})
     observation_id = str(obs.get("observation_id") or "").strip()
     if not observation_id:
-        engine.dispose()
         return
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                logger.warning("保存问答观测降级：数据库不可用")
+                return
             conn.execute(
                 text(f"""
                     INSERT INTO {_OBS_TABLE} (
@@ -211,19 +212,19 @@ def save_observation(uri: str, observation: dict[str, Any], trace: Optional[dict
             conn.commit()
     except Exception as e:
         logger.warning("保存问答观测失败: %s", e)
-    finally:
-        engine.dispose()
 
 
 def list_conversation_observations(uri: str, conversation_id: str, user_id: Optional[str]) -> list[dict[str, Any]]:
-    """按时间顺序列出某会话下的观测记录，用于将 observation_id 映射回历史消息。"""
+    """按时间顺序列出某会话下的观测记录。连接失败时降级返回空列表。"""
 
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import text
+    from src.db_resilience import safe_connection
 
-    engine = create_engine(uri, pool_pre_ping=True)
     out: list[dict[str, Any]] = []
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                return out
             if user_id is None:
                 rows = conn.execute(
                     text(f"""
@@ -257,8 +258,6 @@ def list_conversation_observations(uri: str, conversation_id: str, user_id: Opti
             })
     except Exception as e:
         logger.warning("读取会话观测记录失败: %s", e)
-    finally:
-        engine.dispose()
     return out
 
 
@@ -272,15 +271,18 @@ def upsert_feedback(
     tags: list[str],
     free_text: str,
 ) -> dict[str, Any]:
-    """按 observation_id + actor_key 记录或更新反馈。"""
+    """按 observation_id + actor_key 记录或更新反馈。连接失败时降级返回输入数据。"""
 
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import text
+    from src.db_resilience import safe_connection
 
-    engine = create_engine(uri, pool_pre_ping=True)
     actor_key = str(user_id or f"anon:{conversation_id}")[:512]
     safe_tags = [str(tag).strip()[:64] for tag in (tags or []) if str(tag).strip()]
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                logger.warning("保存问答反馈降级：数据库不可用")
+            else:
             conn.execute(
                 text(f"""
                     INSERT INTO {_FEEDBACK_TABLE} (
@@ -310,8 +312,6 @@ def upsert_feedback(
             conn.commit()
     except Exception as e:
         logger.warning("保存问答反馈失败: %s", e)
-    finally:
-        engine.dispose()
     return {
         "observation_id": observation_id[:64],
         "conversation_id": conversation_id[:128],
@@ -323,14 +323,16 @@ def upsert_feedback(
 
 
 def get_feedback_map(uri: str, conversation_id: str, user_id: Optional[str]) -> dict[str, dict[str, Any]]:
-    """读取某会话下的反馈映射：observation_id -> feedback。"""
+    """读取某会话下的反馈映射。连接失败时降级返回空字典。"""
 
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import text
+    from src.db_resilience import safe_connection
 
-    engine = create_engine(uri, pool_pre_ping=True)
     out: dict[str, dict[str, Any]] = {}
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                return out
             if user_id is None:
                 rows = conn.execute(
                     text(f"""
@@ -358,17 +360,14 @@ def get_feedback_map(uri: str, conversation_id: str, user_id: Optional[str]) -> 
             }
     except Exception as e:
         logger.warning("读取反馈映射失败: %s", e)
-    finally:
-        engine.dispose()
     return out
 
 
 def get_summary(uri: str, *, days: int = 7, user_id: Optional[str] = None) -> dict[str, Any]:
-    """聚合问答效果总览，供看板概览展示。"""
+    """聚合问答效果总览。连接失败时降级返回零值结果。"""
 
-    from sqlalchemy import create_engine, text
-
-    engine = create_engine(uri, pool_pre_ping=True)
+    from sqlalchemy import text
+    from src.db_resilience import safe_connection
     days = max(1, int(days))
     result = {
         "days": days,
@@ -384,7 +383,9 @@ def get_summary(uri: str, *, days: int = 7, user_id: Optional[str] = None) -> di
         "fallback_count": 0,
     }
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                return result
             params = {"days": days}
             user_filter = "o.user_id IS NULL" if user_id is None else "o.user_id = :user_id"
             if user_id is not None:
@@ -435,22 +436,22 @@ def get_summary(uri: str, *, days: int = 7, user_id: Optional[str] = None) -> di
                 result["positive_feedback_count"] = int(fb_row[1] or 0)
     except Exception as e:
         logger.warning("读取问答监控汇总失败: %s", e)
-    finally:
-        engine.dispose()
     return result
 
 
 def list_bad_cases(uri: str, *, days: int = 7, user_id: Optional[str] = None, limit: int = 20) -> list[dict[str, Any]]:
     """列出近期疑似效果不佳的案例：差评、低 grounding、兜底回答优先。"""
 
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import text
+    from src.db_resilience import safe_connection
 
-    engine = create_engine(uri, pool_pre_ping=True)
     days = max(1, int(days))
     limit = max(1, min(int(limit), 100))
     out: list[dict[str, Any]] = []
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                return out
             params = {"days": days, "limit": limit}
             user_filter = "o.user_id IS NULL" if user_id is None else "o.user_id = :user_id"
             if user_id is not None:
@@ -499,22 +500,22 @@ def list_bad_cases(uri: str, *, days: int = 7, user_id: Optional[str] = None, li
             })
     except Exception as e:
         logger.warning("读取差评案例失败: %s", e)
-    finally:
-        engine.dispose()
     return out
 
 
 def list_feedback_tag_stats(uri: str, *, days: int = 7, user_id: Optional[str] = None, limit: int = 20) -> list[dict[str, Any]]:
     """统计近 N 天反馈标签分布。"""
 
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import text
+    from src.db_resilience import safe_connection
 
-    engine = create_engine(uri, pool_pre_ping=True)
     days = max(1, int(days))
     limit = max(1, min(int(limit), 100))
     out: list[dict[str, Any]] = []
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                return out
             params = {"days": days, "limit": limit}
             user_filter = "user_id IS NULL" if user_id is None else "user_id = :user_id"
             if user_id is not None:
@@ -538,22 +539,22 @@ def list_feedback_tag_stats(uri: str, *, days: int = 7, user_id: Optional[str] =
             out.append({"tag": row[0] or "", "count": int(row[1] or 0)})
     except Exception as e:
         logger.warning("读取反馈标签统计失败: %s", e)
-    finally:
-        engine.dispose()
     return out
 
 
 def list_scenario_stats(uri: str, *, days: int = 7, user_id: Optional[str] = None, limit: int = 20) -> list[dict[str, Any]]:
     """统计近 N 天命中的场景模板分布。"""
 
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import text
+    from src.db_resilience import safe_connection
 
-    engine = create_engine(uri, pool_pre_ping=True)
     days = max(1, int(days))
     limit = max(1, min(int(limit), 100))
     out: list[dict[str, Any]] = []
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                return out
             params = {"days": days, "limit": limit}
             user_filter = "o.user_id IS NULL" if user_id is None else "o.user_id = :user_id"
             if user_id is not None:
@@ -578,19 +579,19 @@ def list_scenario_stats(uri: str, *, days: int = 7, user_id: Optional[str] = Non
             out.append({"scenario": row[0] or "", "count": int(row[1] or 0)})
     except Exception as e:
         logger.warning("读取场景模板统计失败: %s", e)
-    finally:
-        engine.dispose()
     return out
 
 
 def delete_conversation_data(uri: str, conversation_id: str, user_id: Optional[str]) -> None:
     """删除某个会话下的问答观测、追踪与反馈数据。"""
 
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import text
+    from src.db_resilience import safe_connection
 
-    engine = create_engine(uri, pool_pre_ping=True)
     try:
-        with engine.connect() as conn:
+        with safe_connection(uri, critical=False) as conn:
+            if conn is None:
+                return
             if user_id is None:
                 rows = conn.execute(
                     text(f"SELECT observation_id FROM {_OBS_TABLE} WHERE conversation_id = :conversation_id AND user_id IS NULL"),
@@ -622,5 +623,3 @@ def delete_conversation_data(uri: str, conversation_id: str, user_id: Optional[s
             conn.commit()
     except Exception as e:
         logger.warning("删除会话监控数据失败: %s", e)
-    finally:
-        engine.dispose()
