@@ -136,6 +136,11 @@ class Settings(BaseSettings):
     redis_sentinel_service_name: str = ""  # 如 mymaster
     redis_sentinel_nodes: str = ""  # 如 127.0.0.1:26379,127.0.0.1:26380
 
+    # ---------- 会话锁 ----------
+    # 同一会话（thread_id）的并发请求是否串行化，避免图状态/待确认 SQL 被并发写坏
+    conversation_lock_enabled: bool = True
+    conversation_lock_buckets: int = 1024  # 锁分桶数，thread_id 哈希取模；不同会话可能同桶
+
     # ---------- 多 worker 共享状态（P3） ----------
     # 当配置且 Redis 可用时，解析缓存、待确认 SQL、人工中断状态存 Redis，多进程/多 worker 共享
     shared_state_redis_url: str = ""  # 为空则使用进程内内存（单 worker 或无需共享）

@@ -2,6 +2,8 @@
 
 本项目从 API 到图执行、知识库与文档解析均按**异步优先**设计，避免阻塞事件循环，支持多请求并发。
 
+> **缓存、熔断、降级**的完整策略说明见 [高并发场景下的缓存、熔断与降级策略](HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md)。
+
 ## 1. 整体原则
 
 - **异步路径不阻塞**：所有可能耗时的同步操作（DB、文件、CPU 密集）均通过 `asyncio.to_thread()` 放入线程池执行，不在 async 函数里直接调用同步阻塞 API。
@@ -47,7 +49,14 @@
   - **Docker**：在 `.env` 或 `docker-compose` 中设置 `UVICORN_WORKERS=4`，镜像内 CMD 已按该变量启动。
 - **注意**：每个 worker 是独立进程，内存中的图状态（MemorySaver）不共享。若配置 **`shared_state_redis_url`**，则解析缓存、待确认 SQL、人工中断状态会存 Redis，**多 worker 间共享**；未配置时上述状态仅进程内有效。多 worker 时仍建议负载均衡做「会话保持」，使同一会话的图状态命中同一 worker；LangGraph 的 checkpointer 可改为 Redis（如 langgraph-checkpoint-redis）实现图状态跨进程。
 
-## 6. 可选后续优化
+## 6. 会话锁（Conversation Lock）
+
+- **目的**：同一 `thread_id`（即同一会话）的并发请求会串行化，避免对图状态、待确认 SQL、持久化等的并发写冲突。
+- **范围**：`POST /chat`、`POST /chat/stream`、`POST /text2sql/confirm_execute`、`DELETE /chat/conversations/{id}`、会话重命名 PATCH 均在进入业务逻辑前按 `thread_id` 加锁；锁在请求/流式响应结束后释放。
+- **实现**：`src/conversation_lock.py` 提供异步上下文管理器 `conversation_lock(thread_id)`；按 `hash(thread_id) % conversation_lock_buckets` 分桶，锁数量有上限，不同会话可能共享同一把桶锁。
+- **配置**：`conversation_lock_enabled=true`（默认）启用；设为 `false` 可关闭锁（仅单用户/单会话场景可考虑）。`conversation_lock_buckets` 默认 1024，可按并发会话数调整。
+
+## 7. 可选后续优化
 
 - **PostgreSQL 异步驱动**：`chat_history` 已支持 asyncpg（`chat_history_use_asyncpg=true`），可减少 to_thread 占用。
 - **Milvus 异步客户端**：若官方提供 async SDK，RAG 检索可改为全异步，进一步减少 to_thread。当前 Milvus 通过 `db_resilience` 管理（重试、熔断、懒重连），详见 [数据库韧性](DB_RESILIENCE.md)。

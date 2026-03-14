@@ -81,6 +81,7 @@ from src.llm import get_deepseek_llm, get_deepseek_router_status, get_last_deeps
 from src.db_resilience import get_all_breaker_status, milvus_ping
 from src import shared_state as shared_state_module
 from src.shared_state import close_shared_state_redis
+from src.conversation_lock import conversation_lock
 
 logger = logging.getLogger(__name__)
 
@@ -915,16 +916,30 @@ async def _persist_conversation_session(
 async def chat(request: Request, req: ChatRequest):
     """
     多智能体对话（非流式）：按 thread_id（含 user_id）隔离会话，单对话最多 15 轮。
-    流程：resume 中断会话 → 检查轮数 → 问答缓存 → 「确认执行」处理 → 图 invoke → 处理 interrupt/pending_sql → 写缓存。
+    流程：会话锁 → resume 中断会话 → 检查轮数 → 问答缓存 → 「确认执行」处理 → 图 invoke → 处理 interrupt/pending_sql → 写缓存。
     """
-    settings = get_settings()
     user_id = _user_id_from_request(request, req.user_id)
     conversation_id = req.conversation_id or str(uuid.uuid4())
     thread_id = _thread_id(user_id, conversation_id)
     started_at = time.perf_counter()
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
+    async with conversation_lock(thread_id):
+        return await _chat_impl(request, req, thread_id, conversation_id, user_id, config, graph, started_at)
 
+
+async def _chat_impl(
+    request: Request,
+    req: ChatRequest,
+    thread_id: str,
+    conversation_id: str,
+    user_id: Optional[str],
+    config: dict,
+    graph,
+    started_at: float,
+):
+    """Chat 逻辑实现，由 chat() 在会话锁内调用，保证同一会话串行处理。"""
+    settings = get_settings()
     # 长期记忆：若配置了 PostgreSQL，且当前进程内无该会话状态，则从 DB 加载并注入
     await _ensure_state_from_db(graph, config, thread_id)
 
@@ -1249,15 +1264,64 @@ async def _chat_stream_generator(
     user_id: Optional[str] = None,
     started_at: Optional[float] = None,
 ):
+    """流式对话 SSE 生成器，在会话锁内执行，保证同一会话串行。"""
+    async with conversation_lock(thread_id):
+        async for chunk in _chat_stream_generator_impl(
+            thread_id, conversation_id, message, user_id, started_at
+        ):
+            yield chunk
+
+
+async def _chat_stream_generator_impl(
+    thread_id: str,
+    conversation_id: str,
+    message: str,
+    user_id: Optional[str] = None,
+    started_at: Optional[float] = None,
+):
     """
-    流式对话的 SSE 生成器：先出首字再逐 chunk；路由与 LLM 均异步，不阻塞事件循环。
-    thread_id：图状态与共享状态（待确认 SQL）的键（含 user_id）；conversation_id 仅用于 SSE 的 done 事件给前端。
+    流式对话的 SSE 实现：先出首字再逐 chunk；路由与 LLM 均异步。
     顺序：确认执行分支 → 缓存命中 → 总控路由 → chat/knowledge 流式输出 → 写状态与缓存 → done。
     """
     settings_stream = get_settings()
     started_at = started_at or time.perf_counter()
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
+    await _ensure_state_from_db(graph, config, thread_id)
+    await _resume_if_interrupted(
+        graph,
+        config,
+        thread_id,
+        float(getattr(settings_stream, "agent_request_timeout_seconds", 120)),
+    )
+    try:
+        snapshot = await graph.aget_state(config) if hasattr(graph, "aget_state") else await asyncio.to_thread(graph.get_state, config)
+        if snapshot and snapshot.values:
+            current_messages = snapshot.values.get("messages") or []
+            n = _count_user_turns(current_messages)
+            if n >= settings_stream.max_conversation_turns:
+                observation_id = str(uuid.uuid4())
+                reply_text = "本轮对话已达 15 轮，建议您新开对话窗口以获得更好体验。"
+                await _save_qa_observation_async(
+                    _build_observation_payload(
+                        observation_id=observation_id,
+                        thread_id=thread_id,
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        question=message,
+                        answer=reply_text,
+                        route="chat_limit",
+                        response_mode="stream",
+                        success=False,
+                        latency_ms=int((time.perf_counter() - started_at) * 1000),
+                        fallback_reason="conversation_turn_limit",
+                    )
+                )
+                yield f"data: {json.dumps({'text': reply_text}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'observation_id': observation_id}, ensure_ascii=False)}\n\n"
+                return
+    except Exception:
+        pass
     # 流式下的「确认执行」：执行待确认 SQL 并流式返回结果，然后发送 done
     pending_sql_val = await shared_state_module.get_pending_sql(thread_id)
     if message.strip() in ("确认执行", "确认") and pending_sql_val:
@@ -1534,30 +1598,31 @@ async def text2sql_confirm_execute(request: Request, body: ConfirmSqlRequest):
     """
     user_id = _user_id_from_request(request, body.user_id)
     thread_id = _thread_id(user_id, body.conversation_id)
-    await _ensure_state_from_db(get_graph(), {"configurable": {"thread_id": thread_id}}, thread_id)
-    sql = await shared_state_module.pop_pending_sql(thread_id)
-    await _persist_runtime_state(thread_id)
-    if not sql:
-        raise HTTPException(
-            status_code=400,
-            detail="当前会话没有待确认的 SQL，或已执行/已过期。请先在对话中发起删除或修改类请求。",
-        )
-    settings = get_settings()
-    uri = settings.text2sql_database_uri
-    try:
-        from src.kb.text2sql import _execute_sql
-        ex = await asyncio.to_thread(_execute_sql, sql, uri)
-    except Exception as e:
-        await shared_state_module.set_pending_sql(thread_id, sql)
+    async with conversation_lock(thread_id):
+        await _ensure_state_from_db(get_graph(), {"configurable": {"thread_id": thread_id}}, thread_id)
+        sql = await shared_state_module.pop_pending_sql(thread_id)
         await _persist_runtime_state(thread_id)
-        raise HTTPException(status_code=500, detail=f"执行失败：{e}")
-    if not ex.ok:
-        await shared_state_module.set_pending_sql(thread_id, sql)
-        await _persist_runtime_state(thread_id)
-        raise HTTPException(status_code=400, detail=ex.error_message or "SQL 执行失败")
-    if ex.rows is None or len(ex.rows) == 0:
-        return {"ok": True, "message": "已执行，影响 0 行。", "rows_affected": 0}
-    return {"ok": True, "message": "已执行。", "rows_affected": len(ex.rows)}
+        if not sql:
+            raise HTTPException(
+                status_code=400,
+                detail="当前会话没有待确认的 SQL，或已执行/已过期。请先在对话中发起删除或修改类请求。",
+            )
+        settings = get_settings()
+        uri = settings.text2sql_database_uri
+        try:
+            from src.kb.text2sql import _execute_sql
+            ex = await asyncio.to_thread(_execute_sql, sql, uri)
+        except Exception as e:
+            await shared_state_module.set_pending_sql(thread_id, sql)
+            await _persist_runtime_state(thread_id)
+            raise HTTPException(status_code=500, detail=f"执行失败：{e}")
+        if not ex.ok:
+            await shared_state_module.set_pending_sql(thread_id, sql)
+            await _persist_runtime_state(thread_id)
+            raise HTTPException(status_code=400, detail=ex.error_message or "SQL 执行失败")
+        if ex.rows is None or len(ex.rows) == 0:
+            return {"ok": True, "message": "已执行，影响 0 行。", "rows_affected": 0}
+        return {"ok": True, "message": "已执行。", "rows_affected": len(ex.rows)}
 
 
 @app.post("/chat/stream")
@@ -1567,56 +1632,10 @@ async def chat_stream(request: Request, req: ChatRequest):
     返回：Content-Type text/event-stream；每条 data 为 JSON：text（内容片段）、done（结束）、conversation_id、error（异常）。
     若会话处于 interrupt 状态会先 resume，再走 _chat_stream_generator。
     """
-    settings = get_settings()
     user_id = _user_id_from_request(request, req.user_id)
     conversation_id = req.conversation_id or str(uuid.uuid4())
     thread_id = _thread_id(user_id, conversation_id)
     started_at = time.perf_counter()
-    graph = get_graph()
-    config = {"configurable": {"thread_id": thread_id}}
-
-    await _ensure_state_from_db(graph, config, thread_id)
-    await _resume_if_interrupted(
-        graph,
-        config,
-        thread_id,
-        float(getattr(settings, "agent_request_timeout_seconds", 120)),
-    )
-
-    try:
-        snapshot = await graph.aget_state(config) if hasattr(graph, "aget_state") else await asyncio.to_thread(graph.get_state, config)
-        if snapshot and snapshot.values:
-            current_messages = snapshot.values.get("messages") or []
-            n = _count_user_turns(current_messages)
-            if n >= settings.max_conversation_turns:
-                observation_id = str(uuid.uuid4())
-                reply_text = "本轮对话已达 15 轮，建议您新开对话窗口以获得更好体验。"
-                await _save_qa_observation_async(
-                    _build_observation_payload(
-                        observation_id=observation_id,
-                        thread_id=thread_id,
-                        conversation_id=conversation_id,
-                        user_id=user_id,
-                        question=req.message,
-                        answer=reply_text,
-                        route="chat_limit",
-                        response_mode="stream",
-                        success=False,
-                        latency_ms=int((time.perf_counter() - started_at) * 1000),
-                        fallback_reason="conversation_turn_limit",
-                    )
-                )
-                async def over_limit():
-                    yield f"data: {json.dumps({'text': reply_text}, ensure_ascii=False)}\n\n"
-                    yield f"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'observation_id': observation_id}, ensure_ascii=False)}\n\n"
-                return StreamingResponse(
-                    over_limit(),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-                )
-    except Exception:
-        pass
-
     return StreamingResponse(
         _chat_stream_generator(thread_id, conversation_id, req.message, user_id, started_at),
         media_type="text/event-stream",
@@ -1685,14 +1704,15 @@ async def rename_chat_conversation(request: Request, body: RenameConversationReq
     """重命名某个会话标题。"""
     actual_user_id = _user_id_from_request(request, body.user_id)
     thread_id = _thread_id(actual_user_id, body.conversation_id)
-    settings = get_settings()
-    uri = (getattr(settings, "chat_history_postgresql_uri", None) or "").strip()
-    if not uri or "postgresql" not in uri.lower():
-        raise HTTPException(status_code=400, detail="未启用 PostgreSQL 会话持久化，暂不支持会话标题管理。")
-    ok = await asyncio.to_thread(chat_history_rename_conversation_session, uri, thread_id, body.title)
-    if not ok:
-        raise HTTPException(status_code=404, detail="会话不存在或标题无效。")
-    return {"ok": True, "conversation_id": body.conversation_id, "title": body.title.strip()}
+    async with conversation_lock(thread_id):
+        settings = get_settings()
+        uri = (getattr(settings, "chat_history_postgresql_uri", None) or "").strip()
+        if not uri or "postgresql" not in uri.lower():
+            raise HTTPException(status_code=400, detail="未启用 PostgreSQL 会话持久化，暂不支持会话标题管理。")
+        ok = await asyncio.to_thread(chat_history_rename_conversation_session, uri, thread_id, body.title)
+        if not ok:
+            raise HTTPException(status_code=404, detail="会话不存在或标题无效。")
+        return {"ok": True, "conversation_id": body.conversation_id, "title": body.title.strip()}
 
 
 @app.delete("/chat/conversations/{conversation_id}", response_model=dict)
@@ -1700,26 +1720,27 @@ async def delete_chat_conversation(request: Request, conversation_id: str, user_
     """删除某个会话的长期记忆与当前进程内状态。"""
     actual_user_id = _user_id_from_request(request, user_id)
     thread_id = _thread_id(actual_user_id, conversation_id)
-    settings = get_settings()
-    uri = (getattr(settings, "chat_history_postgresql_uri", None) or "").strip()
-    if not uri or "postgresql" not in uri.lower():
-        raise HTTPException(status_code=400, detail="未启用 PostgreSQL 会话持久化，暂不支持删除会话。")
-    await asyncio.to_thread(chat_history_delete_conversation_session, uri, thread_id)
-    qa_monitor_uri = _qa_monitoring_uri(settings)
-    if qa_monitor_uri and "postgresql" in qa_monitor_uri.lower():
-        await asyncio.to_thread(qa_monitoring_delete_conversation_data, qa_monitor_uri, conversation_id, actual_user_id)
-    await shared_state_module.pop_pending_sql(thread_id)
-    await shared_state_module.discard_interrupted(thread_id)
-    graph = get_graph()
-    config = {"configurable": {"thread_id": thread_id}}
-    try:
-        if hasattr(graph, "aupdate_state"):
-            await graph.aupdate_state(config, {"messages": []})
-        else:
-            await asyncio.to_thread(graph.update_state, config, {"messages": []})
-    except Exception:
-        pass
-    return {"ok": True, "conversation_id": conversation_id}
+    async with conversation_lock(thread_id):
+        settings = get_settings()
+        uri = (getattr(settings, "chat_history_postgresql_uri", None) or "").strip()
+        if not uri or "postgresql" not in uri.lower():
+            raise HTTPException(status_code=400, detail="未启用 PostgreSQL 会话持久化，暂不支持删除会话。")
+        await asyncio.to_thread(chat_history_delete_conversation_session, uri, thread_id)
+        qa_monitor_uri = _qa_monitoring_uri(settings)
+        if qa_monitor_uri and "postgresql" in qa_monitor_uri.lower():
+            await asyncio.to_thread(qa_monitoring_delete_conversation_data, qa_monitor_uri, conversation_id, actual_user_id)
+        await shared_state_module.pop_pending_sql(thread_id)
+        await shared_state_module.discard_interrupted(thread_id)
+        graph = get_graph()
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            if hasattr(graph, "aupdate_state"):
+                await graph.aupdate_state(config, {"messages": []})
+            else:
+                await asyncio.to_thread(graph.update_state, config, {"messages": []})
+        except Exception:
+            pass
+        return {"ok": True, "conversation_id": conversation_id}
 
 
 @app.post("/qa/feedback", response_model=dict)

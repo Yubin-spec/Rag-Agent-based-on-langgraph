@@ -10114,3 +10114,31636 @@ The user wants me to explain the concepts of process, thread, and coroutine, com
 
 ---
 
+_**User**_
+
+那这个项目是怎么保障高并发的?按各个层级和模块解释清楚
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user wants a clear explanation of how this project ensures high concurrency, explained by layer and module. I should go through the codebase structure and document the concurrency mechanisms at each level: API/HTTP layer, application/async layer, external dependencies (DB, Redis, LLM, Milvus, MinerU), and any limits/circuit breakers. I'll base this on what I know from the conversation history and the docs we've seen.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/ASYNC_CONCURRENCY.md</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "asyncio\\.to_thread|Semaphore|pool_size|max_overflow|max_connections",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "glob": "*.py",
+  "outputMode": "content",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "asyncio\\.to_thread|Semaphore|pool_size|max_overflow|max_connections",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 6,
+  "totalMatches": 86,
+  "topFiles": [
+    {
+      "uri": "api/main.py",
+      "matchCount": 55
+    },
+    {
+      "uri": "src/kb/engine.py",
+      "matchCount": 6
+    },
+    {
+      "uri": "src/db_resilience.py",
+      "matchCount": 15
+    },
+    {
+      "uri": "config/settings.py",
+      "matchCount": 4
+    },
+    {
+      "uri": "src/doc/mineru_client.py",
+      "matchCount": 4
+    },
+    {
+      "uri": "src/answer_cache.py",
+      "matchCount": 2
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have a good picture. Let me also check the LLM layer (multiple endpoints, circuit breaker) and the kb/engine flow to make the explanation complete.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/llm.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/answer_cache.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have enough to write a clear, layered explanation. I'll structure it as:
+1. 接入层（API / 进程）
+2. 请求层（协程 + 限流）
+3. 线程池层
+4. 各依赖模块（DB、Redis、LLM、Milvus、MinerU、共享状态）
+5. 小结表
+</details></think>
+
+---
+
+
+按**各层级和模块**说明这个项目是怎么做高并发的。
+
+---
+
+## 一、整体思路
+
+高并发主要靠三件事：
+
+1. **少占主线程**：能异步就异步，必须同步的丢到线程池，不堵事件循环。  
+2. **资源有上限**：连接池、信号量、限流，避免把某一层或下游打爆。  
+3. **故障隔离**：熔断、重试、降级，单点挂了不拖垮整体。
+
+下面按层说。
+
+---
+
+## 二、按层级说明
+
+### 1. 接入层：多进程（Uvicorn workers）
+
+| 机制 | 说明 |
+|------|------|
+| **多 worker** | `uvicorn_workers`（如 4、7）起多个**进程**，每个进程独立接请求，提高整机并发能力。 |
+| **每进程单事件循环** | 每个进程里一个 asyncio 事件循环，用**协程**并发处理很多请求，而不是“一个请求一个线程”。 |
+
+高并发在这里的体现：**多进程 × 每进程内多协程**，既能吃满多核，又不会因为线程太多而上下文切换爆炸。
+
+---
+
+### 2. 请求层：全 async + 可选全局限流
+
+| 机制 | 说明 |
+|------|------|
+| **路由全 async** | `/chat`、`/chat/stream`、`/doc/upload`、`/doc/confirm_upload` 等全是 `async def`，请求在**协程**里处理，等 I/O 时让出，不占线程。 |
+| **API 限流（可选）** | `api_max_concurrent_requests` &gt; 0 时，用 `asyncio.Semaphore` 限制**当前进程**内同时处理的请求数，超出的在中间件里排队，避免瞬时把下游打爆。 |
+
+高并发在这里的体现：**大量请求可以同时“挂”在事件循环里**（等 DB、等 LLM、等 Redis），而不是阻塞在同步调用上；需要时再用 Semaphore 做“闸门”，防止过载。
+
+---
+
+### 3. 线程池层：同步操作不堵主循环
+
+| 机制 | 说明 |
+|------|------|
+| **asyncio.to_thread** | 所有**同步、可能阻塞**的调用（DB、文件、MinerU 占位解析、校验、写 Milvus 等）都通过 `asyncio.to_thread(...)` 丢到**默认线程池**执行，主线程只做调度。 |
+| **线程池大小** | `asyncio_thread_pool_workers`（默认 0 = 用 Python 默认，约 min(32, cpu+4)）可调大，避免 to_thread 排队过长。 |
+
+高并发在这里的体现：**阻塞操作集中在有限线程里**，不占满 CPU，也不阻塞事件循环，更多请求能以协程形式并发挂着。
+
+---
+
+### 4. 对话/图执行层：LangGraph 全异步
+
+| 机制 | 说明 |
+|------|------|
+| **ainvoke / astream** | 图执行用 `graph.ainvoke`、`graph.aget_state`、`graph.aupdate_state`，流式用 `astream`，全程 **await**，等图内部 I/O 时让出。 |
+| **LLM 调用异步** | 总控、闲聊、知识库里的 chain 用 `chain.ainvoke` / `chain.astream`，等 DeepSeek 时也不占线程。 |
+
+高并发在这里的体现：**一次对话从进来到出去，大部分时间都在“等 I/O”**，这段时间可以服务其它请求，单进程就能承载很多并发会话。
+
+---
+
+### 5. 知识库层（kb/engine）：检索/Text2SQL 进线程池
+
+| 机制 | 说明 |
+|------|------|
+| **QA / Text2SQL / RAG 检索** | 同步的 `qa.find`、`text2sql.query`、RAG 检索（BM25 + Milvus）都通过 `asyncio.to_thread(...)` 执行。 |
+| **RAG 生成** | 生成答案用 `_rag_chain.ainvoke` / 流式等价，是异步的，不占线程。 |
+
+高并发在这里的体现：**CPU/同步 I/O 在线程池里排队执行，异步生成在事件循环里并发**，既不会堵死主循环，又控制住了并发度。
+
+---
+
+### 6. 各依赖模块的并发与限流
+
+#### 6.1 PostgreSQL（对话历史、QA 监控、Text2SQL）
+
+| 机制 | 说明 |
+|------|------|
+| **连接池** | `db_resilience` 按 URI 复用 SQLAlchemy Engine，`postgresql_pool_size`（默认 5）+ `postgresql_max_overflow`（默认 10），单进程最多约 15 个连接。 |
+| **获取超时** | `pool_timeout`（默认 10 秒）内拿不到连接就失败，避免无限排队。 |
+| **重试 + 熔断** | 连接失败重试、连续失败熔断，非关键路径降级（返回空/跳过写入）。 |
+| **可选 asyncpg** | `chat_history_use_asyncpg=true` 时对话历史走 asyncpg 连接池，不占 to_thread 线程池。 |
+
+高并发在这里的体现：**连接数有上限、有超时、有熔断**，不会因为 DB 慢或挂掉把进程拖死。
+
+---
+
+#### 6.2 Redis（问答缓存、可选共享状态）
+
+| 机制 | 说明 |
+|------|------|
+| **异步客户端** | `redis.asyncio`，get/set 是 async，不占线程。 |
+| **连接池** | `redis_max_connections`（默认 10），多协程共享。 |
+| **防击穿** | 同一问题用分桶锁（`answer_cache_single_flight_buckets`），只有一个协程回源，其它等缓存。 |
+
+高并发在这里的体现：**缓存读写全是异步**，热点问题不会重复打满 LLM/知识库。
+
+---
+
+#### 6.3 LLM（DeepSeek）
+
+| 机制 | 说明 |
+|------|------|
+| **多 endpoint** | 可配多个 base_url，按**权重 + 当前 inflight** 选节点，负载分散。 |
+| **熔断** | 单节点连续失败若干次后熔断，流量切到其它节点。 |
+| **单 endpoint 重试** | 只有一个节点时，对可重试错误按 `agent_llm_retry_times` 重试。 |
+
+高并发在这里的体现：**多 Key/多节点分摊请求，故障节点自动摘掉**，避免单点过载或拖慢全体。
+
+---
+
+#### 6.4 Milvus（向量检索）
+
+| 机制 | 说明 |
+|------|------|
+| **db_resilience 统一接入** | 连接获取、检索、写入都走 `get_milvus_collection` / `milvus_operation_with_retry`，带重试和熔断。 |
+| **懒重连** | 连接失效后下次操作自动重连，不常驻无效连接。 |
+| **降级** | 熔断或不可用时向量检索返回空，RAG 仍可依赖 BM25。 |
+
+高并发在这里的体现：**Milvus 慢或挂掉时，不会无限重试拖死请求**，检索能降级。
+
+---
+
+#### 6.5 MinerU（文档解析）
+
+| 机制 | 说明 |
+|------|------|
+| **异步 HTTP** | `httpx.AsyncClient`，不占线程。 |
+| **信号量限流** | `mineru_concurrency_limit`（默认 5），同时只有 N 个请求调 MinerU，其余排队，避免把解析服务打爆。 |
+
+高并发在这里的体现：**对 MinerU 的并发有上限**，保护下游服务。
+
+---
+
+#### 6.6 共享状态（解析缓存、待确认 SQL、人工中断）
+
+| 机制 | 说明 |
+|------|------|
+| **可选 Redis** | 配置 `shared_state_redis_url` 后，状态存 Redis，多 worker 共享；不配则进程内 dict/set。 |
+| **异步接口** | get/set/pop 等全是 async，不阻塞。 |
+
+高并发在这里的体现：**状态读写不堵主线程**，多 worker 时也能共享，不依赖会话保持。
+
+---
+
+## 三、一张表串起来
+
+| 层级/模块 | 高并发手段 | 配置/位置 |
+|-----------|------------|-----------|
+| 接入 | 多进程 | `uvicorn_workers` |
+| 请求 | 全 async 路由 + 可选 Semaphore 限流 | `api_max_concurrent_requests`、中间件 |
+| 线程池 | 同步操作 to_thread，可调大池子 | `asyncio_thread_pool_workers`、lifespan |
+| 图/对话 | ainvoke/astream，全 await | LangGraph、chain |
+| 知识库 | 检索/Text2SQL to_thread，生成 ainvoke | kb/engine |
+| PostgreSQL | 连接池 + 超时 + 熔断 + 降级 | db_resilience、postgresql_pool_size 等 |
+| Redis | 异步客户端 + 连接池 + 防击穿 | answer_cache、redis_max_connections |
+| LLM | 多 endpoint 负载均衡 + 熔断 + 重试 | llm.py、deepseek_api_endpoints |
+| Milvus | 重试 + 熔断 + 懒重连 + 降级 | db_resilience、milvus_upload、rag |
+| MinerU | 异步 httpx + 信号量限流 | mineru_client、mineru_concurrency_limit |
+| 共享状态 | 可选 Redis、异步读写 | shared_state、shared_state_redis_url |
+
+---
+
+## 四、总结一句话
+
+- **进程**：多 worker 提高整机并发。  
+- **协程**：全链路 async，等 I/O 时让出，单进程就能挂很多请求。  
+- **线程池**：同步块（DB、文件、部分检索）放进 to_thread，不堵事件循环。  
+- **各依赖**：连接池/信号量限流 + 熔断/重试/降级，避免某一层或下游成为瓶颈或单点故障。
+
+整体上，项目是通过**异步优先 + 资源上限 + 故障隔离**在每一层做高并发保障的。
+
+---
+
+_**User**_
+
+那你给整个项目再加上锁机制
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user wants me to add locking mechanisms to the entire project. I need to understand what kind of locks would be beneficial and where they're needed.
+
+Common scenarios for locks in a project like this:
+1. **Shared state / in-memory structures** - When multiple coroutines or threads access the same dict/set, we need to protect against race conditions. We already have:
+   - `shared_state.py`: uses `_memory_lock` for in-memory dict/set when Redis is not configured
+   - `answer_cache.py`: has `_redis_lock`, `_local_cache_lock`, and single-flight locks per question
+   - `db_resilience.py`: has `_engine_lock`, `_milvus_lock` for engine/collection caches
+
+2. **Singleton / lazy initialization** - Already protected by locks in many places (e.g. get_engine, get_redis, get_milvus_collection).
+
+3. **Per-resource locks** - e.g. lock per conversation_id when updating conversation state to prevent concurrent updates to the same conversation from corrupting state. This could be useful for:
+   - Graph state updates (ainvoke, update_state) for the same thread_id
+   - Pending SQL / interrupted state for the same thread_id
+   - Parse cache for the same cache_key (we have single-flight for answer cache, but not for parse_result or pending_sql)
+
+4. **Document-level or thread_id-level locks** - To ensure that two requests for the same conversation don't interleave and corrupt the graph state or pending_sql. This is a common pattern: "conversation lock" or "thread lock".
+
+Let me think about what "锁机制" typically means in such a project:
+
+- **Conversation/thread-level lock**: When processing a request for conversation X, we could take a lock on X so that another request for the same X (e.g. user sends another message before the first reply is done) either waits or gets a "please wait" response. This prevents:
+  - Two concurrent ainvoke for the same thread_id corrupting LangGraph state
+  - Two concurrent updates to pending_sql for the same thread_id
+
+- **Global/window locks**: Already have API-level semaphore (api_max_concurrent_requests).
+
+- **Per-key locks for shared_state**: When using in-memory backend, we already have _memory_lock in shared_state. When using Redis, Redis operations are atomic for single keys. So we might want per-thread_id or per-cache_key locks when updating complex state (e.g. parse_result is one key, but pending_sql and interrupted could be updated from different endpoints). Actually for the same thread_id we could have one lock so that "load state → invoke → save state" and "confirm execute" don't interleave.
+
+I'll add:
+1. **Conversation/thread-level lock** - A lock per thread_id (or conversation_id) so that concurrent requests for the same conversation are serialized. This protects graph state updates and pending_sql/interrupted updates. We can use an asyncio.Lock per thread_id with a bounded dict (e.g. limit size, evict oldest) to avoid memory leak.
+
+2. **Optional: Parse cache key lock** - When Redis is not used, set_parse_result and get_parse_result are already under _memory_lock. So we're good. When Redis is used, we might want to avoid two concurrent "confirm_upload" for the same task_id - but that's a business-level idempotency concern. A simple per-cache_key lock could help. Actually the main risk is two requests for the same thread_id doing different things (e.g. one doing ainvoke, one doing confirm execute). So thread-level lock is the main one.
+
+Let me implement:
+
+1. **Conversation lock (per thread_id)**  
+   - In api/main.py or in a small module, maintain a dict of asyncio.Lock keyed by thread_id.  
+   - Use a bounded cache so we don't grow forever (e.g. max 1000 locks, evict when releasing if over capacity).  
+   - Before processing a chat request (or any request that touches this thread_id), acquire the lock for that thread_id; release when done.  
+   - This way, for the same conversation, only one request is processed at a time.
+
+2. **Where to acquire**  
+   - For POST /chat: acquire at start (after we have thread_id), release after response is sent.  
+   - For POST /chat/stream: same, hold for the whole stream.  
+   - For text2sql_confirm_execute: acquire for thread_id, release after.  
+   - For delete/rename conversation: acquire for thread_id.  
+   - For doc upload/confirm: we could use parse_cache_key lock if we want, but typically one user doesn't confirm the same task_id twice concurrently. So maybe skip or add a simple lock per cache_key for confirm_upload.
+
+I'll create a small module for "conversation lock" that provides:
+- get_lock(thread_id: str) -> asyncio.Lock
+- Bounded pool so we don't have unbounded locks (evict least recently used when over limit)
+
+Then in api/main.py we use it around:
+- Chat (sync and stream) - whole request under lock for that thread_id
+- Confirm execute (sync path in chat, stream path in stream, and POST /text2sql/confirm_execute)
+- Delete session, rename session
+
+Let me also check if there are other shared mutable structures that need locks. Looking at the codebase:
+- db_resilience: already has _engine_lock, _milvus_lock
+- answer_cache: already has _redis_lock, _local_cache_lock, single-flight locks
+- shared_state: already has _memory_lock
+- llm.py: has _lock in pool for ordered_candidates and state updates
+
+So the main addition is **per-thread_id (conversation) lock** to serialize operations on the same conversation. I'll implement that and add a config option to disable it if needed (e.g. conversation_lock_enabled: bool = True).
+</details></think>
+
+---
+
+
+为项目添加锁机制：先梳理需保护的共享资源，再实现并接入。
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "thread_id|conversation_id|_thread_id",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py",
+  "outputMode": "content",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "thread_id|conversation_id|_thread_id",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py",
+  "outputMode": "content",
+  "totalFiles": 1,
+  "totalMatches": 100,
+  "topFiles": [
+    {
+      "uri": "api/main.py",
+      "matchCount": 40
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I need to:
+1. Create a conversation lock module that provides per-thread_id asyncio locks with a bounded cache (to avoid memory leak from unlimited locks).
+2. Add config conversation_lock_enabled and maybe conversation_lock_max_entries.
+3. In api/main.py, wrap the chat flow (sync and stream), confirm_execute, delete/rename session, and any other place that mutates state for a thread_id with this lock.
+
+Let me implement the lock module first, then integrate.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="task" data-tool-name="todo_write">
+<details><summary>Tool use: **todo_write** • Todo List</summary>
+
+- [-] Add conversation lock module (per thread_id, bounded)
+- [ ] Integrate lock in /chat, /chat/stream, confirm, delete/rename
+- [ ] Add config and docs
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I'll create a module `src/conversation_lock.py` that:
+1. Provides an async context manager `conversation_lock(thread_id)` which acquires a lock for that thread_id and releases on exit.
+2. Uses a bounded cache of asyncio.Lock: we can't have unlimited locks (one per thread_id forever). So we'll use a dict with max size; when we need a lock for a new thread_id and we're at capacity, we evict the least recently used. But asyncio.Lock doesn't have "last used" - we need to be careful. Actually the simplest is: keep a dict thread_id -> Lock. When the number of locks exceeds max_entries, we remove one. But which one? We could use OrderedDict and when we get a lock we move it to end (LRU). When adding a new lock and len > max, popitem(last=False). But we must not remove a lock that's currently held. So we need to only remove locks that are not in use. That's tricky - we don't know if a Lock is held. Alternative: use a global lock for the whole "get lock for thread_id" operation, and the per-thread locks are only used to serialize that thread's operations. When we evict, we remove the Lock from the dict - any concurrent coroutine that was waiting on that lock would have already acquired it and be running; any new request for that thread_id would get a new Lock. So we could evict locks that haven't been used recently - but we don't track "recently used" on the Lock object. Simpler approach: don't evict. Use a fixed maximum number of locks, and map thread_id to lock via hash(thread_id) % max_locks. So we have exactly max_locks locks (e.g. 1024), and thread_id A and thread_id B might share the same lock if they hash to the same bucket. That's acceptable - we might serialize two different conversations occasionally, but we avoid unbounded memory. This is similar to answer_cache_single_flight_buckets.
+
+So: conversation_locks = [asyncio.Lock() for _ in range(1024)], and lock_for(thread_id) = conversation_locks[hash(thread_id) % 1024]. Then we don't need to evict. Config: conversation_lock_buckets (default 1024). When conversation_lock_enabled is False, we can use a no-op context manager that does nothing.
+
+Let me implement.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/conversation_lock.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now add config and then wrap the chat, chat/stream, text2sql confirm, delete conversation, rename conversation with this lock. For chat and chat/stream we need to wrap the entire handler body (after we have thread_id) in the lock. For streaming we need to hold the lock for the whole duration of the generator - so we need to acquire in the endpoint and pass through, or acquire at the start of the generator and hold until the generator finishes. The cleanest is: in chat_stream, we acquire the lock and then run the generator; but the generator is async and we need to hold the lock while it runs. So we do:
+
+async def chat_stream(...):
+    ...
+    thread_id = _thread_id(...)
+    async with conversation_lock(thread_id):
+        # we need to run the stream generator inside this block
+        # but StreamingResponse expects an async generator. So we need to wrap the generator so that it's created and consumed inside the lock. Actually the problem is: if we do
+        #   async with conversation_lock(thread_id):
+        #       return StreamingResponse(_chat_stream_generator(...), ...)
+        # then we release the lock when we return, before the response is actually streamed! So the lock is released too early.
+        # We need to hold the lock for the entire time the stream is being consumed. That means the lock must be acquired inside the generator and released when the generator is done. So in _chat_stream_generator we do:
+        #   async with conversation_lock(thread_id):
+        #       ... rest of generator body
+        # That way the lock is held for the whole stream. So we need to add the lock in _chat_stream_generator and in the sync chat endpoint (wrap the whole thing after thread_id is known).
+
+Let me add the lock to:
+1. POST /chat - wrap the entire logic after we have thread_id in `async with conversation_lock(thread_id):` ... but that would indent a lot. Better: at the start after thread_id, do async with conversation_lock(thread_id): and then the rest of the function body. So we need to indent from "await _ensure_state_from_db" to the end of the return.
+2. _chat_stream_generator - at the start, async with conversation_lock(thread_id): then the whole generator body.
+3. POST /text2sql/confirm_execute - after thread_id, async with conversation_lock(thread_id): wrap the rest.
+4. DELETE /chat/conversations/{id} - after thread_id, async with conversation_lock(thread_id): wrap the rest.
+5. PATCH rename - after thread_id, async with conversation_lock(thread_id): wrap the rest.
+
+For POST /chat we have many returns inside the body. So we do:
+  async with conversation_lock(thread_id):
+      await _ensure_state_from_db(...)
+      ...
+      return ChatResponse(...)  # multiple places
+  So the whole body goes under the lock.
+
+For stream, the generator is the one that must hold the lock for its entire lifetime. So in _chat_stream_generator first line we do async with conversation_lock(thread_id): and then we need to yield from inside that block. So the structure is:
+  async def _chat_stream_generator(...):
+      async with conversation_lock(thread_id):
+          # all the logic that was there, with yield statements
+          ...
+          yield ...
+  But we have multiple yield points. So we need the whole generator body under one async with. Good.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/config/settings.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now I need to integrate the lock in api/main.py. I'll add the import and then wrap:
+1. chat() - entire body after thread_id in async with conversation_lock(thread_id)
+2. _chat_stream_generator - first thing inside the generator: async with conversation_lock(thread_id): then the rest
+3. text2sql_confirm_execute - after thread_id, async with conversation_lock(thread_id)
+4. delete_chat_conversation - after thread_id, async with conversation_lock(thread_id)
+5. rename - after thread_id, async with conversation_lock(thread_id)
+
+For (1) the chat function is long. I need to wrap from after config = ... and thread_id is set, so from "await _ensure_state_from_db" to the end. Let me read the chat function structure again to get the exact indentation.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I need to wrap the chat() body in conversation_lock. The best way is to add the import and then wrap the entire block from "await _ensure_state_from_db" to the final "return ChatResponse" in "async with conversation_lock(thread_id):". I'll do that by adding one line after config = ... and indenting the rest. Actually that would be a huge indent. Better: at the top after we have thread_id, we open "async with conversation_lock(thread_id):" and then indent the entire rest of the function by 4 spaces. That's a lot of lines. Let me do it in one search_replace by matching from the first "await _ensure_state_from_db" to the last "return ChatResponse(...)" and wrapping in the lock. I'll do it in chunks.
+
+Actually the simplest is: add two lines after "config = ...":
+    from src.conversation_lock import conversation_lock
+    async with conversation_lock(thread_id):
+and then indent everything that follows by 4 spaces until the end of the function. The "everything" is from line 928 to 1245. That's 317 lines. I can't do that in one replace easily. Let me do it in a few steps:
+
+1. Add import at top of file for conversation_lock
+2. In chat(), after "config = {"configurable": {"thread_id": thread_id}}" add:
+    async with conversation_lock(thread_id):
+        # 长期记忆...
+   So I need to add "async with conversation_lock(thread_id):" and then indent the next block. The problem is the block has many return statements. So the structure is:
+    async with conversation_lock(thread_id):
+        await _ensure_state_from_db(...)
+        ...
+        return ChatResponse(...)
+        ...
+        return ...
+   So I need to indent every line from 928 to 1245 by 4 spaces. I'll use a single replace with a large block - replace the block from "    # 长期记忆" through "        return ChatResponse(reply=reply, ..." with the same block but with "    async with conversation_lock(thread_id):\n" at the start and 4 spaces added to each line. This is error-prone. Alternative: use a helper. Define async def _chat_impl(request, req): ... that contains the current body, and in chat() we do:
+    async with conversation_lock(thread_id):
+        return await _chat_impl(request, req)
+   But then we need to pass thread_id, conversation_id, etc. Actually we have them in the outer scope. So:
+    async def chat(...):
+        ...
+        thread_id = _thread_id(...)
+        config = ...
+        async with conversation_lock(thread_id):
+            return await _chat_body(request, req, thread_id, conversation_id, user_id, config, graph, started_at, settings)
+   And _chat_body contains the rest. That way we don't re-indent 300 lines. Let me do that - extract the body into an async function _chat_body and call it inside the lock. But that would require passing many parameters. Simpler: just add the lock wrapper and indent. I'll do the indent in one go by replacing a moderate-sized chunk at a time.
+
+Let me try a different approach: add the lock only around the critical sections. But the critical section is really "anything that reads or writes graph state or shared_state for this thread_id". So the whole of chat() is critical. So we need the full body under the lock.
+
+I'll add the import and then one big replace: after "config = {"configurable": {"thread_id": thread_id}}\n\n" replace "    # 长期记忆" with "    async with conversation_lock(thread_id):\n        # 长期记忆" and then we need to add 4 spaces to all the following lines until the end of the function. That's from line 928 to 1245. I'll do it in 2-3 replace operations - first add the async with and indent the first 100 lines, then the next 100, then the rest. Actually Python doesn't care about the exact indentation of the block as long as it's consistent - so the block under "async with" must be 4 spaces more than the async with. So currently the lines are at 4 spaces (one indent level). Under "async with" they need to be at 8 spaces. So I need to add 4 spaces to each line from 929 to 1245. Let me do one search_replace that adds "async with conversation_lock(thread_id):" and indents the first section, then repeat for the rest. This is going to be tedious. Let me try doing the whole chat function in one replace - I'll read the exact content and then write the replacement with the lock and proper indentation.
+
+Actually the easier approach: add at the top of the function body (after we have thread_id and config):
+    async with conversation_lock(thread_id):
+        pass  # placeholder
+   Then we need to indent the rest of the function to be inside this block. So we need to add 4 spaces to lines 929-1245. I can do replace_all on "    #" -> "        #" for the comment lines but that would also replace other "    #" in the file. So I need to be more specific. Let me do a multi-step approach:
+
+Step 1: Add "from src.conversation_lock import conversation_lock" to imports.
+Step 2: In chat(), after "config = {"configurable": {"thread_id": thread_id}}\n\n    " insert "async with conversation_lock(thread_id):\n    " and then the next line "    # 长期记忆" - but wait, if we insert "async with ...\n    " then the next line is still "    # 长期记忆" which would be at the same indent as "async with", so it would be outside the block. We need the content to be indented. So we need to replace 
+    # 长期记忆：若配置了 PostgreSQL...
+    await _ensure_state_from_db(...)
+with
+    async with conversation_lock(thread_id):
+        # 长期记忆：若配置了 PostgreSQL...
+        await _ensure_state_from_db(...)
+and then for every subsequent line in the function we add 4 spaces. The only way to do this without 300 separate replacements is to do a single replace with a very large new_string. Let me try replacing from "    # 长期记忆" to "    return ChatResponse(reply=reply, conversation_id=conversation_id, observation_id=observation_id)" with the same text but with "    async with conversation_lock(thread_id):\n" at the beginning and "        " (4 spaces) at the start of each line. I'll need to read the file and construct the string. Given the size, I'll do it in 2-3 chunks.
+
+Chunk 1: from "# 长期记忆" through "    except Exception:\n        pass\n\n    # 问答缓存"
+Chunk 2: next big block
+...
+Or I could use run_terminal_cmd to run sed to add 4 spaces to lines 929-1245, then add the async with line. But the tool said to avoid sed for editing. Let me use search_replace with replace_all for a unique string that appears only in that function. For example "    # 长期记忆：若配置了 PostgreSQL，且当前进程内无该会话状态" - if I replace that with "    async with conversation_lock(thread_id):\n        # 长期记忆：若配置了 PostgreSQL，且当前进程内无该会话状态" then the following lines are still at 4 spaces - they're not inside the block. So I really need to indent 300+ lines. The only practical way is to do multiple smaller search_replace calls, each time indenting a block of consecutive lines. For instance replace:
+    await _ensure_state_from_db(graph, config, thread_id)
+
+    # 若该会话曾因
+with
+        await _ensure_state_from_db(graph, config, thread_id)
+
+        # 若该会话曾因
+and so on. That would take many replace calls.
+
+Alternative: create a wrapper that runs the coroutine under the lock. So we have:
+  async def _chat_impl(...):  # the current body
+  async def chat(...):
+      ...
+      async with conversation_lock(thread_id):
+          return await _chat_impl(...)
+  But _chat_impl needs all the local variables. We could pass them as kwargs or we could define _chat_impl to take (request, req, thread_id, conversation_id, user_id, config, graph, started_at, settings) and have it do the rest. So we extract the body into _chat_impl(request, req, thread_id, conversation_id, user_id, config, graph, started_at, settings) and then chat() becomes:
+    ...
+    graph = get_graph()
+    config = ...
+    async with conversation_lock(thread_id):
+        return await _chat_impl(request, req, thread_id, conversation_id, user_id, config, graph, started_at, settings)
+  That way we don't reindent the body - we just move it to _chat_impl and add one parameter (settings we can get_settings() inside _chat_impl). So we need to:
+  1. Create _chat_impl with signature (request, req, thread_id, conversation_id, user_id, config, graph, started_at) and move the entire body (from "# 长期记忆" to the last return) into it. Inside _chat_impl we can call get_settings() so we don't need to pass it.
+  2. In chat(), after building thread_id, config, graph, started_at, do: async with conversation_lock(thread_id): return await _chat_impl(request, req, thread_id, conversation_id, user_id, config, graph, started_at)
+
+Let me do that. I'll add a new function _chat_impl that contains the current body (lines 928-1245) and then chat() will call it inside the lock. So I need to:
+1. Add "from src.conversation_lock import conversation_lock" to imports.
+2. Replace "    # 长期记忆：若配置了 PostgreSQL" with "    async with conversation_lock(thread_id):\n        return await _chat_impl(request, req, thread_id, conversation_id, user_id, config, graph, started_at)\n\nasync def _chat_impl(request: Request, req: ChatRequest, thread_id: str, conversation_id: str, user_id: Optional[str], config: dict, graph, started_at: float):\n    \"\"\"Chat 逻辑实现，由 chat() 在会话锁内调用。\"\"\"\n    settings = get_settings()\n    # 长期记忆：若配置了 PostgreSQL"
+   Wait, that's not right. The current chat() has "settings = get_settings()" at the top. So _chat_impl doesn't need to receive settings if it calls get_settings() again. So the body of _chat_impl is from "# 长期记忆" to the end. And we need to remove the "settings = get_settings()" and "user_id = ", "conversation_id = ", "thread_id = ", "started_at = ", "graph = ", "config = " from the body of _chat_impl since those are set in chat(). So _chat_impl receives request, req, thread_id, conversation_id, user_id, config, graph, started_at. And the first line of the current body after config is "    # 长期记忆". So we:
+  1. In chat(), keep: settings, user_id, conversation_id, thread_id, started_at, graph, config.
+  2. Then add: async with conversation_lock(thread_id): return await _chat_impl(request, req, thread_id, conversation_id, user_id, config, graph, started_at).
+  3. Add new function _chat_impl(request, req, thread_id, conversation_id, user_id, config, graph, started_at) and its body is everything from "# 长期记忆" to the final return (and inside _chat_impl we need settings = get_settings() at the start).
+
+So the structure will be:
+  async def chat(...):
+      settings = get_settings()
+      ...
+      config = ...
+      async with conversation_lock(thread_id):
+          return await _chat_impl(request, req, thread_id, conversation_id, user_id, config, graph, started_at)
+
+  async def _chat_impl(request, req, thread_id, conversation_id, user_id, config, graph, started_at):
+      settings = get_settings()
+      # 长期记忆...
+      ...
+      return ChatResponse(...)
+</details></think>
+
+---
+
+
+采用提取 `_chat_impl` 并在调用处加锁，避免大段重排。
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now I need to:
+1. Change chat() to acquire conversation_lock(thread_id) and then call _chat_impl. So after "config = {"configurable": {"thread_id": thread_id}}" we replace the rest with "async with conversation_lock(thread_id):\n        return await _chat_impl(request, req, thread_id, conversation_id, user_id, config, graph, started_at)"
+2. Add _chat_impl with the current body. The current body starts with "    # 长期记忆" and ends with "        return ChatResponse(reply=reply, ...)". So I need to insert the async with and return, and then add the new function _chat_impl. The new function will have body that starts with "    settings = get_settings()" - no wait, the current chat already has settings = get_settings() at the top. So _chat_impl will receive (request, req, thread_id, conversation_id, user_id, config, graph, started_at) and the first line of its body can be "    settings = get_settings()" (we need settings in the body). So the body of _chat_impl is everything from "# 长期记忆" through the last return, but we need settings in the body - and we already have it in the outer chat(), so we can pass settings to _chat_impl or just call get_settings() again at the start of _chat_impl. So _chat_impl starts with:
+    settings = get_settings()
+    # 长期记忆
+    await _ensure_state_from_db(...)
+    ...
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now I need to remove the duplicate "settings = get_settings()" that was at the start of the original chat() - but we already have it in _chat_impl now. The original chat had "settings = get_settings()" on line 920, and we've left that in chat() - so chat() still has settings = get_settings() which is now unused (we don't use settings in the part that remains in chat()). So we can leave it or remove it. I'll leave it for now. Actually the remaining part of chat() is only:
+    settings = get_settings()
+    user_id = ...
+    conversation_id = ...
+    thread_id = ...
+    ...
+    async with conversation_lock(thread_id):
+        return await _chat_impl(...)
+So we still have "settings = get_settings()" in chat() but it's not used in chat() anymore. We could remove it. Let me leave it. Now I need to fix _chat_impl - it still has references to "settings" which we've set at the start of _chat_impl. But wait - the body we left in _chat_impl still has the rest of the code that uses "settings". So we're good. But we need to remove the duplicate "settings = get_settings()" from the original flow - actually we added "settings = get_settings()" at the start of _chat_impl, and the original code had "settings = get_settings()" at the start of chat(). So the code that was after "await _ensure_state_from_db" and that used "settings" is now in _chat_impl and we have "settings = get_settings()" there. Good. So the only issue is the original code had "settings = get_settings()" in chat() and then used it - but we moved the use to _chat_impl. So we can remove "settings = get_settings()" from chat() since it's not used there anymore. Let me check - in chat() after our edit we have: conversation_id = ..., thread_id = ..., started_at = ..., graph = ..., config = ..., async with ... So we don't use settings in chat() anymore. I'll remove the unused "settings = get_settings()" from chat().
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now I need to wrap the stream endpoint. For stream we need to hold the lock for the entire duration of the generator. So in _chat_stream_generator we add at the very beginning:
+  async with conversation_lock(thread_id):
+      ... rest of generator
+So the whole generator body goes under the lock. I need to read _chat_stream_generator and add the lock at the start and indent the rest. The generator is long. Let me add the lock at the start of _chat_stream_generator and indent the entire body. I'll do it by adding "    async with conversation_lock(thread_id):" after the docstring and then indent the next line. But that would require indenting the whole function body. Alternatively we could wrap the stream endpoint so that we don't return StreamingResponse until the lock is acquired - but then we'd release the lock when we return, before the stream is consumed. So the lock must be inside the generator. So in _chat_stream_generator, first line of actual code (after docstring and settings_stream = get_settings()) we do:
+  async with conversation_lock(thread_id):
+      started_at = started_at or time.perf_counter()
+      ...
+and we need to indent everything after that. This is again a lot of lines. Alternative: create an inner async generator that's under the lock:
+  async def _chat_stream_generator(...):
+      async with conversation_lock(thread_id):
+          async for chunk in _chat_stream_generator_impl(...):
+              yield chunk
+  async def _chat_stream_generator_impl(...):
+      # current body
+      ...
+But then we can't use "yield" inside an async for from another generator in the same way - we need to yield from. So:
+  async def _chat_stream_generator(...):
+      async with conversation_lock(thread_id):
+          async for x in _chat_stream_generator_impl(...):
+              yield x
+  And _chat_stream_generator_impl is an async generator that does all the current logic. So we need to rename the current _chat_stream_generator to _chat_stream_generator_impl and then create a new _chat_stream_generator that acquires the lock and yields from the impl. Let me do that.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I'll wrap the stream generator by having _chat_stream_generator acquire the lock and then iterate over an inner generator. So:
+1. Rename current _chat_stream_generator to _chat_stream_generator_impl
+2. Create new _chat_stream_generator that does:
+   async with conversation_lock(thread_id):
+       async for chunk in _chat_stream_generator_impl(...):
+           yield chunk
+
+So I need to add a new function that wraps the impl. Let me do:
+- Replace "async def _chat_stream_generator(" with "async def _chat_stream_generator_impl(" 
+- Then add before it a new _chat_stream_generator that acquires the lock and yields from the impl.
+
+Actually we can't "yield from" an async generator in the same way. We need:
+  async def _chat_stream_generator(...):
+      async with conversation_lock(thread_id):
+          async for x in _chat_stream_generator_impl(...):
+              yield x
+  So we add the wrapper and rename the inner one to _chat_stream_generator_impl.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now wrap chat_stream endpoint - we need to ensure the lock is held when we create the generator. Actually the lock is now inside _chat_stream_generator, so when the response is streamed, the generator runs and the first thing it does is acquire the lock. So we're good. But we need to wrap the part before we return StreamingResponse - the part that does _ensure_state_from_db and _resume_if_interrupted and the 15-turn check. Those also touch thread_id state. So they should be under the lock too. Currently in chat_stream() we have:
+  await _ensure_state_from_db(...)
+  await _resume_if_interrupted(...)
+  try:
+    snapshot = ...
+    if n >= max_conversation_turns:
+      return StreamingResponse(over_limit(), ...)
+  except: pass
+  return StreamingResponse(_chat_stream_generator(...), ...)
+So the _ensure_state_from_db and _resume_if_interrupted and the turn check run before we start the generator. So they're not under the lock. If we want them under the lock we have two options: 1) Move them into the generator so they run as the first thing inside the lock. 2) Acquire the lock in chat_stream() before _ensure_state_from_db and hold it until we return - but then when we return StreamingResponse, we're returning a generator that hasn't run yet; the lock would be released when we return from chat_stream(), before the client has consumed the stream. So we need to move _ensure_state_from_db and _resume_if_interrupted and the turn check into the generator (they're already at the start of the stream flow in a sense - we could put them at the start of _chat_stream_generator_impl). Actually looking at the stream endpoint again, it does _ensure_state_from_db and _resume_if_interrupted and then the turn check, and then returns StreamingResponse(_chat_stream_generator(...)). So the generator is only started when the client reads the response. So the first thing that runs when the client reads is _chat_stream_generator, which acquires the lock and then runs _chat_stream_generator_impl. So _ensure_state_from_db etc. run in the main request flow, not inside the generator. So they're not protected by the lock. To protect them we'd need to either move them into the generator (so they run as first step of _chat_stream_generator_impl) or acquire the lock in chat_stream() and then pass the lock to the generator... which is complex. The simplest is to move _ensure_state_from_db, _resume_if_interrupted, and the 15-turn check into _chat_stream_generator_impl at the very beginning. Then the whole flow for stream is under the lock. Let me check - currently chat_stream() does:
+  1. get thread_id, config, graph
+  2. await _ensure_state_from_db(graph, config, thread_id)
+  3. await _resume_if_interrupted(...)
+  4. try: snapshot, if n>=15 return StreamingResponse(over_limit())
+  5. return StreamingResponse(_chat_stream_generator(...))
+
+If we move 2, 3, 4 into _chat_stream_generator_impl, then when the generator runs it will first acquire the lock, then run 2, 3, and then we need to handle the 15-turn case - we'd yield the over_limit messages and return. So the impl would start with:
+  await _ensure_state_from_db(graph, config, thread_id)
+  await _resume_if_interrupted(...)
+  try:
+    snapshot = ...
+    if n >= max: yield ...; yield done; return
+  except: pass
+  # then the rest (pending_sql_val = ...)
+But _chat_stream_generator_impl doesn't have graph and config - it has thread_id, conversation_id, etc. So we need to get graph and config inside the impl: graph = get_graph(), config = {"configurable": {"thread_id": thread_id}}. So we can move the state loading and resume and turn check into the impl. That way the stream endpoint becomes:
+  thread_id = ...
+  return StreamingResponse(_chat_stream_generator(...), ...)
+and the generator acquires the lock and then does everything including _ensure_state_from_db. So we need to remove _ensure_state_from_db, _resume_if_interrupted, and the turn check from chat_stream() and add them at the start of _chat_stream_generator_impl. Let me do that.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now I need to add _ensure_state_from_db, _resume_if_interrupted, and the 15-turn check at the start of _chat_stream_generator_impl. Let me read the current start of _chat_stream_generator_impl.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now add the lock to text2sql_confirm_execute, delete_chat_conversation, and rename. Let me do those.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Wait - now the rest of the text2sql_confirm_execute function (await _persist_runtime_state, if not sql raise, try ex = _execute_sql, etc.) is outside the lock. I need to wrap the entire body of the function in the lock, not just the first two lines. Let me read the full function again.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Let me find the text2sql_confirm_execute function and wrap the whole body in the lock. I'll need to indent the rest of the function under "async with conversation_lock(thread_id):". So the structure should be:
+  async with conversation_lock(thread_id):
+      await _ensure_state_from_db(...)
+      sql = await shared_state_module.pop_pending_sql(thread_id)
+      await _persist_runtime_state(thread_id)
+      if not sql:
+          raise HTTPException(...)
+      settings = get_settings()
+      ...
+      return {"ok": True, ...}
+So I need to indent from "await _persist_runtime_state(thread_id)" to the end of the function. Let me do a replace that adds the indentation to the remaining lines of text2sql_confirm_execute.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now wrap delete_chat_conversation and rename in the lock.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Good. Now add config to .env.example and a short doc. Let me check if _count_user_turns exists and is imported in main.py.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "_count_user_turns",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "_count_user_turns",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py",
+  "outputMode": "content",
+  "totalFiles": 1,
+  "totalMatches": 3,
+  "topFiles": [
+    {
+      "uri": "api/main.py",
+      "matchCount": 3
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="generic" data-tool-name="glob_file_search">
+<details>
+<summary>Tool use: **glob_file_search** • Searched codebase "undefined" • **1** result in **1** directory</summary>
+
+Directory: **/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai** (1 file)
+
+| File |
+|------|
+| `.env.example` |
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="task" data-tool-name="todo_write">
+<details><summary>Tool use: **todo_write** • Todo List</summary>
+
+- [x] Add conversation lock module (per thread_id, bounded)
+- [x] Integrate lock in /chat, /chat/stream, confirm, delete/rename
+- [-] Add config and docs
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+_count_user_turns is defined in main.py. Good. Now add .env.example entries and a short doc. Let me read .env.example and config/settings.py for the exact variable names.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/.env.example</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "conversation_lock",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/config/settings.py",
+  "contextBefore": 0,
+  "contextAfter": 0,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "conversation_lock",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/config/settings.py",
+  "outputMode": "content",
+  "totalFiles": 1,
+  "totalMatches": 2,
+  "topFiles": [
+    {
+      "uri": "config/settings.py",
+      "matchCount": 2
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I need to check if config/settings loads these from env. Let me check how other bool/int settings are loaded (e.g. CONVERSATION_LOCK_ENABLED, CONVERSATION_LOCK_BUCKETS).
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/config/settings.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="generic" data-tool-name="glob_file_search">
+<details>
+<summary>Tool use: **glob_file_search** • Searched codebase "undefined" • **1** result in **1** directory</summary>
+
+Directory: **/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai** (1 file)
+
+| File |
+|------|
+| `docs/ASYNC_CONCURRENCY.md` |
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="generic" data-tool-name="glob_file_search">
+<details>
+<summary>Tool use: **glob_file_search** • Searched codebase "undefined" • **14** results in **1** directory</summary>
+
+Directory: **/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai** (14 files)
+
+| File |
+|------|
+| `docs/RESUME_PROJECT_SUMMARY.md` |
+| `docs/LOGGING.md` |
+| `docs/REDIS_CACHE.md` |
+| `docs/TEXT2SQL_OPTIMIZATION.md` |
+| `docs/SECOND_ROUND_INTERVIEW_QA.md` |
+| `docs/PERFORMANCE_AND_CONVERSATION.md` |
+| `docs/DB_RESILIENCE.md` |
+| `docs/ASYNC_CONCURRENCY.md` |
+| `docs/DOCKER_DEPLOY.md` |
+| `docs/TECH_REVIEW_AND_OPTIMIZATION.md` |
+| `docs/DOC_PARSING_AND_VALIDATION.md` |
+| `docs/INTENT_AND_ROUTING.md` |
+| `docs/MEMORY_AND_OPTIMIZATION.md` |
+| `docs/CONTEXT_SAVING.md` |
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+pydantic_settings automatically maps CONVERSATION_LOCK_ENABLED and CONVERSATION_LOCK_BUCKETS from env (snake_case to UPPER). I'll add the two vars to .env.example and add a short section to docs/ASYNC_CONCURRENCY.md.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/.env.example</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/ASYNC_CONCURRENCY.md</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I'll add a new section "会话锁（Conversation Lock）" to ASYNC_CONCURRENCY.md and then mark the todo complete.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/ASYNC_CONCURRENCY.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<tool-use data-tool-type="task" data-tool-name="todo_write">
+<details><summary>Tool use: **todo_write** • Todo List</summary>
+
+- [x] Add conversation lock module (per thread_id, bounded)
+- [x] Integrate lock in /chat, /chat/stream, confirm, delete/rename
+- [x] Add config and docs
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Fixing the doc: "可选后续优化" was section 6, now it's 7. The "6. 可选后续优化" in the original became "7. 可选后续优化" - good. Let me double-check the stream 15-turn logic uses the same timeout attribute name. I used `agent_request_timeout_seconds` - let me verify in settings.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "agent_request_timeout|resume_if_interrupted",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "glob": "*.py",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "agent_request_timeout|resume_if_interrupted",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 3,
+  "totalMatches": 8,
+  "topFiles": [
+    {
+      "uri": "src/llm.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "config/settings.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "api/main.py",
+      "matchCount": 6
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="read_lints">
+<details>
+<summary>Tool use: **read_lints**</summary>
+
+
+Parameters:
+
+```json
+{
+  "paths": [
+    "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py"
+  ]
+}
+```
+Result:
+
+```json
+{
+  "linterErrorsByFile": [
+    {
+      "relativeWorkspacePath": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py"
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+All good. Let me give the user a short summary of what was done.
+</details></think>
+
+---
+
+
+按之前的结论，已做完这些修改：
+
+## 1. 流式接口行为恢复（`_chat_stream_generator_impl`）
+
+在流式生成器内部重新加上了：
+
+- **`_ensure_state_from_db`**：从 DB 恢复图状态  
+- **`_resume_if_interrupted`**：超时后恢复“人工中断”状态  
+- **15 轮校验**：在流式开始前取 snapshot、数用户轮数，若 ≥ `max_conversation_turns` 则直接返回“本轮对话已达 15 轮…”并 yield `done`，不再走后续流式逻辑  
+
+这样流式路径与普通 `/chat` 在「加载状态 → 恢复中断 → 轮数限制」上保持一致。
+
+## 2. 其它接口加会话锁
+
+- **POST /text2sql/confirm_execute**：整段逻辑（取 SQL、执行、写回状态）包在 `async with conversation_lock(thread_id):` 里。  
+- **DELETE /chat/conversations/{conversation_id}**：删除会话及清理状态、图状态等全部在 `conversation_lock(thread_id)` 内执行。  
+- **PATCH 重命名会话**：重命名及校验在 `conversation_lock(thread_id)` 内执行。
+
+## 3. 配置与文档
+
+- **`.env.example`**：增加注释示例  
+  - `CONVERSATION_LOCK_ENABLED=true`  
+  - `CONVERSATION_LOCK_BUCKETS=1024`  
+- **`docs/ASYNC_CONCURRENCY.md`**：新增 **「6. 会话锁（Conversation Lock）」**，说明用途、加锁接口、分桶实现和配置项；原「可选后续优化」顺延为第 7 节。
+
+当前：锁机制已覆盖 chat、stream、确认执行、删除会话、重命名；流式接口的 DB 恢复、中断恢复和 15 轮限制已恢复；配置与文档已补全。
+
+---
+
+_**User**_
+
+你整理一下这个项目高并发场景下的缓存、熔断、降级策略
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user wants me to organize/document the project's caching, circuit breaker, and degradation strategies in high-concurrency scenarios. I need to search the codebase for:
+
+1. Caching - answer cache, retrieval cache, etc.
+2. Circuit breaker - DeepSeek, DB, etc.
+3. Degradation/fallback - what happens when services fail, fallback logic
+
+Let me search for these patterns across the project.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="semantic_search_full">
+<details>
+<summary>Tool use: **semantic_search_full**</summary>
+
+
+Parameters:
+
+```json
+{
+  "query": "Where is circuit breaker or熔断 implemented?",
+  "topK": 10,
+  "explanation": ""
+}
+```
+Result:
+
+```json
+{
+  "codeResults": [
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 36,
+            "column": 5
+          },
+          "endPosition": {
+            "line": 96
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# ---------- 熔断器 ----------",
+            "lineNumber": 40
+          },
+          {
+            "lineNumber": 41
+          },
+          {
+            "text": "class CircuitBreaker:",
+            "lineNumber": 42,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 43
+          },
+          {
+            "text": "    简易熔断器：连续失败达到阈值后进入 OPEN 状态，拒绝请求；",
+            "lineNumber": 44
+          },
+          {
+            "text": "    经过冷却期后进入 HALF_OPEN，放行一次探测；探测成功则恢复 CLOSED。",
+            "lineNumber": 45
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 46
+          },
+          {
+            "lineNumber": 47
+          },
+          {
+            "text": "    def __init__(self, failure_threshold: int = 5, recovery_seconds: float = 30.0, name: str = \"\"):",
+            "lineNumber": 48
+          },
+          {
+            "text": "        self._failure_threshold = failure_threshold",
+            "lineNumber": 49
+          },
+          {
+            "text": "        self._recovery_seconds = recovery_seconds",
+            "lineNumber": 50
+          },
+          {
+            "text": "        self._name = name or \"db\"",
+            "lineNumber": 51
+          },
+          {
+            "text": "        self._failures = 0",
+            "lineNumber": 52
+          },
+          {
+            "text": "        self._last_failure_time = 0.0",
+            "lineNumber": 53
+          },
+          {
+            "text": "        self._state = \"CLOSED\"  # CLOSED | OPEN | HALF_OPEN",
+            "lineNumber": 54
+          },
+          {
+            "text": "        self._lock = threading.Lock()",
+            "lineNumber": 55
+          },
+          {
+            "lineNumber": 56
+          },
+          {
+            "text": "    @property",
+            "lineNumber": 57
+          },
+          {
+            "text": "    def state(self) -&gt; str:",
+            "lineNumber": 58
+          },
+          {
+            "text": "        with self._lock:",
+            "lineNumber": 59
+          },
+          {
+            "text": "            if self._state == \"OPEN\":",
+            "lineNumber": 60
+          },
+          {
+            "text": "                if time.monotonic() - self._last_failure_time &gt;= self._recovery_seconds:",
+            "lineNumber": 61
+          },
+          {
+            "text": "                    self._state = \"HALF_OPEN\"",
+            "lineNumber": 62
+          },
+          {
+            "text": "            return self._state",
+            "lineNumber": 63
+          },
+          {
+            "lineNumber": 64
+          },
+          {
+            "text": "    def allow_request(self) -&gt; bool:",
+            "lineNumber": 65
+          },
+          {
+            "text": "        s = self.state",
+            "lineNumber": 66
+          },
+          {
+            "text": "        return s in (\"CLOSED\", \"HALF_OPEN\")",
+            "lineNumber": 67
+          },
+          {
+            "lineNumber": 68
+          },
+          {
+            "text": "    def record_success(self) -&gt; None:",
+            "lineNumber": 69
+          },
+          {
+            "text": "        with self._lock:",
+            "lineNumber": 70
+          },
+          {
+            "text": "            self._failures = 0",
+            "lineNumber": 71
+          },
+          {
+            "text": "            if self._state != \"CLOSED\":",
+            "lineNumber": 72
+          },
+          {
+            "text": "                logger.info(\"[%s] 熔断器恢复 CLOSED\", self._name)",
+            "lineNumber": 73
+          },
+          {
+            "text": "            self._state = \"CLOSED\"",
+            "lineNumber": 74
+          },
+          {
+            "lineNumber": 75
+          },
+          {
+            "text": "    def record_failure(self) -&gt; None:",
+            "lineNumber": 76
+          },
+          {
+            "text": "        with self._lock:",
+            "lineNumber": 77
+          },
+          {
+            "text": "            self._failures += 1",
+            "lineNumber": 78
+          },
+          {
+            "text": "            self._last_failure_time = time.monotonic()",
+            "lineNumber": 79
+          },
+          {
+            "text": "            if self._failures &gt;= self._failure_threshold and self._state == \"CLOSED\":",
+            "lineNumber": 80
+          },
+          {
+            "text": "                self._state = \"OPEN\"",
+            "lineNumber": 81
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 82
+          },
+          {
+            "text": "                    \"[%s] 连续 %d 次失败，熔断器 OPEN（%ds 后半开探测）\",",
+            "lineNumber": 83
+          },
+          {
+            "text": "                    self._name, self._failures, int(self._recovery_seconds),",
+            "lineNumber": 84
+          },
+          {
+            "text": "                )",
+            "lineNumber": 85
+          },
+          {
+            "text": "            elif self._state == \"HALF_OPEN\":",
+            "lineNumber": 86
+          },
+          {
+            "text": "                self._state = \"OPEN\"",
+            "lineNumber": 87
+          },
+          {
+            "text": "                logger.warning(\"[%s] 半开探测失败，熔断器重新 OPEN\", self._name)",
+            "lineNumber": 88
+          },
+          {
+            "lineNumber": 89
+          },
+          {
+            "text": "    def status(self) -&gt; dict:",
+            "lineNumber": 90
+          },
+          {
+            "text": "        return",
+            "lineNumber": 91
+          }
+        ]
+      },
+      "score": 0.5936846137046814
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 171,
+            "column": 24
+          },
+          "endPosition": {
+            "line": 230,
+            "column": 33
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "@contextmanager",
+            "lineNumber": 175
+          },
+          {
+            "text": "def safe_connection(",
+            "lineNumber": 176,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 177,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 178,
+            "isSignature": true
+          },
+          {
+            "text": "    retries: int = 2,",
+            "lineNumber": 179,
+            "isSignature": true
+          },
+          {
+            "text": "    retry_delay: float = 0.5,",
+            "lineNumber": 180,
+            "isSignature": true
+          },
+          {
+            "text": "    critical: bool = True,",
+            "lineNumber": 181,
+            "isSignature": true
+          },
+          {
+            "text": "    pool_size: Optional[int] = None,",
+            "lineNumber": 182,
+            "isSignature": true
+          },
+          {
+            "text": "    max_overflow: Optional[int] = None,",
+            "lineNumber": 183,
+            "isSignature": true
+          },
+          {
+            "text": "    pool_timeout: Optional[int] = None,",
+            "lineNumber": 184,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 185,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 186
+          },
+          {
+            "text": "    安全获取数据库连接的上下文管理器，内置重试 + 熔断。",
+            "lineNumber": 187
+          },
+          {
+            "text": "    连接池参数未显式传入时从配置读取（postgresql_pool_size 等）。",
+            "lineNumber": 188
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 189
+          },
+          {
+            "text": "    breaker = _get_breaker(uri)",
+            "lineNumber": 190
+          },
+          {
+            "lineNumber": 191
+          },
+          {
+            "text": "    if not breaker.allow_request():",
+            "lineNumber": 192
+          },
+          {
+            "text": "        if critical:",
+            "lineNumber": 193
+          },
+          {
+            "text": "            raise ConnectionError(f\"数据库熔断中（{breaker.status()['state']}），暂时拒绝连接\")",
+            "lineNumber": 194
+          },
+          {
+            "text": "        logger.warning(\"数据库熔断中，降级处理\")",
+            "lineNumber": 195
+          },
+          {
+            "text": "        yield None",
+            "lineNumber": 196
+          },
+          {
+            "text": "        return",
+            "lineNumber": 197
+          },
+          {
+            "lineNumber": 198
+          },
+          {
+            "text": "    cfg = _db_config()",
+            "lineNumber": 199
+          },
+          {
+            "text": "    ps = pool_size if pool_size is not None else cfg[\"pool_size\"]",
+            "lineNumber": 200
+          },
+          {
+            "text": "    mo = max_overflow if max_overflow is not None else cfg[\"max_overflow\"]",
+            "lineNumber": 201
+          },
+          {
+            "text": "    pt = pool_timeout if pool_timeout is not None else cfg[\"pool_timeout\"]",
+            "lineNumber": 202
+          },
+          {
+            "text": "    engine = get_engine(uri, pool_size=ps, max_overflow=mo, pool_timeout=pt)",
+            "lineNumber": 203
+          },
+          {
+            "text": "    last_err = None",
+            "lineNumber": 204
+          },
+          {
+            "lineNumber": 205
+          },
+          {
+            "text": "    for attempt in range(1, retries + 2):",
+            "lineNumber": 206
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 207
+          },
+          {
+            "text": "            with engine.connect() as conn:",
+            "lineNumber": 208
+          },
+          {
+            "text": "                breaker.record_success()",
+            "lineNumber": 209
+          },
+          {
+            "text": "                yield conn",
+            "lineNumber": 210
+          },
+          {
+            "text": "                return",
+            "lineNumber": 211
+          },
+          {
+            "text": "        except Exception as e:",
+            "lineNumber": 212
+          },
+          {
+            "text": "            last_err = e",
+            "lineNumber": 213
+          },
+          {
+            "text": "            breaker.record_failure()",
+            "lineNumber": 214
+          },
+          {
+            "text": "            if attempt &lt;= retries:",
+            "lineNumber": 215
+          },
+          {
+            "text": "                delay = retry_delay * (2 ** (attempt - 1))",
+            "lineNumber": 216
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 217
+          },
+          {
+            "text": "                    \"数据库连接失败（第 %d/%d 次），%.1fs 后重试: %s\",",
+            "lineNumber": 218
+          },
+          {
+            "text": "                    attempt, retries + 1, delay, e,",
+            "lineNumber": 219
+          },
+          {
+            "text": "                )",
+            "lineNumber": 220
+          },
+          {
+            "text": "                time.sleep(delay)",
+            "lineNumber": 221
+          },
+          {
+            "lineNumber": 222
+          },
+          {
+            "text": "    if critical:",
+            "lineNumber": 223
+          },
+          {
+            "text": "        raise ConnectionError(f\"数据库连接失败（已重试 {retries} 次）: {last_err}\") from last_err",
+            "lineNumber": 224
+          },
+          {
+            "text": "    logger.error(\"数据库连接失败（已重试），降级处理: %s\", last_err)",
+            "lineNumber": 225
+          },
+          {
+            "text": "    yield None",
+            "lineNumber": 226,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 227
+          },
+          {
+            "lineNumber": 228
+          },
+          {
+            "text": "# ---------- 异步连接池管理（asyncpg） ----------",
+            "lineNumber": 229
+          },
+          {
+            "lineNumber": 230
+          },
+          {
+            "text": "_async_pools: Dict[str, Any] = {}",
+            "lineNumber": 231
+          }
+        ]
+      },
+      "score": 0.4633176326751709
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 96
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# src/db_resilience.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "数据库连接韧性层：连接池复用、重试、熔断、高并发限流、降级。",
+            "lineNumber": 3
+          },
+          {
+            "lineNumber": 4
+          },
+          {
+            "text": "覆盖范围：",
+            "lineNumber": 5
+          },
+          {
+            "text": "- PostgreSQL / SQLite（SQLAlchemy 同步 + asyncpg 异步）",
+            "lineNumber": 6
+          },
+          {
+            "text": "- Milvus 向量数据库（pymilvus）",
+            "lineNumber": 7
+          },
+          {
+            "lineNumber": 8
+          },
+          {
+            "text": "设计目标：",
+            "lineNumber": 9
+          },
+          {
+            "text": "- 所有数据库连接统一走此模块，避免各处散落的连接创建。",
+            "lineNumber": 10
+          },
+          {
+            "text": "- 连接失败时自动重试（指数退避），连续失败后熔断（短时拒绝，避免雪崩）。",
+            "lineNumber": 11
+          },
+          {
+            "text": "- 熔断期间对非关键路径返回降级结果而非抛异常。",
+            "lineNumber": 12
+          },
+          {
+            "text": "- Milvus 支持懒重连：连接断开后下次操作自动尝试重连。",
+            "lineNumber": 13
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 14
+          },
+          {
+            "text": "import asyncio",
+            "lineNumber": 15
+          },
+          {
+            "text": "import logging",
+            "lineNumber": 16
+          },
+          {
+            "text": "import threading",
+            "lineNumber": 17
+          },
+          {
+            "text": "import time",
+            "lineNumber": 18
+          },
+          {
+            "text": "from contextlib import contextmanager, asynccontextmanager",
+            "lineNumber": 19
+          },
+          {
+            "text": "from typing import Any, Dict, Optional",
+            "lineNumber": 20
+          },
+          {
+            "lineNumber": 21
+          },
+          {
+            "text": "from config import get_settings",
+            "lineNumber": 22
+          },
+          {
+            "lineNumber": 23
+          },
+          {
+            "text": "logger = logging.getLogger(__name__)",
+            "lineNumber": 24
+          },
+          {
+            "lineNumber": 25
+          },
+          {
+            "lineNumber": 26
+          },
+          {
+            "text": "def _db_config():",
+            "lineNumber": 27,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"从配置读取连接池与熔断参数。\"\"\"",
+            "lineNumber": 28
+          },
+          {
+            "text": "    s = get_settings()",
+            "lineNumber": 29
+          },
+          {
+            "text": "    return {",
+            "lineNumber": 30
+          },
+          {
+            "text": "        \"pool_size\": max(1, getattr(s, \"postgresql_pool_size\", 5)),",
+            "lineNumber": 31
+          },
+          {
+            "text": "        \"max_overflow\": max(0, getattr(s, \"postgresql_max_overflow\", 10)),",
+            "lineNumber": 32
+          },
+          {
+            "text": "        \"pool_timeout\": max(1, getattr(s, \"postgresql_pool_timeout\", 10)),",
+            "lineNumber": 33
+          },
+          {
+            "text": "        \"cb_threshold\": max(1, getattr(s, \"db_circuit_breaker_threshold\", 5)),",
+            "lineNumber": 34
+          },
+          {
+            "text": "        \"cb_recovery\": max(5.0, float(getattr(s, \"db_circuit_breaker_recovery_seconds\", 30))),",
+            "lineNumber": 35
+          },
+          {
+            "text": "        \"statement_timeout_ms\": max(0, getattr(s, \"postgresql_statement_timeout_ms\", 0)),",
+            "lineNumber": 36
+          },
+          {
+            "text": "    }",
+            "lineNumber": 37,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 38
+          },
+          {
+            "lineNumber": 39
+          },
+          {
+            "text": "# ---------- 熔断器 ----------",
+            "lineNumber": 40
+          },
+          {
+            "lineNumber": 41
+          },
+          {
+            "text": "class CircuitBreaker:",
+            "lineNumber": 42,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 43
+          }
+        ]
+      },
+      "score": 0.4431922137737274
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/DB_RESILIENCE.md",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 49
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# 数据库连接韧性与高并发应对",
+            "lineNumber": 1
+          },
+          {
+            "lineNumber": 2
+          },
+          {
+            "text": "## 一、概述",
+            "lineNumber": 3
+          },
+          {
+            "lineNumber": 4
+          },
+          {
+            "text": "所有数据库连接（PostgreSQL、SQLite、Milvus）统一通过 &#96;src/db_resilience.py&#96; 管理，提供：",
+            "lineNumber": 5
+          },
+          {
+            "text": "- **连接池复用**：按 URI 缓存 Engine / asyncpg Pool / Milvus Collection，避免每次请求建连销毁。",
+            "lineNumber": 6
+          },
+          {
+            "text": "- **自动重试**：连接失败时指数退避重试（默认 2 次）。",
+            "lineNumber": 7
+          },
+          {
+            "text": "- **熔断保护**：连续失败达阈值后短时拒绝请求，避免雪崩。",
+            "lineNumber": 8
+          },
+          {
+            "text": "- **优雅降级**：非关键路径在数据库不可用时返回默认值而非报错。",
+            "lineNumber": 9
+          },
+          {
+            "text": "- **懒重连**：Milvus 连接断开后下次操作自动尝试重连，无需重启服务。",
+            "lineNumber": 10
+          },
+          {
+            "text": "- **高并发限流**：通过连接池大小 + 溢出上限 + 获取超时控制排队。",
+            "lineNumber": 11
+          },
+          {
+            "lineNumber": 12
+          },
+          {
+            "text": "---",
+            "lineNumber": 13
+          },
+          {
+            "lineNumber": 14
+          },
+          {
+            "text": "## 二、架构",
+            "lineNumber": 15
+          },
+          {
+            "lineNumber": 16
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 17
+          },
+          {
+            "text": "请求 → safe_connection() / safe_async_connection()",
+            "lineNumber": 18
+          },
+          {
+            "text": "         ├── 熔断器检查（OPEN → 降级/拒绝）",
+            "lineNumber": 19
+          },
+          {
+            "text": "         ├── 获取 Engine/Pool（复用缓存）",
+            "lineNumber": 20
+          },
+          {
+            "text": "         ├── 获取连接（pool_timeout 排队）",
+            "lineNumber": 21
+          },
+          {
+            "text": "         ├── 成功 → record_success → 恢复 CLOSED",
+            "lineNumber": 22
+          },
+          {
+            "text": "         └── 失败 → record_failure → 指数退避重试",
+            "lineNumber": 23
+          },
+          {
+            "text": "                     └── 连续失败 → 熔断 OPEN（recovery_seconds 后半开探测）",
+            "lineNumber": 24
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 25
+          },
+          {
+            "lineNumber": 26
+          },
+          {
+            "text": "---",
+            "lineNumber": 27
+          },
+          {
+            "lineNumber": 28
+          },
+          {
+            "text": "## 三、熔断器状态机",
+            "lineNumber": 29
+          },
+          {
+            "lineNumber": 30
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 31
+          },
+          {
+            "text": "CLOSED ──(连续 N 次失败)──→ OPEN ──(冷却期到)──→ HALF_OPEN",
+            "lineNumber": 32
+          },
+          {
+            "text": "  ↑                                                    │",
+            "lineNumber": 33
+          },
+          {
+            "text": "  └──────────(探测成功)────────────────────────────────┘",
+            "lineNumber": 34
+          },
+          {
+            "text": "                                                        │",
+            "lineNumber": 35
+          },
+          {
+            "text": "  OPEN ←──────────(探测失败)────────────────────────────┘",
+            "lineNumber": 36
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 37
+          },
+          {
+            "lineNumber": 38
+          },
+          {
+            "text": "| 参数 | 默认值 | 说明 |",
+            "lineNumber": 39
+          },
+          {
+            "text": "|------|--------|------|",
+            "lineNumber": 40
+          },
+          {
+            "text": "| &#96;failure_threshold&#96; | 5 | 连续失败多少次后熔断 |",
+            "lineNumber": 41
+          },
+          {
+            "text": "| &#96;recovery_seconds&#96; | 30 | 熔断持续时间，到期后放行一次探测 |",
+            "lineNumber": 42
+          },
+          {
+            "lineNumber": 43
+          },
+          {
+            "text": "---",
+            "lineNumber": 44
+          },
+          {
+            "lineNumber": 45
+          },
+          {
+            "text": "## 四、连接池参数",
+            "lineNumber": 46
+          },
+          {
+            "lineNumber": 47
+          },
+          {
+            "text": "### 同步（SQLAlchemy Engine）",
+            "lineNumber": 48
+          }
+        ]
+      },
+      "score": 0.43908464908599854
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 288,
+            "column": 112
+          },
+          "endPosition": {
+            "line": 345
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 235,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 244,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "@asynccontextmanager",
+            "lineNumber": 292
+          },
+          {
+            "text": "async def safe_async_connection(",
+            "lineNumber": 293,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 294,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 295,
+            "isSignature": true
+          },
+          {
+            "text": "    critical: bool = True,",
+            "lineNumber": 296,
+            "isSignature": true
+          },
+          {
+            "text": "    retries: int = 2,",
+            "lineNumber": 297,
+            "isSignature": true
+          },
+          {
+            "text": "    retry_delay: float = 0.5,",
+            "lineNumber": 298,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 299,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 300
+          },
+          {
+            "text": "    异步安全获取 asyncpg 连接，内置重试 + 熔断。",
+            "lineNumber": 301
+          },
+          {
+            "lineNumber": 302
+          },
+          {
+            "text": "    critical=False 时熔断/失败后 yield None（降级）。",
+            "lineNumber": 303
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 304
+          },
+          {
+            "text": "    breaker = _get_breaker(uri)",
+            "lineNumber": 305
+          },
+          {
+            "lineNumber": 306
+          },
+          {
+            "text": "    if not breaker.allow_request():",
+            "lineNumber": 307
+          },
+          {
+            "text": "        if critical:",
+            "lineNumber": 308
+          },
+          {
+            "text": "            raise ConnectionError(f\"数据库熔断中（{breaker.status()['state']}），暂时拒绝连接\")",
+            "lineNumber": 309
+          },
+          {
+            "text": "        logger.warning(\"数据库熔断中（async），降级处理\")",
+            "lineNumber": 310
+          },
+          {
+            "text": "        yield None",
+            "lineNumber": 311
+          },
+          {
+            "text": "        return",
+            "lineNumber": 312
+          },
+          {
+            "lineNumber": 313
+          },
+          {
+            "text": "    last_err = None",
+            "lineNumber": 314
+          },
+          {
+            "text": "    for attempt in range(1, retries + 2):",
+            "lineNumber": 315
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 316
+          },
+          {
+            "text": "            pool = await get_async_pool(uri)",
+            "lineNumber": 317
+          },
+          {
+            "text": "            async with pool.acquire() as conn:",
+            "lineNumber": 318
+          },
+          {
+            "text": "                breaker.record_success()",
+            "lineNumber": 319
+          },
+          {
+            "text": "                yield conn",
+            "lineNumber": 320
+          },
+          {
+            "text": "                return",
+            "lineNumber": 321
+          },
+          {
+            "text": "        except Exception as e:",
+            "lineNumber": 322
+          },
+          {
+            "text": "            last_err = e",
+            "lineNumber": 323
+          },
+          {
+            "text": "            breaker.record_failure()",
+            "lineNumber": 324
+          },
+          {
+            "text": "            if attempt &lt;= retries:",
+            "lineNumber": 325
+          },
+          {
+            "text": "                delay = retry_delay * (2 ** (attempt - 1))",
+            "lineNumber": 326
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 327
+          },
+          {
+            "text": "                    \"异步数据库连接失败（第 %d/%d 次），%.1fs 后重试: %s\",",
+            "lineNumber": 328
+          },
+          {
+            "text": "                    attempt, retries + 1, delay, e,",
+            "lineNumber": 329
+          },
+          {
+            "text": "                )",
+            "lineNumber": 330
+          },
+          {
+            "text": "                await asyncio.sleep(delay)",
+            "lineNumber": 331
+          },
+          {
+            "lineNumber": 332
+          },
+          {
+            "text": "    if critical:",
+            "lineNumber": 333
+          },
+          {
+            "text": "        raise ConnectionError(f\"异步数据库连接失败（已重试 {retries} 次）: {last_err}\") from last_err",
+            "lineNumber": 334
+          },
+          {
+            "text": "    logger.error(\"异步数据库连接失败（已重试），降级处理: %s\", last_err)",
+            "lineNumber": 335
+          },
+          {
+            "text": "    yield None",
+            "lineNumber": 336,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 337
+          },
+          {
+            "lineNumber": 338
+          },
+          {
+            "text": "async def dispose_all_async_pools() -&gt; None:",
+            "lineNumber": 339,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"关闭所有 asyncpg 连接池。\"\"\"",
+            "lineNumber": 340
+          }
+        ]
+      },
+      "score": 0.4389229118824005
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 96,
+            "column": 9
+          },
+          "endPosition": {
+            "line": 160
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# ---------- 同步连接池管理 ----------",
+            "lineNumber": 100
+          },
+          {
+            "lineNumber": 101
+          },
+          {
+            "text": "_engines: Dict[str, Any] = {}",
+            "lineNumber": 102
+          },
+          {
+            "text": "_breakers: Dict[str, CircuitBreaker] = {}",
+            "lineNumber": 103
+          },
+          {
+            "text": "_engine_lock = threading.Lock()",
+            "lineNumber": 104
+          },
+          {
+            "lineNumber": 105
+          },
+          {
+            "lineNumber": 106
+          },
+          {
+            "text": "def _get_breaker(uri: str) -&gt; CircuitBreaker:",
+            "lineNumber": 107,
+            "isSignature": true
+          },
+          {
+            "text": "    cfg = _db_config()",
+            "lineNumber": 108
+          },
+          {
+            "text": "    key = (uri or \"\").strip()",
+            "lineNumber": 109
+          },
+          {
+            "text": "    if key not in _breakers:",
+            "lineNumber": 110
+          },
+          {
+            "text": "        with _engine_lock:",
+            "lineNumber": 111
+          },
+          {
+            "text": "            if key not in _breakers:",
+            "lineNumber": 112
+          },
+          {
+            "text": "                _breakers[key] = CircuitBreaker(",
+            "lineNumber": 113
+          },
+          {
+            "text": "                    failure_threshold=cfg[\"cb_threshold\"],",
+            "lineNumber": 114
+          },
+          {
+            "text": "                    recovery_seconds=cfg[\"cb_recovery\"],",
+            "lineNumber": 115
+          },
+          {
+            "text": "                    name=f\"db:{key[:40]}\",",
+            "lineNumber": 116
+          },
+          {
+            "text": "                )",
+            "lineNumber": 117
+          },
+          {
+            "text": "    return _breakers[key]",
+            "lineNumber": 118,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 119
+          },
+          {
+            "lineNumber": 120
+          },
+          {
+            "text": "def get_engine(",
+            "lineNumber": 121,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 122,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 123,
+            "isSignature": true
+          },
+          {
+            "text": "    pool_size: int = 5,",
+            "lineNumber": 124,
+            "isSignature": true
+          },
+          {
+            "text": "    max_overflow: int = 10,",
+            "lineNumber": 125,
+            "isSignature": true
+          },
+          {
+            "text": "    pool_timeout: int = 10,",
+            "lineNumber": 126,
+            "isSignature": true
+          },
+          {
+            "text": "    pool_recycle: int = 1800,",
+            "lineNumber": 127,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 128,
+            "isSignature": true
+          },
+          {
+            "text": "    ",
+            "lineNumber": 129
+          }
+        ]
+      },
+      "score": 0.42488589882850647
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 464,
+            "column": 48
+          },
+          "endPosition": {
+            "line": 533
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "def milvus_operation_with_retry(",
+            "lineNumber": 468,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 469,
+            "isSignature": true
+          },
+          {
+            "text": "    collection_name: str,",
+            "lineNumber": 470,
+            "isSignature": true
+          },
+          {
+            "text": "    operation,",
+            "lineNumber": 471,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 472,
+            "isSignature": true
+          },
+          {
+            "text": "    retries: int = 2,",
+            "lineNumber": 473,
+            "isSignature": true
+          },
+          {
+            "text": "    retry_delay: float = 0.5,",
+            "lineNumber": 474,
+            "isSignature": true
+          },
+          {
+            "text": "    critical: bool = False,",
+            "lineNumber": 475,
+            "isSignature": true
+          },
+          {
+            "text": "    default=None,",
+            "lineNumber": 476,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 477,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 478
+          },
+          {
+            "text": "    执行 Milvus 操作（search / insert / flush 等），失败时自动重连重试。",
+            "lineNumber": 479
+          },
+          {
+            "lineNumber": 480
+          },
+          {
+            "text": "    参数：",
+            "lineNumber": 481
+          },
+          {
+            "text": "    - operation: 可调用对象，签名 operation(collection) -&gt; result。",
+            "lineNumber": 482
+          },
+          {
+            "text": "    - critical: True 时失败抛异常；False 时返回 default。",
+            "lineNumber": 483
+          },
+          {
+            "text": "    - default: 降级时的默认返回值。",
+            "lineNumber": 484
+          },
+          {
+            "lineNumber": 485
+          },
+          {
+            "text": "    用法：",
+            "lineNumber": 486
+          },
+          {
+            "text": "        results = milvus_operation_with_retry(",
+            "lineNumber": 487
+          },
+          {
+            "text": "            uri, coll_name,",
+            "lineNumber": 488
+          },
+          {
+            "text": "            lambda coll: coll.search(...),",
+            "lineNumber": 489
+          },
+          {
+            "text": "            default=[],",
+            "lineNumber": 490
+          },
+          {
+            "text": "        )",
+            "lineNumber": 491
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 492
+          },
+          {
+            "text": "    breaker = _get_milvus_breaker(uri)",
+            "lineNumber": 493
+          },
+          {
+            "lineNumber": 494
+          },
+          {
+            "text": "    if not breaker.allow_request():",
+            "lineNumber": 495
+          },
+          {
+            "text": "        if critical:",
+            "lineNumber": 496
+          },
+          {
+            "text": "            raise ConnectionError(f\"Milvus 熔断中: {uri[:40]}/{collection_name}\")",
+            "lineNumber": 497
+          },
+          {
+            "text": "        logger.warning(\"Milvus 熔断中，降级处理: %s/%s\", uri[:40], collection_name)",
+            "lineNumber": 498
+          },
+          {
+            "text": "        return default",
+            "lineNumber": 499
+          },
+          {
+            "lineNumber": 500
+          },
+          {
+            "text": "    last_err = None",
+            "lineNumber": 501
+          },
+          {
+            "text": "    for attempt in range(1, retries + 2):",
+            "lineNumber": 502
+          },
+          {
+            "text": "        coll = get_milvus_collection(uri, collection_name)",
+            "lineNumber": 503
+          },
+          {
+            "text": "        if coll is None:",
+            "lineNumber": 504
+          },
+          {
+            "text": "            if critical:",
+            "lineNumber": 505
+          },
+          {
+            "text": "                raise ConnectionError(f\"Milvus collection 不可用: {collection_name}\")",
+            "lineNumber": 506
+          },
+          {
+            "text": "            return default",
+            "lineNumber": 507
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 508
+          },
+          {
+            "text": "            result = operation(coll)",
+            "lineNumber": 509
+          },
+          {
+            "text": "            breaker.record_success()",
+            "lineNumber": 510
+          },
+          {
+            "text": "            return result",
+            "lineNumber": 511
+          },
+          {
+            "text": "        except Exception as e:",
+            "lineNumber": 512
+          },
+          {
+            "text": "            last_err = e",
+            "lineNumber": 513
+          },
+          {
+            "text": "            breaker.record_failure()",
+            "lineNumber": 514
+          },
+          {
+            "text": "            invalidate_milvus_collection(uri, collection_name)",
+            "lineNumber": 515
+          },
+          {
+            "text": "            if attempt &lt;= retries:",
+            "lineNumber": 516
+          },
+          {
+            "text": "                delay = retry_delay * (2 ** (attempt - 1))",
+            "lineNumber": 517
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 518
+          },
+          {
+            "text": "                    \"Milvus 操作失败（第 %d/%d 次），%.1fs 后重试: %s\",",
+            "lineNumber": 519
+          },
+          {
+            "text": "                    attempt, retries + 1, delay, e,",
+            "lineNumber": 520
+          },
+          {
+            "text": "                )",
+            "lineNumber": 521
+          },
+          {
+            "text": "                time.sleep(delay)",
+            "lineNumber": 522
+          },
+          {
+            "lineNumber": 523
+          },
+          {
+            "text": "    if critical:",
+            "lineNumber": 524
+          },
+          {
+            "text": "        raise ConnectionError(f\"Milvus 操作失败（已重试 {retries} 次）: {last_err}\") from last_err",
+            "lineNumber": 525
+          },
+          {
+            "text": "    logger.error(\"Milvus 操作失败（已重试），降级处理: %s\", last_err)",
+            "lineNumber": 526
+          },
+          {
+            "text": "    return default",
+            "lineNumber": 527,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 528
+          },
+          {
+            "lineNumber": 529
+          },
+          {
+            "text": "# ---------- 状态查询 ----------",
+            "lineNumber": 530
+          },
+          {
+            "lineNumber": 531
+          },
+          {
+            "text": "def get_all_breaker_status() -&gt; list:",
+            "lineNumber": 532,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 533
+          }
+        ]
+      },
+      "score": 0.4211297929286957
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/TECH_REVIEW_AND_OPTIMIZATION.md",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 38
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# 项目技术方案审查与优化建议",
+            "lineNumber": 1
+          },
+          {
+            "lineNumber": 2
+          },
+          {
+            "text": "&gt; 审查范围：高并发性能、稳定性、可用性  ",
+            "lineNumber": 3
+          },
+          {
+            "text": "&gt; 审查日期：2025-03  ",
+            "lineNumber": 4
+          },
+          {
+            "text": "&gt; **已实施**：P0/P1/P2 优化项均已落地，见下方「已实施优化」章节。",
+            "lineNumber": 5
+          },
+          {
+            "lineNumber": 6
+          },
+          {
+            "text": "---",
+            "lineNumber": 7
+          },
+          {
+            "lineNumber": 8
+          },
+          {
+            "text": "## 已实施优化（2025-03）",
+            "lineNumber": 9
+          },
+          {
+            "lineNumber": 10
+          },
+          {
+            "text": "| 优先级 | 优化项 | 实现位置 |",
+            "lineNumber": 11
+          },
+          {
+            "text": "|--------|--------|----------|",
+            "lineNumber": 12
+          },
+          {
+            "text": "| P0 | 健康检查增强 | &#96;api/main.py&#96; &#96;/health&#96; 探测 DB/Redis/Milvus/LLM，返回 status/details/breakers |",
+            "lineNumber": 13
+          },
+          {
+            "text": "| P0 | API 全局限流 | &#96;api/main.py&#96; 中间件 + &#96;api_max_concurrent_requests&#96; |",
+            "lineNumber": 14
+          },
+          {
+            "text": "| P0 | MinerU 重试 | &#96;mineru_client.py&#96; &#96;mineru_retry_times&#96;，5xx/超时/连接错误指数退避 |",
+            "lineNumber": 15
+          },
+          {
+            "text": "| P1 | 连接池参数可配置 | &#96;config/settings.py&#96; + &#96;db_resilience.py&#96; |",
+            "lineNumber": 16
+          },
+          {
+            "text": "| P1 | DB statement_timeout | &#96;postgresql_statement_timeout_ms&#96;，通过 connect_args 注入 |",
+            "lineNumber": 17
+          },
+          {
+            "text": "| P1 | 优雅关闭 | &#96;run.py&#96; &#96;timeout_graceful_shutdown&#96; |",
+            "lineNumber": 18
+          },
+          {
+            "text": "| P1 | /health/ready | &#96;api/main.py&#96; 深度检查，任一依赖不可用返回 503 |",
+            "lineNumber": 19
+          },
+          {
+            "text": "| P2 | LLM 单 endpoint 重试 | &#96;llm.py&#96; 单节点时按 &#96;agent_llm_retry_times&#96; 重试 |",
+            "lineNumber": 20
+          },
+          {
+            "text": "| P2 | 熔断参数可配置 | &#96;db_circuit_breaker_threshold&#96;、&#96;db_circuit_breaker_recovery_seconds&#96; |",
+            "lineNumber": 21
+          },
+          {
+            "text": "| P2 | RAG 检索缓存 | &#96;rag.py&#96; &#96;rag_retrieval_cache_max_entries&#96;、&#96;rag_retrieval_cache_ttl_seconds&#96; |",
+            "lineNumber": 22
+          },
+          {
+            "text": "| P2 | /health 集成熔断状态 | &#96;get_all_breaker_status()&#96; 已包含在 &#96;/health&#96; 响应 |",
+            "lineNumber": 23
+          },
+          {
+            "text": "| P3 | Redis Sentinel | &#96;redis_sentinel_service_name&#96;、&#96;redis_sentinel_nodes&#96; 配置后 answer_cache 经 Sentinel 连接 |",
+            "lineNumber": 24
+          },
+          {
+            "text": "| P3 | 多 worker 共享状态 | &#96;shared_state_redis_url&#96; 配置后解析缓存/待确认 SQL/中断状态存 Redis（&#96;src/shared_state.py&#96;） |",
+            "lineNumber": 25
+          },
+          {
+            "text": "| P3 | 异步客户端说明 | 见 ASYNC_CONCURRENCY.md：PostgreSQL 已支持 asyncpg；Milvus 待官方 async SDK |",
+            "lineNumber": 26
+          },
+          {
+            "lineNumber": 27
+          },
+          {
+            "text": "---",
+            "lineNumber": 28
+          },
+          {
+            "lineNumber": 29
+          },
+          {
+            "text": "## 一、项目架构概览",
+            "lineNumber": 30
+          },
+          {
+            "lineNumber": 31
+          },
+          {
+            "text": "### 1.1 核心模块与职责",
+            "lineNumber": 32
+          },
+          {
+            "lineNumber": 33
+          },
+          {
+            "text": "| 模块 | 职责 | 韧性现状 |",
+            "lineNumber": 34
+          },
+          {
+            "text": "|------|------|----------|",
+            "lineNumber": 35
+          },
+          {
+            "text": "| **api/main.py** | HTTP 入口、lifespan、会话隔离、超时 | 无 API 限流；/health 仅返回 ok |",
+            "lineNumber": 36
+          },
+          {
+            "text": "| **db_resilience** | PostgreSQL / SQLite / Milvus 连接池、重试、熔断、降级 | ✅ 已覆盖 |",
+            "lineNumber": 37
+          },
+          {
+            "text": "| **llm** | DeepSeek 多 endpoint、负载均衡、熔断 | ✅ 多节点时自动切换；单节点无重试 |",
+            "lineNumber": 38
+          }
+        ]
+      },
+      "score": 0.41687899827957153
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 345,
+            "column": 24
+          },
+          "endPosition": {
+            "line": 372
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# ---------- Milvus 韧性层 ----------",
+            "lineNumber": 349
+          },
+          {
+            "lineNumber": 350
+          },
+          {
+            "text": "_milvus_collections: Dict[str, Any] = {}",
+            "lineNumber": 351
+          },
+          {
+            "text": "_milvus_lock = threading.Lock()",
+            "lineNumber": 352
+          },
+          {
+            "lineNumber": 353
+          },
+          {
+            "lineNumber": 354
+          },
+          {
+            "text": "def _get_milvus_breaker(uri: str) -&gt; CircuitBreaker:",
+            "lineNumber": 355,
+            "isSignature": true
+          },
+          {
+            "text": "    cfg = _db_config()",
+            "lineNumber": 356
+          },
+          {
+            "text": "    key = f\"milvus:{(uri or '').strip()[:40]}\"",
+            "lineNumber": 357
+          },
+          {
+            "text": "    if key not in _breakers:",
+            "lineNumber": 358
+          },
+          {
+            "text": "        with _engine_lock:",
+            "lineNumber": 359
+          },
+          {
+            "text": "            if key not in _breakers:",
+            "lineNumber": 360
+          },
+          {
+            "text": "                _breakers[key] = CircuitBreaker(",
+            "lineNumber": 361
+          },
+          {
+            "text": "                    failure_threshold=min(3, cfg[\"cb_threshold\"]),",
+            "lineNumber": 362
+          },
+          {
+            "text": "                    recovery_seconds=cfg[\"cb_recovery\"],",
+            "lineNumber": 363
+          },
+          {
+            "text": "                    name=key,",
+            "lineNumber": 364
+          },
+          {
+            "text": "                )",
+            "lineNumber": 365
+          },
+          {
+            "text": "    return _breakers[key]",
+            "lineNumber": 366,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 367
+          },
+          {
+            "lineNumber": 368
+          },
+          {
+            "text": "def _milvus_connect(uri: str) -&gt; None:",
+            "lineNumber": 369,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"建立 Milvus 连接（幂等，pymilvus 内部会复用）。\"\"\"",
+            "lineNumber": 370
+          }
+        ]
+      },
+      "score": 0.3967128098011017
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/DB_RESILIENCE.md",
+        "range": {
+          "startPosition": {
+            "line": 90
+          },
+          "endPosition": {
+            "line": 130
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "| &#96;db_circuit_breaker_threshold&#96; | 5 | 连续失败达该次数后熔断 |",
+            "lineNumber": 91
+          },
+          {
+            "text": "| &#96;db_circuit_breaker_recovery_seconds&#96; | 30 | 熔断持续时间 |",
+            "lineNumber": 92
+          },
+          {
+            "lineNumber": 93
+          },
+          {
+            "text": "## 七、涉及文件",
+            "lineNumber": 94
+          },
+          {
+            "lineNumber": 95
+          },
+          {
+            "text": "| 文件 | 改动 |",
+            "lineNumber": 96
+          },
+          {
+            "text": "|------|------|",
+            "lineNumber": 97
+          },
+          {
+            "text": "| &#96;src/db_resilience.py&#96; | CircuitBreaker、get_engine、safe_connection、get_async_pool、safe_async_connection、**get_milvus_collection**、**milvus_operation_with_retry**；从配置读取连接池与熔断参数 |",
+            "lineNumber": 98
+          },
+          {
+            "text": "| &#96;src/chat_history.py&#96; | 所有同步/异步 DB 操作改用 safe_connection / safe_async_connection |",
+            "lineNumber": 99
+          },
+          {
+            "text": "| &#96;src/qa_monitoring.py&#96; | 所有 DB 操作改用 safe_connection，去除 create_engine + dispose 散落 |",
+            "lineNumber": 100
+          },
+          {
+            "text": "| &#96;src/kb/text2sql.py&#96; | _validate_sql_syntax 和 _execute_sql 改用 safe_connection + 连接池复用 |",
+            "lineNumber": 101
+          },
+          {
+            "text": "| &#96;src/doc/milvus_upload.py&#96; | **改造**：写入操作通过 milvus_operation_with_retry，schema 创建通过 get_milvus_collection |",
+            "lineNumber": 102
+          },
+          {
+            "text": "| &#96;src/kb/rag.py&#96; | **改造**：_init_milvus 和 _vector_search 通过 db_resilience 管理连接，支持懒重连；可选 RAG 检索 LRU 缓存 |",
+            "lineNumber": 103
+          },
+          {
+            "lineNumber": 104
+          },
+          {
+            "text": "---",
+            "lineNumber": 105
+          },
+          {
+            "lineNumber": 106
+          },
+          {
+            "text": "## 八、高并发场景分析",
+            "lineNumber": 107
+          },
+          {
+            "lineNumber": 108
+          },
+          {
+            "text": "### 场景 1：大量用户同时对话",
+            "lineNumber": 109
+          },
+          {
+            "lineNumber": 110
+          },
+          {
+            "text": "- 每个请求的对话历史读写走连接池，pool_size=5 + max_overflow=10 = 最多 15 个并发连接。",
+            "lineNumber": 111
+          },
+          {
+            "text": "- 超出 15 个时排队等待，pool_timeout=10s 内未获取到连接则失败 → 重试 → 降级。",
+            "lineNumber": 112
+          },
+          {
+            "text": "- 异步路径（asyncpg）max_size=10，不占线程池。",
+            "lineNumber": 113
+          },
+          {
+            "lineNumber": 114
+          },
+          {
+            "text": "### 场景 2：数据库短暂不可用（重启/网络抖动）",
+            "lineNumber": 115
+          },
+          {
+            "lineNumber": 116
+          },
+          {
+            "text": "- 第 1-2 次失败：自动重试（指数退避 0.5s → 1s）。",
+            "lineNumber": 117
+          },
+          {
+            "text": "- 连续 5 次失败：熔断 OPEN，后续请求直接降级，不再打数据库。",
+            "lineNumber": 118
+          },
+          {
+            "text": "- 30s 后半开探测：放行一次请求，成功则恢复，失败则继续熔断。",
+            "lineNumber": 119
+          },
+          {
+            "lineNumber": 120
+          },
+          {
+            "text": "### 场景 3：数据库长时间宕机",
+            "lineNumber": 121
+          },
+          {
+            "lineNumber": 122
+          },
+          {
+            "text": "- 熔断器持续 OPEN，所有非关键路径降级运行。",
+            "lineNumber": 123
+          },
+          {
+            "text": "- 对话仍可正常进行（使用内存状态），但历史不持久化。",
+            "lineNumber": 124
+          },
+          {
+            "text": "- Text2SQL 返回\"数据库连接失败\"提示。",
+            "lineNumber": 125
+          },
+          {
+            "text": "- 数据库恢复后，下一次半开探测成功即自动恢复。",
+            "lineNumber": 126
+          },
+          {
+            "lineNumber": 127
+          },
+          {
+            "text": "### 场景 4：Milvus 连接失败",
+            "lineNumber": 128
+          },
+          {
+            "lineNumber": 129
+          },
+          {
+            "text": "- **文档入库**（&#96;milvus_upload.py&#96;）：insert 失败自动重试 2 次，熔断后返回写入 0 条，不阻塞上传流程。",
+            "lineNumber": 130
+          }
+        ]
+      },
+      "score": 0.3874615430831909
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 372,
+            "column": 45
+          },
+          "endPosition": {
+            "line": 446
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "def get_milvus_collection(",
+            "lineNumber": 376,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 377,
+            "isSignature": true
+          },
+          {
+            "text": "    collection_name: str,",
+            "lineNumber": 378,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 379,
+            "isSignature": true
+          },
+          {
+            "text": "    retries: int = 2,",
+            "lineNumber": 380,
+            "isSignature": true
+          },
+          {
+            "text": "    retry_delay: float = 1.0,",
+            "lineNumber": 381,
+            "isSignature": true
+          },
+          {
+            "text": "    create_if_missing: bool = False,",
+            "lineNumber": 382,
+            "isSignature": true
+          },
+          {
+            "text": "    schema_builder=None,",
+            "lineNumber": 383,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 384,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 385
+          },
+          {
+            "text": "    获取 Milvus Collection，内置重试 + 熔断 + 懒重连。",
+            "lineNumber": 386
+          },
+          {
+            "lineNumber": 387
+          },
+          {
+            "text": "    参数：",
+            "lineNumber": 388
+          },
+          {
+            "text": "    - uri: Milvus 连接地址。",
+            "lineNumber": 389
+          },
+          {
+            "text": "    - collection_name: 目标 collection 名称。",
+            "lineNumber": 390
+          },
+          {
+            "text": "    - retries: 连接失败时重试次数。",
+            "lineNumber": 391
+          },
+          {
+            "text": "    - create_if_missing: True 时若 collection 不存在则通过 schema_builder 创建。",
+            "lineNumber": 392
+          },
+          {
+            "text": "    - schema_builder: 可调用对象，签名 schema_builder(collection_name) -&gt; Collection，",
+            "lineNumber": 393
+          },
+          {
+            "text": "                      仅在 create_if_missing=True 且 collection 不存在时调用。",
+            "lineNumber": 394
+          },
+          {
+            "lineNumber": 395
+          },
+          {
+            "text": "    返回 Collection 对象，熔断或失败时返回 None。",
+            "lineNumber": 396
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 397
+          },
+          {
+            "text": "    breaker = _get_milvus_breaker(uri)",
+            "lineNumber": 398
+          },
+          {
+            "text": "    cache_key = f\"{uri}|{collection_name}\"",
+            "lineNumber": 399
+          },
+          {
+            "lineNumber": 400
+          },
+          {
+            "text": "    if not breaker.allow_request():",
+            "lineNumber": 401
+          },
+          {
+            "text": "        logger.warning(\"Milvus 熔断中，跳过连接: %s/%s\", uri[:40], collection_name)",
+            "lineNumber": 402
+          },
+          {
+            "text": "        return None",
+            "lineNumber": 403
+          },
+          {
+            "lineNumber": 404
+          },
+          {
+            "text": "    cached = _milvus_collections.get(cache_key)",
+            "lineNumber": 405
+          },
+          {
+            "text": "    if cached is not None:",
+            "lineNumber": 406
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 407
+          },
+          {
+            "text": "            cached.num_entities  # lightweight ping",
+            "lineNumber": 408
+          },
+          {
+            "text": "            breaker.record_success()",
+            "lineNumber": 409
+          },
+          {
+            "text": "            return cached",
+            "lineNumber": 410
+          },
+          {
+            "text": "        except Exception:",
+            "lineNumber": 411
+          },
+          {
+            "text": "            with _milvus_lock:",
+            "lineNumber": 412
+          },
+          {
+            "text": "                _milvus_collections.pop(cache_key, None)",
+            "lineNumber": 413
+          },
+          {
+            "lineNumber": 414
+          },
+          {
+            "text": "    last_err = None",
+            "lineNumber": 415
+          },
+          {
+            "text": "    for attempt in range(1, retries + 2):",
+            "lineNumber": 416
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 417
+          },
+          {
+            "text": "            _milvus_connect(uri)",
+            "lineNumber": 418
+          }
+        ]
+      },
+      "score": 0.38364291191101074
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/DB_RESILIENCE.md",
+        "range": {
+          "startPosition": {
+            "line": 127
+          },
+          "endPosition": {
+            "line": 164
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "### 场景 4：Milvus 连接失败",
+            "lineNumber": 128
+          },
+          {
+            "lineNumber": 129
+          },
+          {
+            "text": "- **文档入库**（&#96;milvus_upload.py&#96;）：insert 失败自动重试 2 次，熔断后返回写入 0 条，不阻塞上传流程。",
+            "lineNumber": 130
+          },
+          {
+            "text": "- **RAG 检索**（&#96;rag.py&#96;）：search 失败自动重连重试 1 次，熔断后向量检索降级为空列表，BM25 仍可工作。",
+            "lineNumber": 131
+          },
+          {
+            "text": "- **懒重连**：Collection 缓存失效后下次操作自动重新 connect + load，无需重启服务。",
+            "lineNumber": 132
+          },
+          {
+            "text": "- **熔断参数**：3 次连续失败触发熔断，30s 后半开探测。",
+            "lineNumber": 133
+          },
+          {
+            "lineNumber": 134
+          },
+          {
+            "text": "### 场景 5：Milvus 长时间不可用",
+            "lineNumber": 135
+          },
+          {
+            "lineNumber": 136
+          },
+          {
+            "text": "- 熔断器持续 OPEN，向量检索降级为空，RAG 仅依赖 BM25 全文检索。",
+            "lineNumber": 137
+          },
+          {
+            "text": "- 文档入库返回 0 条写入，API 层可提示\"向量库暂不可用，请稍后重试\"。",
+            "lineNumber": 138
+          },
+          {
+            "text": "- Milvus 恢复后半开探测成功即自动恢复，无需人工干预。",
+            "lineNumber": 139
+          },
+          {
+            "lineNumber": 140
+          },
+          {
+            "text": "---",
+            "lineNumber": 141
+          },
+          {
+            "lineNumber": 142
+          },
+          {
+            "text": "## 九、健康检查",
+            "lineNumber": 143
+          },
+          {
+            "lineNumber": 144
+          },
+          {
+            "text": "通过 &#96;get_all_breaker_status()&#96; 可获取所有熔断器状态（含 PostgreSQL 和 Milvus），可接入 &#96;/health&#96; 或 &#96;/db/status&#96; API：",
+            "lineNumber": 145
+          },
+          {
+            "lineNumber": 146
+          },
+          {
+            "text": "&#96;&#96;&#96;json",
+            "lineNumber": 147
+          },
+          {
+            "text": "[",
+            "lineNumber": 148
+          },
+          {
+            "text": "  {",
+            "lineNumber": 149
+          },
+          {
+            "text": "    \"name\": \"db:postgresql://...\",",
+            "lineNumber": 150
+          },
+          {
+            "text": "    \"state\": \"CLOSED\",",
+            "lineNumber": 151
+          },
+          {
+            "text": "    \"failures\": 0,",
+            "lineNumber": 152
+          },
+          {
+            "text": "    \"threshold\": 5,",
+            "lineNumber": 153
+          },
+          {
+            "text": "    \"recovery_seconds\": 30.0",
+            "lineNumber": 154
+          },
+          {
+            "text": "  },",
+            "lineNumber": 155
+          },
+          {
+            "text": "  {",
+            "lineNumber": 156
+          },
+          {
+            "text": "    \"name\": \"milvus:http://localhost:19530\",",
+            "lineNumber": 157
+          },
+          {
+            "text": "    \"state\": \"CLOSED\",",
+            "lineNumber": 158
+          },
+          {
+            "text": "    \"failures\": 0,",
+            "lineNumber": 159
+          },
+          {
+            "text": "    \"threshold\": 3,",
+            "lineNumber": 160
+          },
+          {
+            "text": "    \"recovery_seconds\": 30.0",
+            "lineNumber": 161
+          },
+          {
+            "text": "  }",
+            "lineNumber": 162
+          },
+          {
+            "text": "]",
+            "lineNumber": 163
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 164
+          }
+        ]
+      },
+      "score": 0.36777055263519287
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {
+            "line": 100,
+            "column": 5
+          },
+          "endPosition": {
+            "line": 284
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "class _DeepSeekEndpointPool:",
+            "lineNumber": 104,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"进程内共享的 DeepSeek 节点池。\"\"\"",
+            "lineNumber": 105
+          },
+          {
+            "lineNumber": 106
+          },
+          {
+            "text": "    def __init__(self):",
+            "lineNumber": 107
+          },
+          {
+            "text": "        s = get_settings()",
+            "lineNumber": 108
+          },
+          {
+            "text": "        self._states = [_EndpointState(config=item) for item in _parse_deepseek_endpoints()]",
+            "lineNumber": 109
+          },
+          {
+            "text": "        self._failure_threshold = max(1, int(getattr(s, \"deepseek_circuit_breaker_failures\", 3)))",
+            "lineNumber": 110
+          },
+          {
+            "text": "        self._open_seconds = max(5, int(getattr(s, \"deepseek_circuit_breaker_open_seconds\", 30)))",
+            "lineNumber": 111
+          },
+          {
+            "text": "        self._timeout_seconds = max(1, int(getattr(s, \"agent_request_timeout_seconds\", 120)))",
+            "lineNumber": 112
+          },
+          {
+            "text": "        self._lock = threading.Lock()",
+            "lineNumber": 113
+          },
+          {
+            "text": "        self._round_robin_cursor = 0",
+            "lineNumber": 114
+          },
+          {
+            "lineNumber": 115
+          },
+          {
+            "text": "    def _healthy_states_locked(self) -&gt; list[_EndpointState]:",
+            "lineNumber": 116
+          },
+          {
+            "text": "        now = time.time()",
+            "lineNumber": 117
+          },
+          {
+            "text": "        healthy = [state for state in self._states if state.opened_until &lt;= now]",
+            "lineNumber": 118
+          },
+          {
+            "text": "        if healthy:",
+            "lineNumber": 119
+          },
+          {
+            "text": "            return healthy",
+            "lineNumber": 120
+          },
+          {
+            "text": "        if not self._states:",
+            "lineNumber": 121
+          },
+          {
+            "text": "            return []",
+            "lineNumber": 122
+          },
+          {
+            "text": "        # 所有节点都熔断时，放行“最早到期”的 1 个节点进入半开状态做探测。",
+            "lineNumber": 123
+          },
+          {
+            "text": "        return [min(self._states, key=lambda state: state.opened_until)]",
+            "lineNumber": 124
+          },
+          {
+            "lineNumber": 125
+          },
+          {
+            "text": "    @staticmethod",
+            "lineNumber": 126
+          },
+          {
+            "text": "    def _weighted_load_score(state: _EndpointState) -&gt; float:",
+            "lineNumber": 127
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 128
+          },
+          {
+            "text": "        计算节点当前负载分数，分数越小越应优先被选择。",
+            "lineNumber": 129
+          },
+          {
+            "lineNumber": 130
+          },
+          {
+            "text": "        这里用 &#96;inflight / weight&#96; 近似表达：",
+            "lineNumber": 131
+          },
+          {
+            "text": "        - inflight 越低，说明当前并发越小；",
+            "lineNumber": 132
+          },
+          {
+            "text": "        - weight 越高，说明该节点理论承载能力越强；",
+            "lineNumber": 133
+          },
+          {
+            "text": "        因此高权重节点在相同并发下会得到更低分，更容易继续接流量。",
+            "lineNumber": 134
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 135
+          },
+          {
+            "lineNumber": 136
+          },
+          {
+            "text": "        return state.inflight / max(1, state.config.weight)",
+            "lineNumber": 137
+          },
+          {
+            "lineNumber": 138
+          },
+          {
+            "text": "    def ordered_candidates(self) -&gt; list[_EndpointState]:",
+            "lineNumber": 139
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 140
+          }
+        ]
+      },
+      "score": 0.36072325706481934
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/TECH_REVIEW_AND_OPTIMIZATION.md",
+        "range": {
+          "startPosition": {
+            "line": 80
+          },
+          "endPosition": {
+            "line": 129
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "| 线程池 | 可选 &#96;asyncio_thread_pool_workers&#96;，lifespan 中设置 | 默认 0（用 Python 默认池） |",
+            "lineNumber": 81
+          },
+          {
+            "text": "| 连接池 | PostgreSQL: 5+10；Redis: 10；asyncpg: 10 | &#96;redis_max_connections&#96; 可配，DB 池参数硬编码 |",
+            "lineNumber": 82
+          },
+          {
+            "text": "| 限流 | MinerU: Semaphore(5) | &#96;mineru_concurrency_limit&#96; 可配 |",
+            "lineNumber": 83
+          },
+          {
+            "text": "| 缓存 | Redis 问答缓存 + 防击穿 + 可选本地 LRU | 已配置化 |",
+            "lineNumber": 84
+          },
+          {
+            "lineNumber": 85
+          },
+          {
+            "text": "### 2.2 缺口",
+            "lineNumber": 86
+          },
+          {
+            "lineNumber": 87
+          },
+          {
+            "text": "| 缺口 | 影响 | 位置 |",
+            "lineNumber": 88
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 89
+          },
+          {
+            "text": "| **无 API 全局限流** | 突发流量打满线程池/DB/LLM，导致雪崩 | api/main.py |",
+            "lineNumber": 90
+          },
+          {
+            "text": "| **DB 连接池参数不可配** | 高并发时无法按负载调优 | db_resilience.py |",
+            "lineNumber": 91
+          },
+          {
+            "text": "| **无 RAG 检索缓存** | 相同问题重复检索 Milvus + BM25，浪费资源 | kb/rag.py |",
+            "lineNumber": 92
+          },
+          {
+            "text": "| **多 worker 时内存状态不共享** | &#96;_parse_cache&#96;、&#96;_pending_sql&#96;、&#96;_interrupted_threads&#96; 在进程间隔离 | api/main.py |",
+            "lineNumber": 93
+          },
+          {
+            "lineNumber": 94
+          },
+          {
+            "text": "---",
+            "lineNumber": 95
+          },
+          {
+            "lineNumber": 96
+          },
+          {
+            "text": "## 三、稳定性",
+            "lineNumber": 97
+          },
+          {
+            "lineNumber": 98
+          },
+          {
+            "text": "### 3.1 现状",
+            "lineNumber": 99
+          },
+          {
+            "lineNumber": 100
+          },
+          {
+            "text": "| 维度 | 实现 |",
+            "lineNumber": 101
+          },
+          {
+            "text": "|------|------|",
+            "lineNumber": 102
+          },
+          {
+            "text": "| 错误处理 | 各层 try/except；部分异常未细分 |",
+            "lineNumber": 103
+          },
+          {
+            "text": "| 重试 | DB: 2 次；LLM: 多 endpoint 自动切换；Text2SQL: 执行错误 1 次 |",
+            "lineNumber": 104
+          },
+          {
+            "text": "| 熔断 | DB: 5 次；Milvus: 3 次；LLM: 3 次（可配置） |",
+            "lineNumber": 105
+          },
+          {
+            "text": "| 降级 | chat_history / qa_monitoring / Milvus 返回空或默认值 |",
+            "lineNumber": 106
+          },
+          {
+            "text": "| 超时 | agent_request_timeout=120s；LLM timeout；MinerU 120s |",
+            "lineNumber": 107
+          },
+          {
+            "lineNumber": 108
+          },
+          {
+            "text": "### 3.2 缺口",
+            "lineNumber": 109
+          },
+          {
+            "lineNumber": 110
+          },
+          {
+            "text": "| 缺口 | 影响 | 位置 |",
+            "lineNumber": 111
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 112
+          },
+          {
+            "text": "| **MinerU 无重试** | 5xx/超时/网络抖动直接失败，用户需手动重传 | mineru_client.py L393-427 |",
+            "lineNumber": 113
+          },
+          {
+            "text": "| **LLM 单 endpoint 无重试** | 单节点时一次失败即返回错误 | llm.py |",
+            "lineNumber": 114
+          },
+          {
+            "text": "| **DB 单条 SQL 无 statement_timeout** | 慢 SQL 长时间占用连接 | db_resilience.py |",
+            "lineNumber": 115
+          },
+          {
+            "text": "| **熔断参数分散** | DB/Milvus 阈值硬编码，运维无法统一调优 | db_resilience.py |",
+            "lineNumber": 116
+          },
+          {
+            "lineNumber": 117
+          },
+          {
+            "text": "---",
+            "lineNumber": 118
+          },
+          {
+            "lineNumber": 119
+          },
+          {
+            "text": "## 四、可用性",
+            "lineNumber": 120
+          },
+          {
+            "lineNumber": 121
+          },
+          {
+            "text": "### 4.1 现状",
+            "lineNumber": 122
+          },
+          {
+            "lineNumber": 123
+          },
+          {
+            "text": "| 维度 | 实现 |",
+            "lineNumber": 124
+          },
+          {
+            "text": "|------|------|",
+            "lineNumber": 125
+          },
+          {
+            "text": "| 单点故障 | LLM 多 endpoint；DB/Milvus 熔断降级 |",
+            "lineNumber": 126
+          },
+          {
+            "text": "| 健康检查 | &#96;/health&#96; 仅返回 &#96;{\"status\":\"ok\"}&#96; |",
+            "lineNumber": 127
+          },
+          {
+            "text": "| 优雅关闭 | lifespan 中关闭 Redis、dispose DB、取消 keepalive |",
+            "lineNumber": 128
+          }
+        ]
+      },
+      "score": 0.35970211029052734
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/TECH_REVIEW_AND_OPTIMIZATION.md",
+        "range": {
+          "startPosition": {
+            "line": 158
+          },
+          "endPosition": {
+            "line": 199
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "### P2：中优先级",
+            "lineNumber": 160
+          },
+          {
+            "lineNumber": 161
+          },
+          {
+            "text": "| 序号 | 优化项 | 改动方向 | 涉及文件 |",
+            "lineNumber": 162
+          },
+          {
+            "text": "|------|--------|----------|----------|",
+            "lineNumber": 163
+          },
+          {
+            "text": "| 8 | **LLM 单 endpoint 重试** | 单节点时对可重试错误（超时、5xx）做 2–3 次重试 | llm.py |",
+            "lineNumber": 164
+          },
+          {
+            "text": "| 9 | **熔断参数可配置** | 新增 &#96;db_circuit_breaker_threshold&#96;、&#96;db_circuit_breaker_recovery_seconds&#96; | config/settings.py、db_resilience.py |",
+            "lineNumber": 165
+          },
+          {
+            "text": "| 10 | **RAG 检索缓存** | 对检索结果做进程内 LRU 或 Redis 缓存（key: &#96;kb:rag:v1:{hash(query)}&#96;） | kb/rag.py |",
+            "lineNumber": 166
+          },
+          {
+            "text": "| 11 | **/health 集成熔断状态** | 调用 &#96;get_all_breaker_status()&#96;、&#96;get_deepseek_router_status()&#96; 返回 DB/LLM 熔断状态 | api/main.py |",
+            "lineNumber": 167
+          },
+          {
+            "lineNumber": 168
+          },
+          {
+            "text": "### P3：低优先级（已实施）",
+            "lineNumber": 169
+          },
+          {
+            "lineNumber": 170
+          },
+          {
+            "text": "| 序号 | 优化项 | 改动方向 | 涉及文件 |",
+            "lineNumber": 171
+          },
+          {
+            "text": "|------|--------|----------|----------|",
+            "lineNumber": 172
+          },
+          {
+            "text": "| 12 | **Redis 哨兵/集群** | 配置 &#96;redis_sentinel_service_name&#96; + &#96;redis_sentinel_nodes&#96; 时通过 Sentinel 获取 master | config/settings.py、answer_cache.py |",
+            "lineNumber": 173
+          },
+          {
+            "text": "| 13 | **多 worker 共享状态** | 配置 &#96;shared_state_redis_url&#96; 时解析缓存、待确认 SQL、人工中断状态存 Redis | src/shared_state.py、api/main.py |",
+            "lineNumber": 174
+          },
+          {
+            "text": "| 14 | **Milvus/PostgreSQL 异步客户端** | 文档说明：PostgreSQL 已支持 asyncpg；Milvus 待官方 async SDK 后可接入 | docs/ASYNC_CONCURRENCY.md |",
+            "lineNumber": 175
+          },
+          {
+            "lineNumber": 176
+          },
+          {
+            "text": "---",
+            "lineNumber": 177
+          },
+          {
+            "lineNumber": 178
+          },
+          {
+            "text": "## 六、代码位置速查",
+            "lineNumber": 179
+          },
+          {
+            "lineNumber": 180
+          },
+          {
+            "text": "| 功能 | 文件 | 行号/区域 |",
+            "lineNumber": 181
+          },
+          {
+            "text": "|------|------|-----------|",
+            "lineNumber": 182
+          },
+          {
+            "text": "| lifespan 启动/关闭 | api/main.py | L133-166 |",
+            "lineNumber": 183
+          },
+          {
+            "text": "| /health 端点 | api/main.py | L479-482 |",
+            "lineNumber": 184
+          },
+          {
+            "text": "| MinerU 异步解析 | mineru_client.py | L393-451 |",
+            "lineNumber": 185
+          },
+          {
+            "text": "| DB 连接池创建 | db_resilience.py | get_engine、get_async_pool |",
+            "lineNumber": 186
+          },
+          {
+            "text": "| LLM 单 endpoint 调用 | llm.py | _DeepSeekEndpointPool |",
+            "lineNumber": 187
+          },
+          {
+            "text": "| uvicorn 启动 | run.py | L18-34 |",
+            "lineNumber": 188
+          },
+          {
+            "text": "| 配置项 | config/settings.py | 全文 |",
+            "lineNumber": 189
+          },
+          {
+            "lineNumber": 190
+          },
+          {
+            "text": "---",
+            "lineNumber": 191
+          },
+          {
+            "lineNumber": 192
+          },
+          {
+            "text": "## 七、总结",
+            "lineNumber": 193
+          },
+          {
+            "lineNumber": 194
+          },
+          {
+            "text": "| 维度 | 现状 | 主要缺口 |",
+            "lineNumber": 195
+          },
+          {
+            "text": "|------|------|----------|",
+            "lineNumber": 196
+          },
+          {
+            "text": "| **高并发** | 异步为主、MinerU 限流、Redis 防击穿、DB/Milvus 连接池 | 无 API 限流、连接池参数未配置化、无 RAG 检索缓存 |",
+            "lineNumber": 197
+          },
+          {
+            "text": "| **稳定性** | DB/LLM/Milvus 有重试与熔断 | MinerU 无重试、LLM 单 endpoint 无重试、DB 无 statement_timeout |",
+            "lineNumber": 198
+          },
+          {
+            "text": "| **可用性** | 健康检查简单、lifespan 中关闭资源 | /health 不探测依赖、无优雅关闭等待 |",
+            "lineNumber": 199
+          }
+        ]
+      },
+      "score": 0.34562280774116516
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {
+            "line": 103
+          },
+          "endPosition": {
+            "line": 284
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 104,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 105,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class _DeepSeekEndpointPool:",
+            "lineNumber": 104,
+            "isSignature": true
+          },
+          {
+            "text": "def acquire(self, state: _EndpointState) -&gt; None:",
+            "lineNumber": 190
+          },
+          {
+            "lineNumber": 203
+          },
+          {
+            "text": "            failures,",
+            "lineNumber": 204
+          },
+          {
+            "text": "        )",
+            "lineNumber": 205
+          },
+          {
+            "lineNumber": 206
+          },
+          {
+            "text": "    def release_success(self, state: _EndpointState) -&gt; None:",
+            "lineNumber": 207
+          },
+          {
+            "text": "        \"\"\"请求成功：关闭熔断并清空连续失败计数。\"\"\"",
+            "lineNumber": 208
+          },
+          {
+            "lineNumber": 209
+          },
+          {
+            "text": "        with self._lock:",
+            "lineNumber": 210
+          },
+          {
+            "text": "            was_open = state.opened_until &gt; time.time()",
+            "lineNumber": 211
+          },
+          {
+            "text": "            state.inflight = max(0, state.inflight - 1)",
+            "lineNumber": 212
+          },
+          {
+            "text": "            state.failures = 0",
+            "lineNumber": 213
+          },
+          {
+            "text": "            state.opened_until = 0.0",
+            "lineNumber": 214
+          },
+          {
+            "text": "            current_inflight = state.inflight",
+            "lineNumber": 215
+          },
+          {
+            "text": "        logger.debug(",
+            "lineNumber": 216
+          },
+          {
+            "text": "            \"LLM endpoint success: name=%s inflight=%s circuit_recovered=%s\",",
+            "lineNumber": 217
+          },
+          {
+            "text": "            state.config.name or \"unknown\",",
+            "lineNumber": 218
+          },
+          {
+            "text": "            current_inflight,",
+            "lineNumber": 219
+          },
+          {
+            "text": "            was_open,",
+            "lineNumber": 220
+          },
+          {
+            "text": "        )",
+            "lineNumber": 221
+          },
+          {
+            "lineNumber": 222
+          },
+          {
+            "text": "    def release_failure(self, state: _EndpointState, exc: Exception) -&gt; None:",
+            "lineNumber": 223
+          },
+          {
+            "text": "        \"\"\"请求失败：若为可切换错误则累计失败并触发熔断。\"\"\"",
+            "lineNumber": 224
+          },
+          {
+            "lineNumber": 225
+          },
+          {
+            "text": "        with self._lock:",
+            "lineNumber": 226
+          },
+          {
+            "text": "            state.inflight = max(0, state.inflight - 1)",
+            "lineNumber": 227
+          },
+          {
+            "text": "            if not _is_retryable_error(exc):",
+            "lineNumber": 228
+          },
+          {
+            "text": "                current_inflight = state.inflight",
+            "lineNumber": 229
+          },
+          {
+            "text": "                error_text = str(exc)",
+            "lineNumber": 230
+          },
+          {
+            "text": "                endpoint_name = state.config.name or \"unknown\"",
+            "lineNumber": 231
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 232
+          },
+          {
+            "text": "                    \"LLM endpoint non-retryable failure: name=%s inflight=%s error=%s\",",
+            "lineNumber": 233
+          },
+          {
+            "text": "                    endpoint_name,",
+            "lineNumber": 234
+          },
+          {
+            "text": "                    current_inflight,",
+            "lineNumber": 235
+          },
+          {
+            "text": "                    error_text,",
+            "lineNumber": 236
+          },
+          {
+            "text": "                )",
+            "lineNumber": 237
+          },
+          {
+            "text": "                return",
+            "lineNumber": 238
+          },
+          {
+            "text": "            state.failures += 1",
+            "lineNumber": 239
+          },
+          {
+            "text": "            current_inflight = state.inflight",
+            "lineNumber": 240
+          },
+          {
+            "text": "            failures = state.failures",
+            "lineNumber": 241
+          },
+          {
+            "text": "            threshold = self._failure_threshold",
+            "lineNumber": 242
+          },
+          {
+            "text": "            error_text = str(exc)",
+            "lineNumber": 243
+          },
+          {
+            "text": "            if state.failures &gt;= self._failure_threshold:",
+            "lineNumber": 244
+          },
+          {
+            "text": "                state.opened_until = time.time() + self._open_seconds",
+            "lineNumber": 245
+          }
+        ]
+      },
+      "score": 0.3436373472213745
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./config/settings.py",
+        "range": {
+          "startPosition": {
+            "line": 22
+          },
+          "endPosition": {
+            "line": 212
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 23,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 24,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class Settings(BaseSettings):",
+            "lineNumber": 23,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 135
+          },
+          {
+            "text": "    redis_sentinel_service_name: str = \"\"  # 如 mymaster",
+            "lineNumber": 136
+          },
+          {
+            "text": "    redis_sentinel_nodes: str = \"\"  # 如 127.0.0.1:26379,127.0.0.1:26380",
+            "lineNumber": 137
+          },
+          {
+            "lineNumber": 138
+          },
+          {
+            "text": "    # ---------- 会话锁 ----------",
+            "lineNumber": 139
+          },
+          {
+            "text": "    # 同一会话（thread_id）的并发请求是否串行化，避免图状态/待确认 SQL 被并发写坏",
+            "lineNumber": 140
+          },
+          {
+            "text": "    conversation_lock_enabled: bool = True",
+            "lineNumber": 141
+          },
+          {
+            "text": "    conversation_lock_buckets: int = 1024  # 锁分桶数，thread_id 哈希取模；不同会话可能同桶",
+            "lineNumber": 142
+          },
+          {
+            "lineNumber": 143
+          },
+          {
+            "text": "    # ---------- 多 worker 共享状态（P3） ----------",
+            "lineNumber": 144
+          },
+          {
+            "text": "    # 当配置且 Redis 可用时，解析缓存、待确认 SQL、人工中断状态存 Redis，多进程/多 worker 共享",
+            "lineNumber": 145
+          },
+          {
+            "text": "    shared_state_redis_url: str = \"\"  # 为空则使用进程内内存（单 worker 或无需共享）",
+            "lineNumber": 146
+          },
+          {
+            "lineNumber": 147
+          },
+          {
+            "text": "    # ---------- 数据库连接池与熔断 ----------",
+            "lineNumber": 148
+          },
+          {
+            "text": "    postgresql_pool_size: int = 5",
+            "lineNumber": 149
+          },
+          {
+            "text": "    postgresql_max_overflow: int = 10",
+            "lineNumber": 150
+          },
+          {
+            "text": "    postgresql_pool_timeout: int = 10",
+            "lineNumber": 151
+          },
+          {
+            "text": "    postgresql_statement_timeout_ms: int = 0  # 单条 SQL 超时（毫秒），0 表示不限制",
+            "lineNumber": 152
+          },
+          {
+            "text": "    db_circuit_breaker_threshold: int = 5  # 连续失败达该次数后熔断",
+            "lineNumber": 153
+          },
+          {
+            "text": "    db_circuit_breaker_recovery_seconds: float = 30.0  # 熔断持续时间，到期后半开探测",
+            "lineNumber": 154
+          },
+          {
+            "lineNumber": 155
+          },
+          {
+            "text": "    # ---------- PostgreSQL 探活 ----------",
+            "lineNumber": 156
+          },
+          {
+            "text": "    postgresql_keepalive_uri: str = \"\"  # 为空则不探活；设为 postgresql://... 时每分钟执行 SELECT 1 保持连接可用",
+            "lineNumber": 157
+          },
+          {
+            "text": "    postgresql_keepalive_interval_seconds: int = 60  # 探活间隔，默认 60 秒",
+            "lineNumber": 158
+          },
+          {
+            "lineNumber": 159
+          },
+          {
+            "text": "    # ---------- 对话长期记忆（PostgreSQL） ----------",
+            "lineNumber": 160
+          },
+          {
+            "text": "    chat_history_postgresql_uri: str = \"\"  # 为空则仅用内存（MemorySaver）；设为 postgresql://... 时对话历史落库，进程重启后可恢复",
+            "lineNumber": 161
+          },
+          {
+            "text": "    qa_monitoring_postgresql_uri: str = \"\"  # 问答效果监控与用户反馈分析库；为空时回退到 chat_history_postgresql_uri",
+            "lineNumber": 162
+          },
+          {
+            "text": "    # 加载时只取最近 N 条消息注入短期记忆，0 表示全量加载；可减少长会话的加载量与反序列化",
+            "lineNumber": 163
+          },
+          {
+            "text": "    chat_history_load_max_messages: int = 0",
+            "lineNumber": 164
+          },
+          {
+            "text": "    # 写入 chat_history 时单条 content 最大字符数，0 表示不截断（仍受 DB TEXT 限制）",
+            "lineNumber": 165
+          },
+          {
+            "text": "    chat_history_max_content_chars: int = 0",
+            "lineNumber": 166
+          }
+        ]
+      },
+      "score": 0.33785033226013184
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/TECH_REVIEW_AND_OPTIMIZATION.md",
+        "range": {
+          "startPosition": {
+            "line": 36
+          },
+          "endPosition": {
+            "line": 82
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "| **db_resilience** | PostgreSQL / SQLite / Milvus 连接池、重试、熔断、降级 | ✅ 已覆盖 |",
+            "lineNumber": 37
+          },
+          {
+            "text": "| **llm** | DeepSeek 多 endpoint、负载均衡、熔断 | ✅ 多节点时自动切换；单节点无重试 |",
+            "lineNumber": 38
+          },
+          {
+            "text": "| **answer_cache** | Redis 问答缓存、防击穿、本地 LRU | ✅ 断线懒重连；无 Redis 探活 |",
+            "lineNumber": 39
+          },
+          {
+            "text": "| **graph/app** | LangGraph 图、MemorySaver / Redis checkpointer | 依赖 Redis 时无降级 |",
+            "lineNumber": 40
+          },
+          {
+            "text": "| **doc/mineru_client** | MinerU 文档解析、信号量限流 | ❌ 无重试 |",
+            "lineNumber": 41
+          },
+          {
+            "text": "| **kb/rag** | BM25 + Milvus 混合检索 | ✅ 通过 db_resilience |",
+            "lineNumber": 42
+          },
+          {
+            "text": "| **kb/text2sql** | 自然语言转 SQL | ✅ 通过 db_resilience |",
+            "lineNumber": 43
+          },
+          {
+            "lineNumber": 44
+          },
+          {
+            "text": "### 1.2 请求链路与外部依赖",
+            "lineNumber": 45
+          },
+          {
+            "lineNumber": 46
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 47
+          },
+          {
+            "text": "客户端",
+            "lineNumber": 48
+          },
+          {
+            "text": "  → FastAPI (async)",
+            "lineNumber": 49
+          },
+          {
+            "text": "  → 会话恢复（PostgreSQL / Redis checkpointer）",
+            "lineNumber": 50
+          },
+          {
+            "text": "  → 轮数检查（max_conversation_turns=15）",
+            "lineNumber": 51
+          },
+          {
+            "text": "  → 问答缓存（Redis get_cached_answer + 防击穿锁）",
+            "lineNumber": 52
+          },
+          {
+            "text": "  → LangGraph ainvoke / 流式",
+            "lineNumber": 53
+          },
+          {
+            "text": "      → Supervisor → Chat / Knowledge Agent",
+            "lineNumber": 54
+          },
+          {
+            "text": "          → KnowledgeEngine",
+            "lineNumber": 55
+          },
+          {
+            "text": "              → QA Store（本地 JSON）",
+            "lineNumber": 56
+          },
+          {
+            "text": "              → Text2SQL（PostgreSQL via db_resilience）",
+            "lineNumber": 57
+          },
+          {
+            "text": "              → RAG（Milvus via db_resilience + BM25）",
+            "lineNumber": 58
+          },
+          {
+            "text": "              → LLM（DeepSeek via llm 路由）",
+            "lineNumber": 59
+          },
+          {
+            "text": "  → 写缓存、持久化（chat_history、qa_monitoring）",
+            "lineNumber": 60
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 61
+          },
+          {
+            "lineNumber": 62
+          },
+          {
+            "text": "| 依赖 | 用途 | 韧性 |",
+            "lineNumber": 63
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 64
+          },
+          {
+            "text": "| DeepSeek API | 大模型 | 多 endpoint 熔断；单 endpoint 无重试 |",
+            "lineNumber": 65
+          },
+          {
+            "text": "| BGE-M3 / Reranker | 向量/重排 | 进程内，无外部依赖 |",
+            "lineNumber": 66
+          },
+          {
+            "text": "| Milvus | 向量检索 | 重试 + 熔断 + 懒重连 |",
+            "lineNumber": 67
+          },
+          {
+            "text": "| PostgreSQL | 对话历史、QA 监控、Text2SQL | 重试 + 熔断 + 降级 |",
+            "lineNumber": 68
+          },
+          {
+            "text": "| Redis | 问答缓存、可选 checkpointer | 断线懒重连；无探活 |",
+            "lineNumber": 69
+          },
+          {
+            "text": "| MinerU | 文档解析 | 信号量限流；❌ 无重试 |",
+            "lineNumber": 70
+          },
+          {
+            "lineNumber": 71
+          },
+          {
+            "text": "---",
+            "lineNumber": 72
+          },
+          {
+            "lineNumber": 73
+          },
+          {
+            "text": "## 二、高并发性能",
+            "lineNumber": 74
+          },
+          {
+            "lineNumber": 75
+          },
+          {
+            "text": "### 2.1 现状",
+            "lineNumber": 76
+          },
+          {
+            "lineNumber": 77
+          },
+          {
+            "text": "| 维度 | 实现 | 配置 |",
+            "lineNumber": 78
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 79
+          },
+          {
+            "text": "| 异步路径 | API、图、知识库、MinerU 均 async；同步 IO 用 &#96;asyncio.to_thread&#96; | - |",
+            "lineNumber": 80
+          },
+          {
+            "text": "| 线程池 | 可选 &#96;asyncio_thread_pool_workers&#96;，lifespan 中设置 | 默认 0（用 Python 默认池） |",
+            "lineNumber": 81
+          },
+          {
+            "text": "| 连接池 | PostgreSQL: 5+10；Redis: 10；asyncpg: 10 | &#96;redis_max_connections&#96; 可配，DB 池参数硬编码 |",
+            "lineNumber": 82
+          }
+        ]
+      },
+      "score": 0.3306882381439209
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 49
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# src/llm.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "大模型调用统一入口。",
+            "lineNumber": 3
+          },
+          {
+            "lineNumber": 4
+          },
+          {
+            "text": "本项目仅使用 DeepSeek（如 DeepSeek R1），禁止调用 OpenAI 自有模型（如 GPT-4）。",
+            "lineNumber": 5
+          },
+          {
+            "text": "在单一 API 基础上补充了多 Key/多 endpoint 负载均衡、失败熔断与自动切换：",
+            "lineNumber": 6
+          },
+          {
+            "text": "- 默认仍兼容原有 &#96;OPENAI_API_BASE&#96; + &#96;OPENAI_API_KEY&#96; 配置；",
+            "lineNumber": 7
+          },
+          {
+            "text": "- 若配置 &#96;DEEPSEEK_API_ENDPOINTS&#96;，则按“权重 + 当前并发负载”优先选择健康节点；",
+            "lineNumber": 8
+          },
+          {
+            "text": "- 连续失败达到阈值后暂时熔断，避免把流量持续打到异常节点。",
+            "lineNumber": 9
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 10
+          },
+          {
+            "lineNumber": 11
+          },
+          {
+            "text": "from __future__ import annotations",
+            "lineNumber": 12
+          },
+          {
+            "lineNumber": 13
+          },
+          {
+            "text": "import logging",
+            "lineNumber": 14
+          },
+          {
+            "text": "import threading",
+            "lineNumber": 15
+          },
+          {
+            "text": "import time",
+            "lineNumber": 16
+          },
+          {
+            "text": "from contextvars import ContextVar",
+            "lineNumber": 17
+          },
+          {
+            "text": "from dataclasses import dataclass, field",
+            "lineNumber": 18
+          },
+          {
+            "text": "from typing import Any, AsyncIterator, Iterator, Optional",
+            "lineNumber": 19
+          },
+          {
+            "lineNumber": 20
+          },
+          {
+            "text": "from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun",
+            "lineNumber": 21
+          },
+          {
+            "text": "from langchain_core.language_models import BaseChatModel",
+            "lineNumber": 22
+          },
+          {
+            "text": "from langchain_core.outputs import ChatGenerationChunk, ChatResult",
+            "lineNumber": 23
+          },
+          {
+            "text": "from pydantic import ConfigDict, PrivateAttr",
+            "lineNumber": 24
+          },
+          {
+            "lineNumber": 25
+          },
+          {
+            "text": "from config import get_settings",
+            "lineNumber": 26
+          },
+          {
+            "lineNumber": 27
+          },
+          {
+            "text": "logger = logging.getLogger(__name__)",
+            "lineNumber": 28
+          },
+          {
+            "text": "_LAST_ENDPOINT_NAME: ContextVar[str] = ContextVar(\"deepseek_last_endpoint_name\", default=\"\")",
+            "lineNumber": 29
+          },
+          {
+            "lineNumber": 30
+          },
+          {
+            "lineNumber": 31
+          },
+          {
+            "text": "def _is_retryable_error(exc: Exception) -&gt; bool:",
+            "lineNumber": 32,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"识别适合切换到其它节点重试的错误：超时、连接错误、429 与 5xx。\"\"\"",
+            "lineNumber": 33
+          },
+          {
+            "lineNumber": 34
+          },
+          {
+            "text": "    status_code = str(getattr(exc, \"status_code\", \"\") or \"\")",
+            "lineNumber": 35
+          },
+          {
+            "text": "    msg = (str(exc) or \"\").lower()",
+            "lineNumber": 36
+          },
+          {
+            "text": "    retryable_keywords = (\"timeout\", \"timed out\", \"connection\", \"temporarily\", \"rate limit\", \"429\")",
+            "lineNumber": 37
+          },
+          {
+            "text": "    if any(keyword in msg for keyword in retryable_keywords):",
+            "lineNumber": 38
+          },
+          {
+            "text": "        return True",
+            "lineNumber": 39
+          },
+          {
+            "text": "    return status_code.startswith(\"5\") or status_code == \"429\"",
+            "lineNumber": 40,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 41
+          },
+          {
+            "lineNumber": 42
+          },
+          {
+            "text": "@dataclass",
+            "lineNumber": 43
+          },
+          {
+            "text": "class _EndpointConfig:",
+            "lineNumber": 44,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"单个 DeepSeek 接入点配置。\"\"\"",
+            "lineNumber": 45
+          }
+        ]
+      },
+      "score": 0.32539403438568115
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 375
+          },
+          "endPosition": {
+            "line": 457
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 376,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 385,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "def get_milvus_collection(",
+            "lineNumber": 376,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 377,
+            "isSignature": true
+          },
+          {
+            "text": "    collection_name: str,",
+            "lineNumber": 378,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 379,
+            "isSignature": true
+          },
+          {
+            "text": "    retries: int = 2,",
+            "lineNumber": 380,
+            "isSignature": true
+          },
+          {
+            "text": "    retry_delay: float = 1.0,",
+            "lineNumber": 381,
+            "isSignature": true
+          },
+          {
+            "text": "    create_if_missing: bool = False,",
+            "lineNumber": 382,
+            "isSignature": true
+          },
+          {
+            "text": "    schema_builder=None,",
+            "lineNumber": 383,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 384,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 415
+          },
+          {
+            "text": "    for attempt in range(1, retries + 2):",
+            "lineNumber": 416
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 417
+          },
+          {
+            "text": "            _milvus_connect(uri)",
+            "lineNumber": 418
+          },
+          {
+            "text": "            from pymilvus import Collection, utility",
+            "lineNumber": 419
+          },
+          {
+            "text": "            if utility.has_collection(collection_name):",
+            "lineNumber": 420
+          },
+          {
+            "text": "                coll = Collection(collection_name)",
+            "lineNumber": 421
+          },
+          {
+            "text": "                coll.load()",
+            "lineNumber": 422
+          },
+          {
+            "text": "            elif create_if_missing and schema_builder:",
+            "lineNumber": 423
+          },
+          {
+            "text": "                coll = schema_builder(collection_name)",
+            "lineNumber": 424
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 425
+          },
+          {
+            "text": "                logger.warning(\"Milvus collection '%s' 不存在\", collection_name)",
+            "lineNumber": 426
+          },
+          {
+            "text": "                breaker.record_success()",
+            "lineNumber": 427
+          },
+          {
+            "text": "                return None",
+            "lineNumber": 428
+          },
+          {
+            "lineNumber": 429
+          },
+          {
+            "text": "            with _milvus_lock:",
+            "lineNumber": 430
+          },
+          {
+            "text": "                _milvus_collections[cache_key] = coll",
+            "lineNumber": 431
+          },
+          {
+            "text": "            breaker.record_success()",
+            "lineNumber": 432
+          },
+          {
+            "text": "            logger.info(\"Milvus 连接成功: %s/%s\", uri[:40], collection_name)",
+            "lineNumber": 433
+          },
+          {
+            "text": "            return coll",
+            "lineNumber": 434
+          },
+          {
+            "text": "        except Exception as e:",
+            "lineNumber": 435
+          },
+          {
+            "text": "            last_err = e",
+            "lineNumber": 436
+          },
+          {
+            "text": "            breaker.record_failure()",
+            "lineNumber": 437
+          },
+          {
+            "text": "            if attempt &lt;= retries:",
+            "lineNumber": 438
+          },
+          {
+            "text": "                delay = retry_delay * (2 ** (attempt - 1))",
+            "lineNumber": 439
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 440
+          },
+          {
+            "text": "                    \"Milvus 连接失败（第 %d/%d 次），%.1fs 后重试: %s\",",
+            "lineNumber": 441
+          },
+          {
+            "text": "                    attempt, retries + 1, delay, e,",
+            "lineNumber": 442
+          },
+          {
+            "text": "                )",
+            "lineNumber": 443
+          },
+          {
+            "text": "                time.sleep(delay)",
+            "lineNumber": 444
+          },
+          {
+            "lineNumber": 445
+          },
+          {
+            "text": "    logger.error(\"Milvus 连接失败（已重试 %d 次）: %s\", retries, last_err)",
+            "lineNumber": 446
+          },
+          {
+            "text": "    return None",
+            "lineNumber": 447,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 448
+          },
+          {
+            "lineNumber": 449
+          },
+          {
+            "text": "def milvus_ping(uri: str) -&gt; bool:",
+            "lineNumber": 450,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"探活：尝试连接 Milvus 并执行轻量操作，不触发熔断。\"\"\"",
+            "lineNumber": 451
+          }
+        ]
+      },
+      "score": 0.30676698684692383
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 41
+          },
+          "endPosition": {
+            "line": 101,
+            "column": 29
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 42,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 43,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class CircuitBreaker:",
+            "lineNumber": 42,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 88
+          },
+          {
+            "lineNumber": 89
+          },
+          {
+            "text": "    def status(self) -&gt; dict:",
+            "lineNumber": 90
+          },
+          {
+            "text": "        return {",
+            "lineNumber": 91
+          },
+          {
+            "text": "            \"name\": self._name,",
+            "lineNumber": 92
+          },
+          {
+            "text": "            \"state\": self.state,",
+            "lineNumber": 93
+          },
+          {
+            "text": "            \"failures\": self._failures,",
+            "lineNumber": 94
+          },
+          {
+            "text": "            \"threshold\": self._failure_threshold,",
+            "lineNumber": 95
+          },
+          {
+            "text": "            \"recovery_seconds\": self._recovery_seconds,",
+            "lineNumber": 96
+          },
+          {
+            "text": "        }",
+            "lineNumber": 97,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 98
+          },
+          {
+            "lineNumber": 99
+          },
+          {
+            "text": "# ---------- 同步连接池管理 ----------",
+            "lineNumber": 100
+          },
+          {
+            "lineNumber": 101
+          },
+          {
+            "text": "_engines: Dict[str, Any] = {}",
+            "lineNumber": 102
+          }
+        ]
+      },
+      "score": 0.3052544593811035
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 526,
+            "column": 18
+          },
+          "endPosition": {
+            "line": 533,
+            "column": 51
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 468,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 478,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "# ---------- 状态查询 ----------",
+            "lineNumber": 530
+          },
+          {
+            "lineNumber": 531
+          },
+          {
+            "text": "def get_all_breaker_status() -&gt; list:",
+            "lineNumber": 532,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"返回所有熔断器状态（含 PostgreSQL 和 Milvus），供健康检查 API 使用。\"\"\"",
+            "lineNumber": 533
+          },
+          {
+            "text": "    return [b.status() for b in _breakers.values()]",
+            "lineNumber": 534,
+            "isSignature": true
+          }
+        ]
+      },
+      "score": 0.3037233352661133
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./config/settings.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 212
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# config/settings.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "项目全局配置。",
+            "lineNumber": 3
+          },
+          {
+            "text": "注意：本项目仅允许使用以下模型，禁止调用 OpenAI 自有模型：",
+            "lineNumber": 4
+          },
+          {
+            "text": "  - 大模型：DeepSeek R1（或 deepseek-chat），通过 DeepSeek API 调用；",
+            "lineNumber": 5
+          },
+          {
+            "text": "  - 向量模型：BGE-M3（BAAI/bge-m3）；",
+            "lineNumber": 6
+          },
+          {
+            "text": "  - 重排模型：BGE Reranker Large（BAAI/bge-reranker-large）。",
+            "lineNumber": 7
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 8
+          },
+          {
+            "lineNumber": 9
+          },
+          {
+            "text": "from typing import List",
+            "lineNumber": 10
+          },
+          {
+            "text": "from pydantic import field_validator",
+            "lineNumber": 11
+          },
+          {
+            "text": "from pydantic_settings import BaseSettings",
+            "lineNumber": 12
+          },
+          {
+            "text": "from functools import lru_cache",
+            "lineNumber": 13
+          },
+          {
+            "lineNumber": 14
+          },
+          {
+            "lineNumber": 15
+          },
+          {
+            "text": "# 允许使用的大模型名称（仅 DeepSeek，禁止 OpenAI 的 gpt-4 等）",
+            "lineNumber": 16
+          },
+          {
+            "text": "ALLOWED_LLM_PREFIXES = (\"deepseek-\", \"deepseek_reasoner\")",
+            "lineNumber": 17
+          },
+          {
+            "text": "# 允许的向量/重排模型：仅 BGE 系列",
+            "lineNumber": 18
+          },
+          {
+            "text": "ALLOWED_EMBEDDING_MODELS = (\"BAAI/bge-m3\", \"bge-m3\")",
+            "lineNumber": 19
+          },
+          {
+            "text": "ALLOWED_RERANKER_MODELS = (\"BAAI/bge-reranker-large\", \"bge-reranker-large\")",
+            "lineNumber": 20
+          },
+          {
+            "lineNumber": 21
+          },
+          {
+            "lineNumber": 22
+          },
+          {
+            "text": "class Settings(BaseSettings):",
+            "lineNumber": 23,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 24
+          },
+          {
+            "text": "    配置项说明：",
+            "lineNumber": 25
+          },
+          {
+            "text": "    - 大模型：仅使用 DeepSeek，通过兼容 OpenAI 的 API 调用（base_url 必须指向 DeepSeek）。",
+            "lineNumber": 26
+          },
+          {
+            "text": "    - 向量与重排：仅使用 BGE-M3、BGE Reranker Large，本地加载。",
+            "lineNumber": 27
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 28
+          },
+          {
+            "lineNumber": 29
+          },
+          {
+            "text": "    # ---------- 大模型（仅 DeepSeek，禁止 OpenAI） ----------",
+            "lineNumber": 30
+          },
+          {
+            "text": "    # 环境变量 OPENAI_API_BASE：必须为 DeepSeek API 地址，如 https://api.deepseek.com/v1",
+            "lineNumber": 31
+          },
+          {
+            "text": "    openai_api_base: str = \"https://api.deepseek.com/v1\"",
+            "lineNumber": 32
+          },
+          {
+            "text": "    # 环境变量 OPENAI_API_KEY：DeepSeek API Key",
+            "lineNumber": 33
+          },
+          {
+            "text": "    openai_api_key: str = \"\"",
+            "lineNumber": 34
+          },
+          {
+            "text": "    # 模型名：仅允许 deepseek-chat、deepseek-reasoner 等，禁止 gpt-4 等 OpenAI 模型",
+            "lineNumber": 35
+          },
+          {
+            "text": "    llm_model: str = \"deepseek-chat\"",
+            "lineNumber": 36
+          },
+          {
+            "text": "    # 多 endpoint 配置，格式：base_url|api_key|weight|name，多项可用逗号或换行分隔；为空时退回单节点配置",
+            "lineNumber": 37
+          },
+          {
+            "text": "    deepseek_api_endpoints: str = \"\"",
+            "lineNumber": 38
+          },
+          {
+            "text": "    deepseek_circuit_breaker_failures: int = 3  # 同一节点连续失败达到该次数后熔断",
+            "lineNumber": 39
+          },
+          {
+            "text": "    deepseek_circuit_breaker_open_seconds: int = 30  # 熔断持续时间，到期后自动半开探测",
+            "lineNumber": 40
+          },
+          {
+            "lineNumber": 41
+          },
+          {
+            "text": "    # ---------- 向量模型（仅 BGE-M3，本地部署/本地加载） ----------",
+            "lineNumber": 42
+          },
+          {
+            "text": "    # 可为 HuggingFace 模型名（如 BAAI/bge-m3）或本地路径（如 /path/to/bge-m3），本地加载不调用远程 API",
+            "lineNumber": 43
+          },
+          {
+            "text": "    bge_embedding_model: str = \"BAAI/bge-m3\"",
+            "lineNumber": 44
+          },
+          {
+            "text": "    embedding_device: str = \"cpu\"",
+            "lineNumber": 45
+          },
+          {
+            "lineNumber": 46
+          },
+          {
+            "text": "    # ---------- 重排模型（仅 BGE Reranker Large，本地部署/本地加载） ----------",
+            "lineNumber": 47
+          }
+        ]
+      },
+      "score": 0.2990565299987793
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {
+            "line": 49,
+            "column": 18
+          },
+          "endPosition": {
+            "line": 100
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "@dataclass",
+            "lineNumber": 53
+          },
+          {
+            "text": "class _EndpointState:",
+            "lineNumber": 54,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"运行期节点状态：用于负载均衡与熔断。\"\"\"",
+            "lineNumber": 55
+          },
+          {
+            "lineNumber": 56
+          },
+          {
+            "text": "    config: _EndpointConfig",
+            "lineNumber": 57
+          },
+          {
+            "text": "    failures: int = 0",
+            "lineNumber": 58
+          },
+          {
+            "text": "    opened_until: float = 0.0",
+            "lineNumber": 59
+          },
+          {
+            "text": "    inflight: int = 0",
+            "lineNumber": 60
+          },
+          {
+            "text": "    clients: dict[tuple[str, float], Any] = field(default_factory=dict)",
+            "lineNumber": 61,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 62
+          },
+          {
+            "lineNumber": 63
+          },
+          {
+            "text": "def _parse_deepseek_endpoints() -&gt; list[_EndpointConfig]:",
+            "lineNumber": 64,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 65
+          }
+        ]
+      },
+      "score": 0.2824704647064209
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/TECH_REVIEW_AND_OPTIMIZATION.md",
+        "range": {
+          "startPosition": {
+            "line": 127
+          },
+          "endPosition": {
+            "line": 164
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "| 优雅关闭 | lifespan 中关闭 Redis、dispose DB、取消 keepalive |",
+            "lineNumber": 128
+          },
+          {
+            "lineNumber": 129
+          },
+          {
+            "text": "### 4.2 缺口",
+            "lineNumber": 130
+          },
+          {
+            "lineNumber": 131
+          },
+          {
+            "text": "| 缺口 | 影响 | 位置 |",
+            "lineNumber": 132
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 133
+          },
+          {
+            "text": "| **/health 不探测依赖** | K8s/负载均衡无法区分“进程存活”与“依赖可用” | api/main.py L479-482 |",
+            "lineNumber": 134
+          },
+          {
+            "text": "| **无 /health/ready 深度检查** | 无法用于 readiness 探针 | - |",
+            "lineNumber": 135
+          },
+          {
+            "text": "| **无优雅关闭等待** | SIGTERM 后立即退出，进行中请求被中断 | run.py、api/main.py |",
+            "lineNumber": 136
+          },
+          {
+            "text": "| **无 timeout_graceful_shutdown** | uvicorn 默认行为可能截断响应 | run.py |",
+            "lineNumber": 137
+          },
+          {
+            "lineNumber": 138
+          },
+          {
+            "text": "---",
+            "lineNumber": 139
+          },
+          {
+            "lineNumber": 140
+          },
+          {
+            "text": "## 五、优化建议（按优先级）",
+            "lineNumber": 141
+          },
+          {
+            "lineNumber": 142
+          },
+          {
+            "text": "### P0：高优先级（建议优先实施）",
+            "lineNumber": 143
+          },
+          {
+            "lineNumber": 144
+          },
+          {
+            "text": "| 序号 | 优化项 | 改动方向 | 涉及文件 |",
+            "lineNumber": 145
+          },
+          {
+            "text": "|------|--------|----------|----------|",
+            "lineNumber": 146
+          },
+          {
+            "text": "| 1 | **健康检查增强** | &#96;/health&#96; 增加 DB ping、Redis ping、Milvus 连接、LLM 至少一个 endpoint 可用；返回 &#96;status: ok | degraded&#96; 及 &#96;details&#96; | api/main.py |",
+            "lineNumber": 147
+          },
+          {
+            "text": "| 2 | **API 全局限流** | 增加 &#96;api_max_concurrent_requests&#96; 配置，用 &#96;asyncio.Semaphore&#96; 或 slowapi 限制并发；超限返回 503 | api/main.py、config/settings.py |",
+            "lineNumber": 148
+          },
+          {
+            "text": "| 3 | **MinerU 重试** | 对 5xx/超时/连接错误做指数退避重试 2–3 次 | mineru_client.py &#96;_parse_via_api_async&#96; |",
+            "lineNumber": 149
+          },
+          {
+            "lineNumber": 150
+          },
+          {
+            "text": "### P1：中高优先级",
+            "lineNumber": 151
+          },
+          {
+            "lineNumber": 152
+          },
+          {
+            "text": "| 序号 | 优化项 | 改动方向 | 涉及文件 |",
+            "lineNumber": 153
+          },
+          {
+            "text": "|------|--------|----------|----------|",
+            "lineNumber": 154
+          },
+          {
+            "text": "| 4 | **连接池参数可配置** | 新增 &#96;postgresql_pool_size&#96;、&#96;postgresql_max_overflow&#96;；db_resilience 从配置读取 | config/settings.py、db_resilience.py |",
+            "lineNumber": 155
+          },
+          {
+            "text": "| 5 | **DB statement_timeout** | 在 &#96;safe_connection&#96; 或 engine 中设置 &#96;connect_args={\"options\":\"-c statement_timeout=30000\"}&#96; 等 | db_resilience.py |",
+            "lineNumber": 156
+          },
+          {
+            "text": "| 6 | **优雅关闭** | lifespan 收到关闭信号后停止接收新请求；run.py 传递 &#96;timeout_graceful_shutdown=30&#96; 给 uvicorn | api/main.py、run.py |",
+            "lineNumber": 157
+          },
+          {
+            "text": "| 7 | **/health/ready 深度检查** | 新增 &#96;/health/ready&#96;，执行 DB/Redis/Milvus/LLM 探测，供 K8s readiness 使用 | api/main.py |",
+            "lineNumber": 158
+          },
+          {
+            "lineNumber": 159
+          },
+          {
+            "text": "### P2：中优先级",
+            "lineNumber": 160
+          },
+          {
+            "lineNumber": 161
+          },
+          {
+            "text": "| 序号 | 优化项 | 改动方向 | 涉及文件 |",
+            "lineNumber": 162
+          },
+          {
+            "text": "|------|--------|----------|----------|",
+            "lineNumber": 163
+          },
+          {
+            "text": "| 8 | **LLM 单 endpoint 重试** | 单节点时对可重试错误（超时、5xx）做 2–3 次重试 | llm.py |",
+            "lineNumber": 164
+          }
+        ]
+      },
+      "score": 0.26229679584503174
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="semantic_search_full">
+<details>
+<summary>Tool use: **semantic_search_full**</summary>
+
+
+Parameters:
+
+```json
+{
+  "query": "Where is answer cache or retrieval cache used?",
+  "topK": 10,
+  "explanation": ""
+}
+```
+Result:
+
+```json
+{
+  "codeResults": [
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/answer_cache.py",
+        "range": {
+          "startPosition": {
+            "line": 239,
+            "column": 20
+          },
+          "endPosition": {
+            "line": 300
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "async def get_cached_answer(question: str) -&gt; Optional[str]:",
+            "lineNumber": 243,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 244
+          },
+          {
+            "text": "    根据归一化问题查缓存，命中则返回答案，否则返回 None。",
+            "lineNumber": 245
+          },
+          {
+            "text": "    若启用本地热 key 缓存，先查本地再查 Redis；本地命中可减轻 Redis 热 key 压力。",
+            "lineNumber": 246
+          },
+          {
+            "text": "    Redis 不可用或断线时返回 None，不抛错；断线时会置空客户端以便下次重连。",
+            "lineNumber": 247
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 248
+          },
+          {
+            "text": "    if not (question or \"\").strip():",
+            "lineNumber": 249
+          },
+          {
+            "text": "        return None",
+            "lineNumber": 250
+          },
+          {
+            "text": "    key = _cache_key(question)",
+            "lineNumber": 251
+          },
+          {
+            "text": "    local_val = await _local_get(key)",
+            "lineNumber": 252
+          },
+          {
+            "text": "    if local_val is not None:",
+            "lineNumber": 253
+          },
+          {
+            "text": "        return local_val",
+            "lineNumber": 254
+          },
+          {
+            "text": "    client = await _get_redis()",
+            "lineNumber": 255
+          },
+          {
+            "text": "    if client is None:",
+            "lineNumber": 256
+          },
+          {
+            "text": "        return None",
+            "lineNumber": 257
+          },
+          {
+            "text": "    try:",
+            "lineNumber": 258
+          },
+          {
+            "text": "        value = await client.get(key)",
+            "lineNumber": 259
+          },
+          {
+            "text": "        if value is not None and _local_cache_max_entries() &gt; 0:",
+            "lineNumber": 260
+          },
+          {
+            "text": "            await _local_set(key, value)",
+            "lineNumber": 261
+          },
+          {
+            "text": "        return value",
+            "lineNumber": 262
+          },
+          {
+            "text": "    except Exception as e:",
+            "lineNumber": 263
+          },
+          {
+            "text": "        if _is_redis_connection_error(e):",
+            "lineNumber": 264
+          },
+          {
+            "text": "            _invalidate_redis()",
+            "lineNumber": 265
+          },
+          {
+            "text": "            logger.warning(\"Redis 读缓存失败（已置空客户端以便重连）: %s\", e)",
+            "lineNumber": 266
+          },
+          {
+            "text": "        else:",
+            "lineNumber": 267
+          },
+          {
+            "text": "            logger.debug(\"Redis get 异常: %s\", e)",
+            "lineNumber": 268
+          },
+          {
+            "text": "        return None",
+            "lineNumber": 269,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 270
+          },
+          {
+            "lineNumber": 271
+          },
+          {
+            "text": "async def set_cached_answer(question: str, answer: str) -&gt; None:",
+            "lineNumber": 272,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 273
+          }
+        ]
+      },
+      "score": 0.5105150938034058
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 930
+          },
+          "endPosition": {
+            "line": 1256
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 931,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 941,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_impl(",
+            "lineNumber": 931,
+            "isSignature": true
+          },
+          {
+            "text": "    request: Request,",
+            "lineNumber": 932,
+            "isSignature": true
+          },
+          {
+            "text": "    req: ChatRequest,",
+            "lineNumber": 933,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 934,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 935,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 936,
+            "isSignature": true
+          },
+          {
+            "text": "    config: dict,",
+            "lineNumber": 937,
+            "isSignature": true
+          },
+          {
+            "text": "    graph,",
+            "lineNumber": 938,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: float,",
+            "lineNumber": 939,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 940,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 982
+          },
+          {
+            "text": "    except Exception:",
+            "lineNumber": 983
+          },
+          {
+            "text": "        pass",
+            "lineNumber": 984
+          },
+          {
+            "lineNumber": 985
+          },
+          {
+            "text": "    # 问答缓存：若历史问题命中缓存，直接返回并写入本轮对话状态（缓存异常不影响主流程）",
+            "lineNumber": 986
+          },
+          {
+            "text": "    if getattr(settings, \"answer_cache_enabled\", True):",
+            "lineNumber": 987
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 988
+          },
+          {
+            "text": "            cached = await get_cached_answer(req.message)",
+            "lineNumber": 989
+          },
+          {
+            "text": "        except Exception:",
+            "lineNumber": 990
+          },
+          {
+            "text": "            cached = None",
+            "lineNumber": 991
+          },
+          {
+            "text": "        if cached is not None:",
+            "lineNumber": 992
+          },
+          {
+            "text": "            observation_id = str(uuid.uuid4())",
+            "lineNumber": 993
+          },
+          {
+            "text": "            if hasattr(graph, \"aupdate_state\"):",
+            "lineNumber": 994
+          },
+          {
+            "text": "                await graph.aupdate_state(",
+            "lineNumber": 995
+          },
+          {
+            "text": "                    config,",
+            "lineNumber": 996
+          },
+          {
+            "text": "                    {\"messages\": [HumanMessage(content=req.message), AIMessage(content=cached)]},",
+            "lineNumber": 997
+          },
+          {
+            "text": "                )",
+            "lineNumber": 998
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 999
+          },
+          {
+            "text": "                await asyncio.to_thread(",
+            "lineNumber": 1000
+          },
+          {
+            "text": "                    graph.update_state,",
+            "lineNumber": 1001
+          },
+          {
+            "text": "                    config,",
+            "lineNumber": 1002
+          },
+          {
+            "text": "                    {\"messages\": [HumanMessage(content=req.message), AIMessage(content=cached)]},",
+            "lineNumber": 1003
+          },
+          {
+            "text": "                )",
+            "lineNumber": 1004
+          },
+          {
+            "text": "            await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)",
+            "lineNumber": 1005
+          },
+          {
+            "text": "            await _persist_chat_messages( thread_id, [HumanMessage(content=req.message), AIMessage(content=cached)])",
+            "lineNumber": 1006
+          },
+          {
+            "text": "            await _save_qa_observation_async(",
+            "lineNumber": 1007
+          },
+          {
+            "text": "                _build_observation_payload(",
+            "lineNumber": 1008
+          },
+          {
+            "text": "                    observation_id=observation_id,",
+            "lineNumber": 1009
+          },
+          {
+            "text": "                    thread_id=thread_id,",
+            "lineNumber": 1010
+          },
+          {
+            "text": "                    conversation_id=conversation_id,",
+            "lineNumber": 1011
+          },
+          {
+            "text": "                    user_id=user_id,",
+            "lineNumber": 1012
+          },
+          {
+            "text": "                    question=req.message,",
+            "lineNumber": 1013
+          },
+          {
+            "text": "                    answer=cached,",
+            "lineNumber": 1014
+          },
+          {
+            "text": "                    route=\"cache\",",
+            "lineNumber": 1015
+          },
+          {
+            "text": "                    response_mode=\"sync\",",
+            "lineNumber": 1016
+          },
+          {
+            "text": "                    success=True,",
+            "lineNumber": 1017
+          },
+          {
+            "text": "                    latency_ms=int((time.perf_counter() - started_at) * 1000),",
+            "lineNumber": 1018
+          },
+          {
+            "text": "                    used_cache=True,",
+            "lineNumber": 1019
+          },
+          {
+            "text": "                )",
+            "lineNumber": 1020
+          },
+          {
+            "text": "            )",
+            "lineNumber": 1021
+          },
+          {
+            "text": "            return ChatResponse(reply=cached, conversation_id=conversation_id, observation_id=observation_id)",
+            "lineNumber": 1022
+          },
+          {
+            "lineNumber": 1023
+          },
+          {
+            "text": "    # 对话内「确认执行」：从共享状态取出该会话的待执行 SQL 并执行，结果写入图状态后返回",
+            "lineNumber": 1024
+          }
+        ]
+      },
+      "score": 0.5060980916023254
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 930
+          },
+          "endPosition": {
+            "line": 1256
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 931,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 941,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_impl(",
+            "lineNumber": 931,
+            "isSignature": true
+          },
+          {
+            "text": "    request: Request,",
+            "lineNumber": 932,
+            "isSignature": true
+          },
+          {
+            "text": "    req: ChatRequest,",
+            "lineNumber": 933,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 934,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 935,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 936,
+            "isSignature": true
+          },
+          {
+            "text": "    config: dict,",
+            "lineNumber": 937,
+            "isSignature": true
+          },
+          {
+            "text": "    graph,",
+            "lineNumber": 938,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: float,",
+            "lineNumber": 939,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 940,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1103
+          },
+          {
+            "lineNumber": 1104
+          },
+          {
+            "text": "    # 防击穿：同一问题仅一个协程回源，持锁后再次查缓存再决定是否走图",
+            "lineNumber": 1105
+          },
+          {
+            "text": "    async with answer_lock(req.message):",
+            "lineNumber": 1106
+          },
+          {
+            "text": "        cached = await get_cached_answer(req.message)",
+            "lineNumber": 1107
+          },
+          {
+            "text": "        if cached is not None:",
+            "lineNumber": 1108
+          },
+          {
+            "text": "            observation_id = str(uuid.uuid4())",
+            "lineNumber": 1109
+          },
+          {
+            "text": "            if hasattr(graph, \"aupdate_state\"):",
+            "lineNumber": 1110
+          },
+          {
+            "text": "                await graph.aupdate_state(",
+            "lineNumber": 1111
+          },
+          {
+            "text": "                    config,",
+            "lineNumber": 1112
+          },
+          {
+            "text": "                    {\"messages\": [HumanMessage(content=req.message), AIMessage(content=cached)]},",
+            "lineNumber": 1113
+          },
+          {
+            "text": "                )",
+            "lineNumber": 1114
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 1115
+          },
+          {
+            "text": "                await asyncio.to_thread(",
+            "lineNumber": 1116
+          },
+          {
+            "text": "                    graph.update_state,",
+            "lineNumber": 1117
+          },
+          {
+            "text": "                    config,",
+            "lineNumber": 1118
+          },
+          {
+            "text": "                    {\"messages\": [HumanMessage(content=req.message), AIMessage(content=cached)]},",
+            "lineNumber": 1119
+          },
+          {
+            "text": "                )",
+            "lineNumber": 1120
+          },
+          {
+            "text": "            await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)",
+            "lineNumber": 1121
+          },
+          {
+            "text": "            await _persist_chat_messages( thread_id, [HumanMessage(content=req.message), AIMessage(content=cached)])",
+            "lineNumber": 1122
+          },
+          {
+            "text": "            await _save_qa_observation_async(",
+            "lineNumber": 1123
+          },
+          {
+            "text": "                _build_observation_payload(",
+            "lineNumber": 1124
+          },
+          {
+            "text": "                    observation_id=observation_id,",
+            "lineNumber": 1125
+          },
+          {
+            "text": "                    thread_id=thread_id,",
+            "lineNumber": 1126
+          },
+          {
+            "text": "                    conversation_id=conversation_id,",
+            "lineNumber": 1127
+          },
+          {
+            "text": "                    user_id=user_id,",
+            "lineNumber": 1128
+          },
+          {
+            "text": "                    question=req.message,",
+            "lineNumber": 1129
+          },
+          {
+            "text": "                    answer=cached,",
+            "lineNumber": 1130
+          },
+          {
+            "text": "                    route=\"cache\",",
+            "lineNumber": 1131
+          },
+          {
+            "text": "                    response_mode=\"sync\",",
+            "lineNumber": 1132
+          },
+          {
+            "text": "                    success=True,",
+            "lineNumber": 1133
+          },
+          {
+            "text": "                    latency_ms=int((time.perf_counter() - started_at) * 1000),",
+            "lineNumber": 1134
+          },
+          {
+            "text": "                    used_cache=True,",
+            "lineNumber": 1135
+          },
+          {
+            "text": "                )",
+            "lineNumber": 1136
+          },
+          {
+            "text": "            )",
+            "lineNumber": 1137
+          },
+          {
+            "text": "            return ChatResponse(reply=cached, conversation_id=conversation_id, observation_id=observation_id)",
+            "lineNumber": 1138
+          },
+          {
+            "text": "        messages = [HumanMessage(content=req.message)]",
+            "lineNumber": 1139
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 1140
+          },
+          {
+            "text": "            result = await asyncio.wait_for",
+            "lineNumber": 1141
+          }
+        ]
+      },
+      "score": 0.48545318841934204
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 1274
+          },
+          "endPosition": {
+            "line": 1583
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 1275,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 1282,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_stream_generator_impl(",
+            "lineNumber": 1275,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 1276,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 1277,
+            "isSignature": true
+          },
+          {
+            "text": "    message: str,",
+            "lineNumber": 1278,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str] = None,",
+            "lineNumber": 1279,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: Optional[float] = None,",
+            "lineNumber": 1280,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 1281,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1440
+          },
+          {
+            "lineNumber": 1441
+          },
+          {
+            "text": "    # 防击穿：同一问题仅一个协程回源，持锁后再次查缓存再决定是否走图",
+            "lineNumber": 1442
+          },
+          {
+            "text": "    async with answer_lock(message):",
+            "lineNumber": 1443
+          },
+          {
+            "text": "        cached = await get_cached_answer(message)",
+            "lineNumber": 1444
+          },
+          {
+            "text": "        if cached is not None:",
+            "lineNumber": 1445
+          },
+          {
+            "text": "            observation_id = str(uuid.uuid4())",
+            "lineNumber": 1446
+          },
+          {
+            "text": "            if cached:",
+            "lineNumber": 1447
+          },
+          {
+            "text": "                yield f\"data: {json.dumps({'text': cached[0:1]}, ensure_ascii=False)}\\n\\n\"",
+            "lineNumber": 1448
+          },
+          {
+            "text": "                rest = cached[1:]",
+            "lineNumber": 1449
+          },
+          {
+            "text": "                chunk_size = 64",
+            "lineNumber": 1450
+          },
+          {
+            "text": "                for i in range(0, len(rest), chunk_size):",
+            "lineNumber": 1451
+          },
+          {
+            "text": "                    yield f\"data: {json.dumps({'text': rest[i:i + chunk_size]}, ensure_ascii=False)}\\n\\n\"",
+            "lineNumber": 1452
+          },
+          {
+            "text": "            if hasattr(graph, \"aupdate_state\"):",
+            "lineNumber": 1453
+          },
+          {
+            "text": "                await graph.aupdate_state(config, {\"messages\": [HumanMessage(content=message), AIMessage(content=cached)]})",
+            "lineNumber": 1454
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 1455
+          },
+          {
+            "text": "                await asyncio.to_thread(graph.update_state, config, {\"messages\": [HumanMessage(content=message), AIMessage(content=cached)]})",
+            "lineNumber": 1456
+          },
+          {
+            "text": "            await _persist_conversation_session(thread_id, conversation_id, user_id, message)",
+            "lineNumber": 1457
+          },
+          {
+            "text": "            await _persist_chat_messages( thread_id, [HumanMessage(content=message), AIMessage(content=cached)])",
+            "lineNumber": 1458
+          },
+          {
+            "text": "            await _save_qa_observation_async(",
+            "lineNumber": 1459
+          },
+          {
+            "text": "                _build_observation_payload(",
+            "lineNumber": 1460
+          },
+          {
+            "text": "                    observation_id=observation_id,",
+            "lineNumber": 1461
+          },
+          {
+            "text": "                    thread_id=thread_id,",
+            "lineNumber": 1462
+          },
+          {
+            "text": "                    conversation_id=conversation_id,",
+            "lineNumber": 1463
+          },
+          {
+            "text": "                    user_id=user_id,",
+            "lineNumber": 1464
+          },
+          {
+            "text": "                    question=message,",
+            "lineNumber": 1465
+          },
+          {
+            "text": "                    answer=cached,",
+            "lineNumber": 1466
+          },
+          {
+            "text": "                    route=\"cache\",",
+            "lineNumber": 1467
+          },
+          {
+            "text": "                    response_mode=\"stream\",",
+            "lineNumber": 1468
+          },
+          {
+            "text": "                    success=True,",
+            "lineNumber": 1469
+          },
+          {
+            "text": "                    latency_ms=int((time.perf_counter() - started_at) * 1000),",
+            "lineNumber": 1470
+          },
+          {
+            "text": "                    used_cache=True,",
+            "lineNumber": 1471
+          },
+          {
+            "text": "                )",
+            "lineNumber": 1472
+          },
+          {
+            "text": "            )",
+            "lineNumber": 1473
+          },
+          {
+            "text": "            yield f\"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'observation_id': observation_id}, ensure_ascii=False)}\\n\\n\"",
+            "lineNumber": 1474
+          },
+          {
+            "text": "            return",
+            "lineNumber": 1475
+          },
+          {
+            "lineNumber": 1476
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 1477
+          },
+          {
+            "text": "            snapshot = await graph.aget_state(config) if",
+            "lineNumber": 1478
+          }
+        ]
+      },
+      "score": 0.46806246042251587
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/answer_cache.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 50
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "\"\"\"",
+            "lineNumber": 1
+          },
+          {
+            "text": "用户问答缓存：将「问题 → 答案」存入 Redis，后续相同/归一化后相似问题直接命中缓存返回。",
+            "lineNumber": 2
+          },
+          {
+            "lineNumber": 3
+          },
+          {
+            "text": "优化要点：",
+            "lineNumber": 4
+          },
+          {
+            "text": "- 连接池：多协程共享连接池，可配置 max_connections、超时、健康检查间隔。",
+            "lineNumber": 5
+          },
+          {
+            "text": "- 断线重连：连接/读写失败时置空客户端，下次调用时懒加载重建。",
+            "lineNumber": 6
+          },
+          {
+            "text": "- 单条价值长度限制：超长答案不写入，避免占满内存。",
+            "lineNumber": 7
+          },
+          {
+            "text": "- 生命周期：应用关闭时主动关闭连接池，避免连接泄漏。",
+            "lineNumber": 8
+          },
+          {
+            "text": "- 热 key：可选进程内 LRU 本地缓存，命中则不再打 Redis，降低热 key 压力。",
+            "lineNumber": 9
+          },
+          {
+            "text": "- 防击穿：同一问题缓存未命中时，仅一个协程回源计算，其余等待后复用结果（单飞锁）。",
+            "lineNumber": 10
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 11
+          },
+          {
+            "text": "import asyncio",
+            "lineNumber": 12
+          },
+          {
+            "text": "import hashlib",
+            "lineNumber": 13
+          },
+          {
+            "text": "import logging",
+            "lineNumber": 14
+          },
+          {
+            "text": "import re",
+            "lineNumber": 15
+          },
+          {
+            "text": "import time",
+            "lineNumber": 16
+          },
+          {
+            "text": "from collections import OrderedDict",
+            "lineNumber": 17
+          },
+          {
+            "text": "from contextlib import asynccontextmanager",
+            "lineNumber": 18
+          },
+          {
+            "text": "from typing import Any, List, Optional",
+            "lineNumber": 19
+          },
+          {
+            "lineNumber": 20
+          },
+          {
+            "text": "from config import get_settings",
+            "lineNumber": 21
+          },
+          {
+            "lineNumber": 22
+          },
+          {
+            "text": "logger = logging.getLogger(__name__)",
+            "lineNumber": 23
+          },
+          {
+            "lineNumber": 24
+          },
+          {
+            "text": "_CACHE_KEY_PREFIX = \"kb:answer:v1:\"",
+            "lineNumber": 25
+          },
+          {
+            "text": "_MAX_QUESTION_LEN = 500",
+            "lineNumber": 26
+          },
+          {
+            "lineNumber": 27
+          },
+          {
+            "text": "_redis: Any = None",
+            "lineNumber": 28
+          },
+          {
+            "text": "_redis_lock = asyncio.Lock()",
+            "lineNumber": 29
+          },
+          {
+            "lineNumber": 30
+          },
+          {
+            "text": "# 本地热 key 缓存：key -&gt; (value, expiry_ts)，按访问顺序做 LRU，容量与 TTL 可配置",
+            "lineNumber": 31
+          },
+          {
+            "text": "_local_cache: Optional[OrderedDict] = None",
+            "lineNumber": 32
+          },
+          {
+            "text": "_local_cache_lock = asyncio.Lock()",
+            "lineNumber": 33
+          },
+          {
+            "lineNumber": 34
+          },
+          {
+            "text": "# 防击穿：按 key 分桶的锁，同一问题只有一个协程回源，其余等待后读缓存",
+            "lineNumber": 35
+          },
+          {
+            "text": "_single_flight_locks: List[asyncio.Lock] = []",
+            "lineNumber": 36
+          },
+          {
+            "text": "_single_flight_initialized = False",
+            "lineNumber": 37
+          },
+          {
+            "lineNumber": 38
+          },
+          {
+            "lineNumber": 39
+          },
+          {
+            "text": "def _normalize_question(question: str) -&gt; str:",
+            "lineNumber": 40,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"归一化问题：去首尾空白、连续空白折叠为单空格、小写、截断至 _MAX_QUESTION_LEN，用于缓存 key 匹配。\"\"\"",
+            "lineNumber": 41
+          },
+          {
+            "text": "    s = (question or \"\").strip()",
+            "lineNumber": 42
+          },
+          {
+            "text": "    s = re.sub(r\"\\s+\", \" \", s)[:_MAX_QUESTION_LEN]",
+            "lineNumber": 43
+          },
+          {
+            "text": "    return s.lower().strip()",
+            "lineNumber": 44,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 45
+          },
+          {
+            "lineNumber": 46
+          },
+          {
+            "text": "def _cache_key(question: str) -&gt; str:",
+            "lineNumber": 47,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 48
+          }
+        ]
+      },
+      "score": 0.44733381271362305
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 1274
+          },
+          "endPosition": {
+            "line": 1583
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 1275,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 1282,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_stream_generator_impl(",
+            "lineNumber": 1275,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 1276,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 1277,
+            "isSignature": true
+          },
+          {
+            "text": "    message: str,",
+            "lineNumber": 1278,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str] = None,",
+            "lineNumber": 1279,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: Optional[float] = None,",
+            "lineNumber": 1280,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 1281,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1405
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 1406
+          },
+          {
+            "text": "            cached = await get_cached_answer(message)",
+            "lineNumber": 1407
+          },
+          {
+            "text": "        except Exception:",
+            "lineNumber": 1408
+          },
+          {
+            "text": "            cached = None",
+            "lineNumber": 1409
+          },
+          {
+            "text": "        if cached is not None:",
+            "lineNumber": 1410
+          },
+          {
+            "text": "            observation_id = str(uuid.uuid4())",
+            "lineNumber": 1411
+          },
+          {
+            "text": "            if cached:",
+            "lineNumber": 1412
+          },
+          {
+            "text": "                yield f\"data: {json.dumps({'text': cached[0:1]}, ensure_ascii=False)}\\n\\n\"",
+            "lineNumber": 1413
+          },
+          {
+            "text": "                rest = cached[1:]",
+            "lineNumber": 1414
+          },
+          {
+            "text": "                chunk_size = 64",
+            "lineNumber": 1415
+          },
+          {
+            "text": "                for i in range(0, len(rest), chunk_size):",
+            "lineNumber": 1416
+          },
+          {
+            "text": "                    yield f\"data: {json.dumps({'text': rest[i:i + chunk_size]}, ensure_ascii=False)}\\n\\n\"",
+            "lineNumber": 1417
+          },
+          {
+            "text": "            if hasattr(graph, \"aupdate_state\"):",
+            "lineNumber": 1418
+          },
+          {
+            "text": "                await graph.aupdate_state(config, {\"messages\": [HumanMessage(content=message), AIMessage(content=cached)]})",
+            "lineNumber": 1419
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 1420
+          },
+          {
+            "text": "                await asyncio.to_thread(graph.update_state, config, {\"messages\": [HumanMessage(content=message), AIMessage(content=cached)]})",
+            "lineNumber": 1421
+          },
+          {
+            "text": "            await _persist_conversation_session(thread_id, conversation_id, user_id, message)",
+            "lineNumber": 1422
+          },
+          {
+            "text": "            await _persist_chat_messages( thread_id, [HumanMessage(content=message), AIMessage(content=cached)])",
+            "lineNumber": 1423
+          },
+          {
+            "text": "            await _save_qa_observation_async(",
+            "lineNumber": 1424
+          },
+          {
+            "text": "                _build_observation_payload(",
+            "lineNumber": 1425
+          },
+          {
+            "text": "                    observation_id=observation_id,",
+            "lineNumber": 1426
+          },
+          {
+            "text": "                    thread_id=thread_id,",
+            "lineNumber": 1427
+          },
+          {
+            "text": "                    conversation_id=conversation_id,",
+            "lineNumber": 1428
+          },
+          {
+            "text": "                    user_id=user_id,",
+            "lineNumber": 1429
+          },
+          {
+            "text": "                    question=message,",
+            "lineNumber": 1430
+          },
+          {
+            "text": "                    answer=cached,",
+            "lineNumber": 1431
+          },
+          {
+            "text": "                    route=\"cache\",",
+            "lineNumber": 1432
+          },
+          {
+            "text": "                    response_mode=\"stream\",",
+            "lineNumber": 1433
+          },
+          {
+            "text": "                    success=True,",
+            "lineNumber": 1434
+          },
+          {
+            "text": "                    latency_ms=int((time.perf_counter() - started_at) * 1000),",
+            "lineNumber": 1435
+          },
+          {
+            "text": "                    used_cache=True,",
+            "lineNumber": 1436
+          },
+          {
+            "text": "                )",
+            "lineNumber": 1437
+          },
+          {
+            "text": "            )",
+            "lineNumber": 1438
+          },
+          {
+            "text": "            yield f\"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'observation_id': observation_id}, ensure_ascii=False)}\\n\\n\"",
+            "lineNumber": 1439
+          },
+          {
+            "text": "            return",
+            "lineNumber": 1440
+          },
+          {
+            "lineNumber": 1441
+          },
+          {
+            "text": "    # 防击穿：同一问题仅一个协程回源，持锁后再次查缓存再决定是否走图",
+            "lineNumber": 1442
+          }
+        ]
+      },
+      "score": 0.4422878623008728
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 29,
+            "column": 25
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# src/kb/rag.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "复杂问题 RAG：BM25 + HNSW 混合检索（3:7），检索评估与重检，答案展示依据来源。",
+            "lineNumber": 3
+          },
+          {
+            "text": "模型使用约定（本项目禁止调用 OpenAI）：",
+            "lineNumber": 4
+          },
+          {
+            "text": "  - 向量模型：仅 BGE-M3（BAAI/bge-m3），本地部署/本地加载，不调用远程 embedding API；",
+            "lineNumber": 5
+          },
+          {
+            "text": "  - 重排模型：仅 BGE Reranker Large（BAAI/bge-reranker-large），本地部署/本地加载，不调用远程 API；",
+            "lineNumber": 6
+          },
+          {
+            "text": "  - 大模型不在此模块调用，由 kb.engine 使用 DeepSeek。",
+            "lineNumber": 7
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 8
+          },
+          {
+            "text": "import hashlib",
+            "lineNumber": 9
+          },
+          {
+            "text": "import threading",
+            "lineNumber": 10
+          },
+          {
+            "text": "import time",
+            "lineNumber": 11
+          },
+          {
+            "text": "from collections import OrderedDict",
+            "lineNumber": 12
+          },
+          {
+            "text": "from typing import List, Optional, Tuple",
+            "lineNumber": 13
+          },
+          {
+            "text": "from dataclasses import dataclass",
+            "lineNumber": 14
+          },
+          {
+            "lineNumber": 15
+          },
+          {
+            "text": "from config import get_settings",
+            "lineNumber": 16
+          },
+          {
+            "text": "from .retrieval_eval import evaluate_retrieval, RetrievalEvalResult",
+            "lineNumber": 17
+          },
+          {
+            "text": "from .embedding_loader import get_bge_embedding, get_bge_reranker",
+            "lineNumber": 18
+          },
+          {
+            "lineNumber": 19
+          },
+          {
+            "text": "_rag_cache: Optional[OrderedDict] = None",
+            "lineNumber": 20
+          },
+          {
+            "text": "_rag_cache_lock = threading.Lock()",
+            "lineNumber": 21
+          },
+          {
+            "lineNumber": 22
+          },
+          {
+            "lineNumber": 23
+          },
+          {
+            "text": "def _rag_cache_key(query: str, total_k: int, use_rerank: bool, rerank_top: int) -&gt; str:",
+            "lineNumber": 24,
+            "isSignature": true
+          },
+          {
+            "text": "    h = hashlib.sha256(f\"{query}|{total_k}|{use_rerank}|{rerank_top}\".encode()).hexdigest()[:32]",
+            "lineNumber": 25
+          },
+          {
+            "text": "    return f\"rag:v1:{h}\"",
+            "lineNumber": 26,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 27
+          },
+          {
+            "lineNumber": 28
+          },
+          {
+            "text": "def _get_settings():",
+            "lineNumber": 29,
+            "isSignature": true
+          },
+          {
+            "text": "    return get_settings()",
+            "lineNumber": 30,
+            "isSignature": true
+          }
+        ]
+      },
+      "score": 0.42499685287475586
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/answer_cache.py",
+        "range": {
+          "startPosition": {
+            "line": 268,
+            "column": 19
+          },
+          "endPosition": {
+            "line": 311
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "async def set_cached_answer(question: str, answer: str) -&gt; None:",
+            "lineNumber": 272,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 273
+          },
+          {
+            "text": "    将问题→答案写入 Redis（及可选本地热 key 缓存），TTL 使用配置的 answer_cache_ttl_seconds。",
+            "lineNumber": 274
+          },
+          {
+            "text": "    若配置了 answer_cache_max_value_bytes 且答案超长则跳过写入。",
+            "lineNumber": 275
+          },
+          {
+            "text": "    Redis 不可用或断线时不写入、不抛错；断线时会置空客户端以便下次重连。",
+            "lineNumber": 276
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 277
+          },
+          {
+            "text": "    if not (question or \"\").strip() or not (answer or \"\").strip():",
+            "lineNumber": 278
+          },
+          {
+            "text": "        return",
+            "lineNumber": 279
+          },
+          {
+            "text": "    settings = get_settings()",
+            "lineNumber": 280
+          },
+          {
+            "text": "    max_bytes = max(0, getattr(settings, \"answer_cache_max_value_bytes\", 0))",
+            "lineNumber": 281
+          },
+          {
+            "text": "    if max_bytes &gt; 0:",
+            "lineNumber": 282
+          },
+          {
+            "text": "        answer_bytes = answer.encode(\"utf-8\")",
+            "lineNumber": 283
+          },
+          {
+            "text": "        if len(answer_bytes) &gt; max_bytes:",
+            "lineNumber": 284
+          },
+          {
+            "text": "            logger.debug(\"答案长度 %s 超过 answer_cache_max_value_bytes=%s，跳过写入缓存\", len(answer_bytes), max_bytes)",
+            "lineNumber": 285
+          },
+          {
+            "text": "            return",
+            "lineNumber": 286
+          },
+          {
+            "text": "    key = _cache_key(question)",
+            "lineNumber": 287
+          },
+          {
+            "text": "    if _local_cache_max_entries() &gt; 0:",
+            "lineNumber": 288
+          },
+          {
+            "text": "        await _local_set(key, answer)",
+            "lineNumber": 289
+          },
+          {
+            "text": "    client = await _get_redis()",
+            "lineNumber": 290
+          },
+          {
+            "text": "    if client is None:",
+            "lineNumber": 291
+          },
+          {
+            "text": "        return",
+            "lineNumber": 292
+          },
+          {
+            "text": "    try:",
+            "lineNumber": 293
+          },
+          {
+            "text": "        ttl = max(60, getattr(settings, \"answer_cache_ttl_seconds\", 86400))",
+            "lineNumber": 294
+          },
+          {
+            "text": "        await client.set(key, answer, ex=ttl)",
+            "lineNumber": 295
+          },
+          {
+            "text": "    except Exception as e:",
+            "lineNumber": 296
+          },
+          {
+            "text": "        if _is_redis_connection_error(e):",
+            "lineNumber": 297
+          },
+          {
+            "text": "            _invalidate_redis()",
+            "lineNumber": 298
+          },
+          {
+            "text": "            logger.warning(\"Redis 写缓存失败（已置空客户端以便重连）: %s\", e)",
+            "lineNumber": 299
+          },
+          {
+            "text": "        else:",
+            "lineNumber": 300
+          },
+          {
+            "text": "            logger.debug(\"Redis set 异常: %s\", e)",
+            "lineNumber": 301,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 302
+          },
+          {
+            "lineNumber": 303
+          },
+          {
+            "text": "@asynccontextmanager",
+            "lineNumber": 304
+          },
+          {
+            "text": "async def answer_lock(question: str):",
+            "lineNumber": 305,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 306
+          }
+        ]
+      },
+      "score": 0.42125755548477173
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {
+            "line": 62
+          },
+          "endPosition": {
+            "line": 332
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 63,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 64,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class RAGRetriever:",
+            "lineNumber": 63,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 175
+          },
+          {
+            "lineNumber": 176
+          },
+          {
+            "text": "    def _merge_3_7(",
+            "lineNumber": 177
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 178
+          },
+          {
+            "text": "        query: str,",
+            "lineNumber": 179
+          },
+          {
+            "text": "        total_k: int,",
+            "lineNumber": 180
+          },
+          {
+            "text": "        use_rerank: bool = True,",
+            "lineNumber": 181
+          },
+          {
+            "text": "        rerank_top: int = 5,",
+            "lineNumber": 182
+          },
+          {
+            "text": "    ) -&gt; List[dict]:",
+            "lineNumber": 183
+          },
+          {
+            "text": "        \"\"\"按配置比例（默认 3:7）取 BM25 与向量结果，合并后使用 BGE Reranker 重排。支持进程内 LRU 缓存。\"\"\"",
+            "lineNumber": 184
+          },
+          {
+            "text": "        global _rag_cache",
+            "lineNumber": 185
+          },
+          {
+            "text": "        s = _get_settings()",
+            "lineNumber": 186
+          },
+          {
+            "text": "        max_entries = max(0, getattr(s, \"rag_retrieval_cache_max_entries\", 0))",
+            "lineNumber": 187
+          },
+          {
+            "text": "        ttl = max(1, getattr(s, \"rag_retrieval_cache_ttl_seconds\", 300))",
+            "lineNumber": 188
+          },
+          {
+            "text": "        if max_entries &gt; 0:",
+            "lineNumber": 189
+          },
+          {
+            "text": "            key = _rag_cache_key(query, total_k, use_rerank, rerank_top)",
+            "lineNumber": 190
+          },
+          {
+            "text": "            with _rag_cache_lock:",
+            "lineNumber": 191
+          },
+          {
+            "text": "                if _rag_cache is None:",
+            "lineNumber": 192
+          },
+          {
+            "text": "                    _rag_cache = OrderedDict()",
+            "lineNumber": 193
+          },
+          {
+            "text": "                entry = _rag_cache.get(key)",
+            "lineNumber": 194
+          },
+          {
+            "text": "                if entry is not None:",
+            "lineNumber": 195
+          },
+          {
+            "text": "                    cached, expiry = entry",
+            "lineNumber": 196
+          },
+          {
+            "text": "                    if time.time() &lt; expiry:",
+            "lineNumber": 197
+          },
+          {
+            "text": "                        _rag_cache.move_to_end(key)",
+            "lineNumber": 198
+          },
+          {
+            "text": "                        return cached",
+            "lineNumber": 199
+          },
+          {
+            "text": "                    _rag_cache.pop(key, None)",
+            "lineNumber": 200
+          },
+          {
+            "text": "        combined = self._merge_3_7_impl(query, total_k, use_rerank, rerank_top)",
+            "lineNumber": 201
+          },
+          {
+            "text": "        if max_entries &gt; 0 and combined:",
+            "lineNumber": 202
+          },
+          {
+            "text": "            with _rag_cache_lock:",
+            "lineNumber": 203
+          },
+          {
+            "text": "                if _rag_cache is None:",
+            "lineNumber": 204
+          },
+          {
+            "text": "                    _rag_cache = OrderedDict()",
+            "lineNumber": 205
+          },
+          {
+            "text": "                _rag_cache[key] = (combined, time.time() + ttl)",
+            "lineNumber": 206
+          },
+          {
+            "text": "                _rag_cache.move_to_end(key)",
+            "lineNumber": 207
+          },
+          {
+            "text": "                while len(_rag_cache) &gt; max_entries:",
+            "lineNumber": 208
+          },
+          {
+            "text": "                    _rag_cache.popitem(last=False)",
+            "lineNumber": 209
+          },
+          {
+            "text": "        return combined",
+            "lineNumber": 210
+          },
+          {
+            "lineNumber": 211
+          },
+          {
+            "text": "    def _merge_3_7_impl(",
+            "lineNumber": 212
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 213
+          },
+          {
+            "text": "        query: str,",
+            "lineNumber": 214
+          },
+          {
+            "text": "        total_k: int,",
+            "lineNumber": 215
+          },
+          {
+            "text": "        use_rerank: bool = True,",
+            "lineNumber": 216
+          },
+          {
+            "text": "        rerank_top: int = 5,",
+            "lineNumber": 217
+          },
+          {
+            "text": "    ) -&gt; List[dict]:",
+            "lineNumber": 218
+          },
+          {
+            "text": "        ",
+            "lineNumber": 219
+          }
+        ]
+      },
+      "score": 0.3980139493942261
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 930
+          },
+          "endPosition": {
+            "line": 1271
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 931,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 941,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_impl(",
+            "lineNumber": 931,
+            "isSignature": true
+          },
+          {
+            "text": "    request: Request,",
+            "lineNumber": 932,
+            "isSignature": true
+          },
+          {
+            "text": "    req: ChatRequest,",
+            "lineNumber": 933,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 934,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 935,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 936,
+            "isSignature": true
+          },
+          {
+            "text": "    config: dict,",
+            "lineNumber": 937,
+            "isSignature": true
+          },
+          {
+            "text": "    graph,",
+            "lineNumber": 938,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: float,",
+            "lineNumber": 939,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 940,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1224
+          },
+          {
+            "text": "        reply = (last_msg.content if last_msg else \"抱歉，未生成回复。\").strip()",
+            "lineNumber": 1225
+          },
+          {
+            "text": "        observation_id = str(uuid.uuid4())",
+            "lineNumber": 1226
+          },
+          {
+            "text": "        route = (result.get(\"route\") or (\"knowledge\" if result.get(\"qa_trace\") else \"chat\")).strip()",
+            "lineNumber": 1227
+          },
+          {
+            "text": "        qa_trace = result.get(\"qa_trace\") or None",
+            "lineNumber": 1228
+          },
+          {
+            "text": "        if getattr(settings, \"answer_cache_enabled\", True) and reply:",
+            "lineNumber": 1229
+          },
+          {
+            "text": "            try:",
+            "lineNumber": 1230
+          },
+          {
+            "text": "                await set_cached_answer(req.message, reply)",
+            "lineNumber": 1231
+          },
+          {
+            "text": "            except Exception:",
+            "lineNumber": 1232
+          },
+          {
+            "text": "                pass",
+            "lineNumber": 1233
+          },
+          {
+            "text": "        await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)",
+            "lineNumber": 1234
+          },
+          {
+            "text": "        # 长期记忆：本轮 user + assistant 追加写入 PostgreSQL",
+            "lineNumber": 1235
+          },
+          {
+            "text": "        last_two = result.get(\"messages\") or []",
+            "lineNumber": 1236
+          },
+          {
+            "text": "        if len(last_two) &gt;= 2:",
+            "lineNumber": 1237
+          },
+          {
+            "text": "            await _persist_chat_messages( thread_id, last_two[-2:])",
+            "lineNumber": 1238
+          },
+          {
+            "text": "        await _save_qa_observation_async(",
+            "lineNumber": 1239
+          },
+          {
+            "text": "            _build_observation_payload(",
+            "lineNumber": 1240
+          },
+          {
+            "text": "                observation_id=observation_id,",
+            "lineNumber": 1241
+          },
+          {
+            "text": "                thread_id=thread_id,",
+            "lineNumber": 1242
+          },
+          {
+            "text": "                conversation_id=conversation_id,",
+            "lineNumber": 1243
+          },
+          {
+            "text": "                user_id=user_id,",
+            "lineNumber": 1244
+          },
+          {
+            "text": "                question=req.message,",
+            "lineNumber": 1245
+          },
+          {
+            "text": "                answer=reply,",
+            "lineNumber": 1246
+          },
+          {
+            "text": "                route=route,",
+            "lineNumber": 1247
+          },
+          {
+            "text": "                response_mode=\"sync\",",
+            "lineNumber": 1248
+          },
+          {
+            "text": "                success=bool(reply),",
+            "lineNumber": 1249
+          },
+          {
+            "text": "                latency_ms=int((time.perf_counter() - started_at) * 1000),",
+            "lineNumber": 1250
+          },
+          {
+            "text": "                pending_sql=bool(result.get(\"pending_sql\")),",
+            "lineNumber": 1251
+          },
+          {
+            "text": "                trace=qa_trace,",
+            "lineNumber": 1252
+          },
+          {
+            "text": "                fallback_reason=(qa_trace or {}).get(\"fallback_reason\", \"\"),",
+            "lineNumber": 1253
+          },
+          {
+            "text": "            ),",
+            "lineNumber": 1254
+          },
+          {
+            "text": "            trace=qa_trace,",
+            "lineNumber": 1255
+          },
+          {
+            "text": "        )",
+            "lineNumber": 1256
+          },
+          {
+            "text": "        return ChatResponse(reply=reply, conversation_id=conversation_id, observation_id=observation_id)",
+            "lineNumber": 1257,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1258
+          },
+          {
+            "lineNumber": 1259
+          },
+          {
+            "text": "async def _chat_stream_generator(",
+            "lineNumber": 1260,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 1261,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 1262,
+            "isSignature": true
+          },
+          {
+            "text": "    message: str,",
+            "lineNumber": 1263,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str] = None,",
+            "lineNumber": 1264,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: Optional[float] = None,",
+            "lineNumber": 1265,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 1266,
+            "isSignature": true
+          },
+          {
+            "text": "    ",
+            "lineNumber": 1267
+          }
+        ]
+      },
+      "score": 0.3979476988315582
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/answer_cache.py",
+        "range": {
+          "startPosition": {
+            "line": 300,
+            "column": 51
+          },
+          "endPosition": {
+            "line": 311,
+            "column": 13
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "@asynccontextmanager",
+            "lineNumber": 304
+          },
+          {
+            "text": "async def answer_lock(question: str):",
+            "lineNumber": 305,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 306
+          },
+          {
+            "text": "    防击穿：同一问题缓存未命中时，仅持锁的协程回源计算并写缓存，其余协程等待后再次读缓存。",
+            "lineNumber": 307
+          },
+          {
+            "text": "    用法：在 get_cached_answer 未命中后，用 async with answer_lock(question): 包裹「再查一次缓存 + 计算 + set_cached_answer」。",
+            "lineNumber": 308
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 309
+          },
+          {
+            "text": "    lock = _get_single_flight_lock(question)",
+            "lineNumber": 310
+          },
+          {
+            "text": "    async with lock:",
+            "lineNumber": 311
+          },
+          {
+            "text": "        yield",
+            "lineNumber": 312,
+            "isSignature": true
+          }
+        ]
+      },
+      "score": 0.3859677314758301
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/answer_cache.py",
+        "range": {
+          "startPosition": {
+            "line": 89,
+            "column": 79
+          },
+          "endPosition": {
+            "line": 125
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "async def _local_get(key: str) -&gt; Optional[str]:",
+            "lineNumber": 93,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"从本地缓存读取，过期或不存在返回 None。\"\"\"",
+            "lineNumber": 94
+          },
+          {
+            "text": "    cache = await _get_local_cache()",
+            "lineNumber": 95
+          },
+          {
+            "text": "    if cache is None:",
+            "lineNumber": 96
+          },
+          {
+            "text": "        return None",
+            "lineNumber": 97
+          },
+          {
+            "text": "    async with _local_cache_lock:",
+            "lineNumber": 98
+          },
+          {
+            "text": "        entry = cache.get(key)",
+            "lineNumber": 99
+          },
+          {
+            "text": "        if entry is None:",
+            "lineNumber": 100
+          },
+          {
+            "text": "            return None",
+            "lineNumber": 101
+          },
+          {
+            "text": "        value, expiry_ts = entry",
+            "lineNumber": 102
+          },
+          {
+            "text": "        if time.time() &gt; expiry_ts:",
+            "lineNumber": 103
+          },
+          {
+            "text": "            cache.pop(key, None)",
+            "lineNumber": 104
+          },
+          {
+            "text": "            return None",
+            "lineNumber": 105
+          },
+          {
+            "text": "        cache.move_to_end(key)  # LRU",
+            "lineNumber": 106
+          },
+          {
+            "text": "        return value",
+            "lineNumber": 107,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 108
+          },
+          {
+            "lineNumber": 109
+          },
+          {
+            "text": "async def _local_set(key: str, value: str) -&gt; None:",
+            "lineNumber": 110,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"写入本地缓存，并做容量与过期清理。\"\"\"",
+            "lineNumber": 111
+          }
+        ]
+      },
+      "score": 0.3858613967895508
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/REDIS_CACHE.md",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 34
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# Redis 问答缓存说明与优化",
+            "lineNumber": 1
+          },
+          {
+            "lineNumber": 2
+          },
+          {
+            "text": "问答缓存将「归一化后的问题 → 答案」存入 Redis，相同或高度相似问题可直接命中缓存，降低 LLM 与检索压力。",
+            "lineNumber": 3
+          },
+          {
+            "lineNumber": 4
+          },
+          {
+            "text": "## 1. 行为概览",
+            "lineNumber": 5
+          },
+          {
+            "lineNumber": 6
+          },
+          {
+            "text": "- **Key**：&#96;kb:answer:v1:&#96; + 问题归一化后的 SHA256（前 32 位）。归一化：去首尾空白、连续空白折叠、小写、截断 500 字。",
+            "lineNumber": 7
+          },
+          {
+            "text": "- **Value**：答案纯文本（UTF-8）。",
+            "lineNumber": 8
+          },
+          {
+            "text": "- **TTL**：由 &#96;answer_cache_ttl_seconds&#96; 控制，默认 86400（24 小时）。",
+            "lineNumber": 9
+          },
+          {
+            "text": "- **开关**：&#96;answer_cache_enabled=False&#96; 或 &#96;redis_url&#96; 为空时，不连 Redis，读/写均静默跳过。",
+            "lineNumber": 10
+          },
+          {
+            "lineNumber": 11
+          },
+          {
+            "text": "## 2. 连接与高并发",
+            "lineNumber": 12
+          },
+          {
+            "lineNumber": 13
+          },
+          {
+            "text": "- **连接池**：使用 &#96;redis.asyncio&#96;，&#96;Redis.from_url()&#96; 内部使用连接池；&#96;redis_max_connections&#96; 控制池大小（默认 10），高并发时可适当调大。",
+            "lineNumber": 14
+          },
+          {
+            "text": "- **超时**：&#96;redis_socket_connect_timeout&#96;（建连，默认 2 秒）、&#96;redis_socket_timeout&#96;（读写，默认 5 秒），避免单次请求长时间占用连接。",
+            "lineNumber": 15
+          },
+          {
+            "text": "- **健康检查**：&#96;redis_health_check_interval&#96;（秒，默认 30）对池内连接做定期健康检查，0 表示不检查。可减少因长时间空闲被服务端关闭导致的半死连接。",
+            "lineNumber": 16
+          },
+          {
+            "lineNumber": 17
+          },
+          {
+            "text": "## 3. 断线重连",
+            "lineNumber": 18
+          },
+          {
+            "lineNumber": 19
+          },
+          {
+            "text": "- 读/写时若发生连接类或超时类异常，会置空全局客户端并打日志；下次 &#96;get_cached_answer&#96; / &#96;set_cached_answer&#96; 时重新懒加载建连，无需重启进程。",
+            "lineNumber": 20
+          },
+          {
+            "text": "- 首次建连使用 asyncio.Lock，保证并发下只建一个池。",
+            "lineNumber": 21
+          },
+          {
+            "lineNumber": 22
+          },
+          {
+            "text": "## 4. 单条价值长度限制",
+            "lineNumber": 23
+          },
+          {
+            "lineNumber": 24
+          },
+          {
+            "text": "- &#96;answer_cache_max_value_bytes&#96;：单条答案最大缓存字节数（UTF-8），默认 0 表示不限制。",
+            "lineNumber": 25
+          },
+          {
+            "text": "- 若 &gt; 0 且答案编码后超过该长度，则**不写入**缓存，避免超大 value 占满内存或拖慢 Redis；读逻辑不变，仅写时做长度校验。",
+            "lineNumber": 26
+          },
+          {
+            "lineNumber": 27
+          },
+          {
+            "text": "## 5. 热 key 与防击穿",
+            "lineNumber": 28
+          },
+          {
+            "lineNumber": 29
+          },
+          {
+            "text": "### 5.1 热 key（进程内本地缓存）",
+            "lineNumber": 30
+          },
+          {
+            "lineNumber": 31
+          },
+          {
+            "text": "- **问题**：同一问题被高并发重复请求时，会集中打同一个 Redis key，造成热 key 压力甚至拖垮实例。",
+            "lineNumber": 32
+          },
+          {
+            "text": "- **做法**：可选**进程内 LRU 缓存**，在查 Redis 前先查本地；命中则直接返回、不打 Redis；未命中再查 Redis，并从 Redis 回填本地（写时同时写 Redis + 本地）。",
+            "lineNumber": 33
+          },
+          {
+            "text": "- **配置**：&#96;answer_cache_local_max_entries&#96;（条数，0 表示关闭）、&#96;answer_cache_local_ttl_seconds&#96;（本地 TTL，默认 60）。多 worker 时每个进程独立一份本地缓存，不共享。",
+            "lineNumber": 34
+          }
+        ]
+      },
+      "score": 0.38204869627952576
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/REDIS_CACHE.md",
+        "range": {
+          "startPosition": {
+            "line": 56
+          },
+          "endPosition": {
+            "line": 74
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "| answer_cache_local_ttl_seconds | 60 | 本地缓存 TTL（秒） |",
+            "lineNumber": 57
+          },
+          {
+            "text": "| answer_cache_single_flight_buckets | 256 | 防击穿单飞锁分桶数 |",
+            "lineNumber": 58
+          },
+          {
+            "text": "| redis_max_connections | 10 | 连接池最大连接数 |",
+            "lineNumber": 59
+          },
+          {
+            "text": "| redis_socket_connect_timeout | 2.0 | 建连超时（秒） |",
+            "lineNumber": 60
+          },
+          {
+            "text": "| redis_socket_timeout | 5.0 | 读写超时（秒） |",
+            "lineNumber": 61
+          },
+          {
+            "text": "| redis_health_check_interval | 30 | 健康检查间隔（秒），0 不检查 |",
+            "lineNumber": 62
+          },
+          {
+            "lineNumber": 63
+          },
+          {
+            "text": "## 8. 调用位置",
+            "lineNumber": 64
+          },
+          {
+            "lineNumber": 65
+          },
+          {
+            "text": "- **读**：&#96;POST /chat&#96;、&#96;POST /chat/stream&#96; 在处理用户消息后、走图/知识库前，会先 &#96;get_cached_answer(question)&#96;，命中则直接返回缓存内容（先查本地热 key，再查 Redis）。",
+            "lineNumber": 66
+          },
+          {
+            "text": "- **写**：在返回用户答案后（非流式/流式均会）调用 &#96;set_cached_answer(question, answer)&#96; 写入缓存（若启用本地缓存则同时写 Redis 与本地）。",
+            "lineNumber": 67
+          },
+          {
+            "text": "- **防击穿**：缓存未命中后，使用 &#96;answer_lock(question)&#96; 包裹「再次查缓存 + 回源 + 写缓存」，保证同一问题仅一个协程回源。",
+            "lineNumber": 68
+          },
+          {
+            "lineNumber": 69
+          },
+          {
+            "text": "## 9. 可选后续优化",
+            "lineNumber": 70
+          },
+          {
+            "lineNumber": 71
+          },
+          {
+            "text": "- **按租户/用户隔离**：若多租户需隔离缓存，可在 key 中加入 &#96;user_id&#96; 或 &#96;tenant_id&#96; 前缀。",
+            "lineNumber": 72
+          },
+          {
+            "text": "- **缓存统计**：可用 Redis INFO 或自定义指标统计命中率、key 数量，便于调 TTL 与容量。",
+            "lineNumber": 73
+          },
+          {
+            "text": "- **集群/哨兵**：生产若使用 Redis Cluster 或 Sentinel，需使用对应 &#96;redis_url&#96; 与客户端配置（如 &#96;redis-py&#96; 对 cluster 的支持）。",
+            "lineNumber": 74
+          }
+        ]
+      },
+      "score": 0.3779143989086151
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 198,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 204,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "async def _generate_grounded_answer_async(",
+            "lineNumber": 267
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 268
+          },
+          {
+            "text": "        question: str,",
+            "lineNumber": 269
+          },
+          {
+            "text": "        rag_result: RAGRetrieveResult,",
+            "lineNumber": 270
+          },
+          {
+            "text": "        trace: Optional[KnowledgeQueryTrace] = None,",
+            "lineNumber": 271
+          },
+          {
+            "text": "    ) -&gt; str:",
+            "lineNumber": 272
+          },
+          {
+            "lineNumber": 328
+          },
+          {
+            "text": "        return (",
+            "lineNumber": 329
+          },
+          {
+            "text": "            \"根据当前检索结果无法确认，建议您补充更具体的问题或转人工客服。\"",
+            "lineNumber": 330
+          },
+          {
+            "text": "            if last_score &lt; min_score",
+            "lineNumber": 331
+          },
+          {
+            "text": "            else last_answer",
+            "lineNumber": 332
+          },
+          {
+            "text": "        )",
+            "lineNumber": 333
+          },
+          {
+            "lineNumber": 334
+          },
+          {
+            "text": "    def query(self, question: str) -&gt; Tuple[str, Optional[str]]:",
+            "lineNumber": 335
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 336
+          },
+          {
+            "text": "        依次尝试 QA、Text2SQL、RAG，返回 (回复文案, 待确认 SQL 或 None)。",
+            "lineNumber": 337
+          },
+          {
+            "text": "        当 Text2SQL 返回删除/修改类需人工确认时，第二项为待执行 SQL，由上层写入 state.pending_sql 并交 API 确认执行。",
+            "lineNumber": 338
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 339
+          },
+          {
+            "text": "        trace = self._reset_trace()",
+            "lineNumber": 340
+          },
+          {
+            "text": "        # 1) 高频 QA 精准匹配",
+            "lineNumber": 341
+          },
+          {
+            "text": "        answer = self.qa.find(question)",
+            "lineNumber": 342
+          },
+          {
+            "text": "        if answer:",
+            "lineNumber": 343
+          },
+          {
+            "text": "            trace.route = \"qa\"",
+            "lineNumber": 344
+          },
+          {
+            "text": "            trace.final_status = \"qa_hit\"",
+            "lineNumber": 345
+          },
+          {
+            "text": "            return (answer, None)",
+            "lineNumber": 346
+          },
+          {
+            "lineNumber": 347
+          },
+          {
+            "text": "        # 2) 结构化数据 Text2SQL（可能返回待确认 SQL）",
+            "lineNumber": 348
+          },
+          {
+            "text": "        result = self.text2sql.query(question)",
+            "lineNumber": 349
+          },
+          {
+            "text": "        if result is not None:",
+            "lineNumber": 350
+          },
+          {
+            "text": "            trace.route = \"text2sql\"",
+            "lineNumber": 351
+          },
+          {
+            "text": "            if isinstance(result, Text2SQLConfirmRequired):",
+            "lineNumber": 352
+          },
+          {
+            "text": "                trace.final_status = \"text2sql_pending\"",
+            "lineNumber": 353
+          },
+          {
+            "text": "                trace.pending_sql = True",
+            "lineNumber": 354
+          },
+          {
+            "text": "                return (result.message, result.sql)",
+            "lineNumber": 355
+          },
+          {
+            "text": "            trace.final_status = \"text2sql_answer\"",
+            "lineNumber": 356
+          },
+          {
+            "text": "            return (result, None)",
+            "lineNumber": 357
+          },
+          {
+            "lineNumber": 358
+          },
+          {
+            "text": "        # 3) RAG：带评估与重检，并返回依据来源",
+            "lineNumber": 359
+          },
+          {
+            "text": "        trace.route = \"rag\"",
+            "lineNumber": 360
+          },
+          {
+            "text": "        rag_result = self.rag.retrieve_with_validation(",
+            "lineNumber": 361
+          },
+          {
+            "text": "            question, top_k=10, use_rerank=True, rerank_top=5",
+            "lineNumber": 362
+          },
+          {
+            "text": "        )",
+            "lineNumber": 363
+          },
+          {
+            "text": "        trace.retrieve_attempt = rag_result.attempt",
+            "lineNumber": 364
+          },
+          {
+            "text": "        trace.source_count = len(rag_result.chunks)",
+            "lineNumber": 365
+          },
+          {
+            "text": "        trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))",
+            "lineNumber": 366
+          },
+          {
+            "text": "        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))",
+            "lineNumber": 367
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 368
+          },
+          {
+            "text": "            trace.top_match_score =",
+            "lineNumber": 369
+          }
+        ]
+      },
+      "score": 0.37623894214630127
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "async def aquery(self, question: str) -&gt; Tuple[str, Optional[str]]:",
+            "lineNumber": 449
+          },
+          {
+            "lineNumber": 491
+          },
+          {
+            "text": "        return (answer_text, None)",
+            "lineNumber": 492
+          },
+          {
+            "lineNumber": 493
+          },
+          {
+            "text": "    async def aquery_stream(",
+            "lineNumber": 494
+          },
+          {
+            "text": "        self, question: str, pending_sql_out: Optional[List[str]] = None",
+            "lineNumber": 495
+          },
+          {
+            "text": "    ) -&gt; AsyncIterator[str]:",
+            "lineNumber": 496
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 497
+          },
+          {
+            "text": "        异步流式回答：先出首字再逐 chunk；RAG 使用 LLM astream，其余在线程池执行后按段 yield。",
+            "lineNumber": 498
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 499
+          },
+          {
+            "text": "        trace = self._reset_trace()",
+            "lineNumber": 500
+          },
+          {
+            "text": "        # 1) QA",
+            "lineNumber": 501
+          },
+          {
+            "text": "        answer = await asyncio.to_thread(self.qa.find, question)",
+            "lineNumber": 502
+          },
+          {
+            "text": "        if answer:",
+            "lineNumber": 503
+          },
+          {
+            "text": "            trace.route = \"qa\"",
+            "lineNumber": 504
+          },
+          {
+            "text": "            trace.final_status = \"qa_hit\"",
+            "lineNumber": 505
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(answer):",
+            "lineNumber": 506
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 507
+          },
+          {
+            "text": "            return",
+            "lineNumber": 508
+          },
+          {
+            "lineNumber": 509
+          },
+          {
+            "text": "        # 2) Text2SQL（可能为待确认 SQL）",
+            "lineNumber": 510
+          },
+          {
+            "text": "        result = await asyncio.to_thread(self.text2sql.query, question)",
+            "lineNumber": 511
+          },
+          {
+            "text": "        if result is not None:",
+            "lineNumber": 512
+          },
+          {
+            "text": "            trace.route = \"text2sql\"",
+            "lineNumber": 513
+          },
+          {
+            "text": "            # 删除/修改类需人工确认：将 SQL 放入 pending_sql_out 供 API 写入 _pending_sql",
+            "lineNumber": 514
+          },
+          {
+            "text": "            if isinstance(result, Text2SQLConfirmRequired):",
+            "lineNumber": 515
+          },
+          {
+            "text": "                trace.final_status = \"text2sql_pending\"",
+            "lineNumber": 516
+          },
+          {
+            "text": "                trace.pending_sql = True",
+            "lineNumber": 517
+          },
+          {
+            "text": "                if pending_sql_out is not None:",
+            "lineNumber": 518
+          },
+          {
+            "text": "                    pending_sql_out.append(result.sql)",
+            "lineNumber": 519
+          },
+          {
+            "text": "                for chunk in self._yield_text_chunked(result.message):",
+            "lineNumber": 520
+          },
+          {
+            "text": "                    yield chunk",
+            "lineNumber": 521
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 522
+          },
+          {
+            "text": "                trace.final_status = \"text2sql_answer\"",
+            "lineNumber": 523
+          },
+          {
+            "text": "                for chunk in self._yield_text_chunked(result):",
+            "lineNumber": 524
+          },
+          {
+            "text": "                    yield chunk",
+            "lineNumber": 525
+          },
+          {
+            "text": "            return",
+            "lineNumber": 526
+          },
+          {
+            "lineNumber": 527
+          },
+          {
+            "text": "        # 3) RAG：检索在线程池，生成用 astream",
+            "lineNumber": 528
+          },
+          {
+            "text": "        trace.route = \"rag\"",
+            "lineNumber": 529
+          },
+          {
+            "text": "        rag_result = await asyncio.to_thread(",
+            "lineNumber": 530
+          },
+          {
+            "text": "            self.rag.retrieve_with_validation,",
+            "lineNumber": 531
+          },
+          {
+            "text": "            question, top_k=10, use_rerank=True, rerank_top=5,",
+            "lineNumber": 532
+          },
+          {
+            "text": "        )",
+            "lineNumber": 533
+          },
+          {
+            "text": "        trace.retrieve_attempt = rag_result.attempt",
+            "lineNumber": 534
+          },
+          {
+            "text": "        trace.source_count = len(rag_result.chunks)",
+            "lineNumber": 535
+          },
+          {
+            "text": "        trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))",
+            "lineNumber": 536
+          },
+          {
+            "text": "        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))",
+            "lineNumber": 537
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 538
+          },
+          {
+            "text": "            trace.top_match_score =",
+            "lineNumber": 539
+          }
+        ]
+      },
+      "score": 0.37518319487571716
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 392
+          },
+          {
+            "lineNumber": 393
+          },
+          {
+            "text": "    def query_stream(self, question: str):",
+            "lineNumber": 394
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 395
+          },
+          {
+            "text": "        知识库流式回答：先出首字再逐 chunk。依次尝试 QA → Text2SQL → RAG，首个有结果即流式输出。",
+            "lineNumber": 396
+          },
+          {
+            "text": "        Yields: 文本片段（str）。",
+            "lineNumber": 397
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 398
+          },
+          {
+            "text": "        trace = self._reset_trace()",
+            "lineNumber": 399
+          },
+          {
+            "text": "        # 1) QA 精准匹配",
+            "lineNumber": 400
+          },
+          {
+            "text": "        answer = self.qa.find(question)",
+            "lineNumber": 401
+          },
+          {
+            "text": "        if answer:",
+            "lineNumber": 402
+          },
+          {
+            "text": "            trace.route = \"qa\"",
+            "lineNumber": 403
+          },
+          {
+            "text": "            trace.final_status = \"qa_hit\"",
+            "lineNumber": 404
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(answer):",
+            "lineNumber": 405
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 406
+          },
+          {
+            "text": "            return",
+            "lineNumber": 407
+          },
+          {
+            "lineNumber": 408
+          },
+          {
+            "text": "        # 2) Text2SQL（可能为待确认 SQL，统一按文案流式输出）",
+            "lineNumber": 409
+          },
+          {
+            "text": "        result = self.text2sql.query(question)",
+            "lineNumber": 410
+          },
+          {
+            "text": "        if result is not None:",
+            "lineNumber": 411
+          },
+          {
+            "text": "            trace.route = \"text2sql\"",
+            "lineNumber": 412
+          },
+          {
+            "text": "            trace.final_status = \"text2sql_pending\" if isinstance(result, Text2SQLConfirmRequired) else \"text2sql_answer\"",
+            "lineNumber": 413
+          },
+          {
+            "text": "            trace.pending_sql = isinstance(result, Text2SQLConfirmRequired)",
+            "lineNumber": 414
+          },
+          {
+            "text": "            msg = result.message if isinstance(result, Text2SQLConfirmRequired) else result",
+            "lineNumber": 415
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(msg):",
+            "lineNumber": 416
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 417
+          },
+          {
+            "text": "            return",
+            "lineNumber": 418
+          },
+          {
+            "lineNumber": 419
+          },
+          {
+            "text": "        # 3) RAG：检索后流式生成",
+            "lineNumber": 420
+          },
+          {
+            "text": "        trace.route = \"rag\"",
+            "lineNumber": 421
+          },
+          {
+            "text": "        rag_result = self.rag.retrieve_with_validation(",
+            "lineNumber": 422
+          },
+          {
+            "text": "            question, top_k=10, use_rerank=True, rerank_top=5",
+            "lineNumber": 423
+          },
+          {
+            "text": "        )",
+            "lineNumber": 424
+          },
+          {
+            "text": "        trace.retrieve_attempt = rag_result.attempt",
+            "lineNumber": 425
+          },
+          {
+            "text": "        trace.source_count = len(rag_result.chunks)",
+            "lineNumber": 426
+          },
+          {
+            "text": "        trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))",
+            "lineNumber": 427
+          },
+          {
+            "text": "        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))",
+            "lineNumber": 428
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 429
+          },
+          {
+            "text": "            trace.top_match_score = max(e.match_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 430
+          },
+          {
+            "text": "            trace.top_normalized_score = max(e.normalized_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 431
+          },
+          {
+            "text": "        if not rag_result.chunks:",
+            "lineNumber": 432
+          },
+          {
+            "text": "            trace.final_status = \"rag_no_hit\"",
+            "lineNumber": 433
+          }
+        ]
+      },
+      "score": 0.37360966205596924
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/answer_cache.py",
+        "range": {
+          "startPosition": {
+            "line": 68,
+            "column": 40
+          },
+          "endPosition": {
+            "line": 85,
+            "column": 80
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "async def _get_local_cache() -&gt; Optional[OrderedDict]:",
+            "lineNumber": 72,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"若启用本地热 key 缓存，返回 LRU OrderedDict（key -&gt; (value, expiry_ts)），否则返回 None。\"\"\"",
+            "lineNumber": 73
+          },
+          {
+            "text": "    global _local_cache",
+            "lineNumber": 74
+          },
+          {
+            "text": "    settings = get_settings()",
+            "lineNumber": 75
+          },
+          {
+            "text": "    max_entries = max(0, getattr(settings, \"answer_cache_local_max_entries\", 0))",
+            "lineNumber": 76
+          },
+          {
+            "text": "    if max_entries &lt;= 0:",
+            "lineNumber": 77
+          },
+          {
+            "text": "        return None",
+            "lineNumber": 78
+          },
+          {
+            "text": "    async with _local_cache_lock:",
+            "lineNumber": 79
+          },
+          {
+            "text": "        if _local_cache is None:",
+            "lineNumber": 80
+          },
+          {
+            "text": "            _local_cache = OrderedDict()",
+            "lineNumber": 81
+          },
+          {
+            "text": "        return _local_cache",
+            "lineNumber": 82,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 83
+          },
+          {
+            "lineNumber": 84
+          },
+          {
+            "text": "def _local_cache_ttl_seconds() -&gt; int:",
+            "lineNumber": 85,
+            "isSignature": true
+          },
+          {
+            "text": "    return max(1, getattr(get_settings(), \"answer_cache_local_ttl_seconds\", 60))",
+            "lineNumber": 86,
+            "isSignature": true
+          }
+        ]
+      },
+      "score": 0.36556506156921387
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 394,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 395,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "async def aquery(self, question: str) -&gt; Tuple[str, Optional[str]]:",
+            "lineNumber": 449
+          },
+          {
+            "lineNumber": 472
+          },
+          {
+            "text": "        rag_result = await asyncio.to_thread(",
+            "lineNumber": 473
+          },
+          {
+            "text": "            self.rag.retrieve_with_validation,",
+            "lineNumber": 474
+          },
+          {
+            "text": "            question, top_k=10, use_rerank=True, rerank_top=5,",
+            "lineNumber": 475
+          },
+          {
+            "text": "        )",
+            "lineNumber": 476
+          },
+          {
+            "text": "        trace.retrieve_attempt = rag_result.attempt",
+            "lineNumber": 477
+          },
+          {
+            "text": "        trace.source_count = len(rag_result.chunks)",
+            "lineNumber": 478
+          },
+          {
+            "text": "        trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))",
+            "lineNumber": 479
+          },
+          {
+            "text": "        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))",
+            "lineNumber": 480
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 481
+          },
+          {
+            "text": "            trace.top_match_score = max(e.match_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 482
+          },
+          {
+            "text": "            trace.top_normalized_score = max(e.normalized_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 483
+          },
+          {
+            "text": "        if not rag_result.chunks:",
+            "lineNumber": 484
+          },
+          {
+            "text": "            trace.final_status = \"rag_no_hit\"",
+            "lineNumber": 485
+          },
+          {
+            "text": "            trace.fallback_reason = \"no_retrieval_hit\"",
+            "lineNumber": 486
+          },
+          {
+            "text": "            return (\"未找到相关知识，建议您换个问法或转人工客服。\", None)",
+            "lineNumber": 487
+          },
+          {
+            "text": "        answer_text = await self._generate_grounded_answer_async(question, rag_result, trace=trace)",
+            "lineNumber": 488
+          },
+          {
+            "text": "        sources_block = _format_sources(rag_result)",
+            "lineNumber": 489
+          },
+          {
+            "text": "        if sources_block:",
+            "lineNumber": 490
+          },
+          {
+            "text": "            return (answer_text + \"\\n\\n\" + sources_block, None)",
+            "lineNumber": 491
+          },
+          {
+            "text": "        return (answer_text, None)",
+            "lineNumber": 492
+          },
+          {
+            "lineNumber": 493
+          },
+          {
+            "text": "    async def aquery_stream(",
+            "lineNumber": 494
+          },
+          {
+            "text": "        self, question: str, pending_sql_out: Optional[List[str]] = None",
+            "lineNumber": 495
+          },
+          {
+            "text": "    ) -&gt; AsyncIterator[str]:",
+            "lineNumber": 496
+          },
+          {
+            "text": "        ",
+            "lineNumber": 497
+          }
+        ]
+      },
+      "score": 0.3595322370529175
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 1274
+          },
+          "endPosition": {
+            "line": 1583
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 1275,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 1282,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_stream_generator_impl(",
+            "lineNumber": 1275,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 1276,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 1277,
+            "isSignature": true
+          },
+          {
+            "text": "    message: str,",
+            "lineNumber": 1278,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str] = None,",
+            "lineNumber": 1279,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: Optional[float] = None,",
+            "lineNumber": 1280,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 1281,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1509
+          },
+          {
+            "text": "            if full_reply:",
+            "lineNumber": 1510
+          },
+          {
+            "text": "                if hasattr(graph, \"aupdate_state\"):",
+            "lineNumber": 1511
+          },
+          {
+            "text": "                    await graph.aupdate_state(",
+            "lineNumber": 1512
+          },
+          {
+            "text": "                        config,",
+            "lineNumber": 1513
+          },
+          {
+            "text": "                        {\"messages\": [HumanMessage(content=message), AIMessage(content=full_reply)]},",
+            "lineNumber": 1514
+          },
+          {
+            "text": "                    )",
+            "lineNumber": 1515
+          },
+          {
+            "text": "                else:",
+            "lineNumber": 1516
+          },
+          {
+            "text": "                    await asyncio.to_thread(",
+            "lineNumber": 1517
+          },
+          {
+            "text": "                        graph.update_state,",
+            "lineNumber": 1518
+          },
+          {
+            "text": "                        config,",
+            "lineNumber": 1519
+          },
+          {
+            "text": "                        {\"messages\": [HumanMessage(content=message), AIMessage(content=full_reply)]},",
+            "lineNumber": 1520
+          },
+          {
+            "text": "                    )",
+            "lineNumber": 1521
+          },
+          {
+            "text": "                if getattr(settings_stream, \"answer_cache_enabled\", True):",
+            "lineNumber": 1522
+          },
+          {
+            "text": "                    try:",
+            "lineNumber": 1523
+          },
+          {
+            "text": "                        await set_cached_answer(message, full_reply)",
+            "lineNumber": 1524
+          },
+          {
+            "text": "                    except Exception:",
+            "lineNumber": 1525
+          },
+          {
+            "text": "                        pass",
+            "lineNumber": 1526
+          },
+          {
+            "text": "                await _persist_conversation_session(thread_id, conversation_id, user_id, message)",
+            "lineNumber": 1527
+          },
+          {
+            "text": "                await _persist_chat_messages( thread_id, [HumanMessage(content=message), AIMessage(content=full_reply)])",
+            "lineNumber": 1528
+          },
+          {
+            "text": "            route = \"chat\" if next_action == \"chat\" else \"knowledge\"",
+            "lineNumber": 1529
+          },
+          {
+            "text": "            await _save_qa_observation_async(",
+            "lineNumber": 1530
+          },
+          {
+            "text": "                _build_observation_payload(",
+            "lineNumber": 1531
+          },
+          {
+            "text": "                    observation_id=observation_id,",
+            "lineNumber": 1532
+          },
+          {
+            "text": "                    thread_id=thread_id,",
+            "lineNumber": 1533
+          },
+          {
+            "text": "                    conversation_id=conversation_id,",
+            "lineNumber": 1534
+          },
+          {
+            "text": "                    user_id=user_id,",
+            "lineNumber": 1535
+          },
+          {
+            "text": "                    question=message,",
+            "lineNumber": 1536
+          },
+          {
+            "text": "                    answer=full_reply,",
+            "lineNumber": 1537
+          },
+          {
+            "text": "                    route=route,",
+            "lineNumber": 1538
+          },
+          {
+            "text": "                    response_mode=\"stream\",",
+            "lineNumber": 1539
+          },
+          {
+            "text": "                    success=bool(full_reply),",
+            "lineNumber": 1540
+          },
+          {
+            "text": "                    latency_ms=int((time.perf_counter() - started_at) * 1000),",
+            "lineNumber": 1541
+          },
+          {
+            "text": "                    pending_sql=bool(qa_trace and qa_trace.get(\"pending_sql\")),",
+            "lineNumber": 1542
+          },
+          {
+            "text": "                    trace=qa_trace,",
+            "lineNumber": 1543
+          },
+          {
+            "text": "                    fallback_reason=(qa_trace or {}).get(\"fallback_reason\", \"\"),",
+            "lineNumber": 1544
+          },
+          {
+            "text": "                ),",
+            "lineNumber": 1545
+          },
+          {
+            "text": "                trace=qa_trace,",
+            "lineNumber": 1546
+          },
+          {
+            "text": "            )",
+            "lineNumber": 1547
+          },
+          {
+            "text": "            yield f\"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'observation_id': observation_id}, ensure_ascii=False)}\\n\\n\"",
+            "lineNumber": 1548
+          },
+          {
+            "text": "        except asyncio.CancelledError:",
+            "lineNumber": 1549
+          }
+        ]
+      },
+      "score": 0.3552432656288147
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/answer_cache.py",
+        "range": {
+          "startPosition": {
+            "line": 156,
+            "column": 14
+          },
+          "endPosition": {
+            "line": 209
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "async def _get_redis():",
+            "lineNumber": 160,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 161
+          },
+          {
+            "text": "    懒加载全局 Redis 连接（redis.asyncio + 连接池）。",
+            "lineNumber": 162
+          },
+          {
+            "text": "    当配置 redis_sentinel_service_name 与 redis_sentinel_nodes 时，通过 Sentinel 获取 master；",
+            "lineNumber": 163
+          },
+          {
+            "text": "    否则使用 redis_url 直连。",
+            "lineNumber": 164
+          },
+          {
+            "text": "    answer_cache_enabled 为 False 且未配 Sentinel 时返回 None。",
+            "lineNumber": 165
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 166
+          },
+          {
+            "text": "    global _redis",
+            "lineNumber": 167
+          },
+          {
+            "text": "    if _redis is not None:",
+            "lineNumber": 168
+          },
+          {
+            "text": "        return _redis",
+            "lineNumber": 169
+          },
+          {
+            "text": "    settings = get_settings()",
+            "lineNumber": 170
+          },
+          {
+            "text": "    if not getattr(settings, \"answer_cache_enabled\", True):",
+            "lineNumber": 171
+          },
+          {
+            "text": "        return None",
+            "lineNumber": 172
+          },
+          {
+            "text": "    sentinel_name = (getattr(settings, \"redis_sentinel_service_name\", None) or \"\").strip()",
+            "lineNumber": 173
+          },
+          {
+            "text": "    sentinel_nodes_str = (getattr(settings, \"redis_sentinel_nodes\", None) or \"\").strip()",
+            "lineNumber": 174
+          },
+          {
+            "text": "    use_sentinel = sentinel_name and sentinel_nodes_str",
+            "lineNumber": 175
+          },
+          {
+            "text": "    if not use_sentinel and not (getattr(settings, \"redis_url\", \"\") or \"\").strip():",
+            "lineNumber": 176
+          },
+          {
+            "text": "        return None",
+            "lineNumber": 177
+          },
+          {
+            "text": "    async with _redis_lock:",
+            "lineNumber": 178
+          },
+          {
+            "text": "        if _redis is not None:",
+            "lineNumber": 179
+          },
+          {
+            "text": "            return _redis",
+            "lineNumber": 180
+          }
+        ]
+      },
+      "score": 0.3545769453048706
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/answer_cache.py",
+        "range": {
+          "startPosition": {
+            "line": 159
+          },
+          "endPosition": {
+            "line": 215
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 160,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 161,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _get_redis():",
+            "lineNumber": 160,
+            "isSignature": true
+          },
+          {
+            "text": "():",
+            "lineNumber": 176
+          },
+          {
+            "text": "        return None",
+            "lineNumber": 177
+          },
+          {
+            "text": "    async with _redis_lock:",
+            "lineNumber": 178
+          },
+          {
+            "text": "        if _redis is not None:",
+            "lineNumber": 179
+          },
+          {
+            "text": "            return _redis",
+            "lineNumber": 180
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 181
+          },
+          {
+            "text": "            from redis.asyncio import Redis",
+            "lineNumber": 182
+          },
+          {
+            "text": "            if use_sentinel:",
+            "lineNumber": 183
+          },
+          {
+            "text": "                from redis.asyncio.sentinel import Sentinel",
+            "lineNumber": 184
+          },
+          {
+            "text": "                nodes = _parse_sentinel_nodes(sentinel_nodes_str)",
+            "lineNumber": 185
+          },
+          {
+            "text": "                if not nodes:",
+            "lineNumber": 186
+          },
+          {
+            "text": "                    raise ValueError(\"redis_sentinel_nodes 解析后为空\")",
+            "lineNumber": 187
+          },
+          {
+            "text": "                sentinel = Sentinel(",
+            "lineNumber": 188
+          },
+          {
+            "text": "                    nodes,",
+            "lineNumber": 189
+          },
+          {
+            "text": "                    socket_timeout=getattr(settings, \"redis_socket_connect_timeout\", 2.0),",
+            "lineNumber": 190
+          },
+          {
+            "text": "                )",
+            "lineNumber": 191
+          },
+          {
+            "text": "                _redis = sentinel.master_for(",
+            "lineNumber": 192
+          },
+          {
+            "text": "                    sentinel_name,",
+            "lineNumber": 193
+          },
+          {
+            "text": "                    decode_responses=True,",
+            "lineNumber": 194
+          },
+          {
+            "text": "                    socket_timeout=getattr(settings, \"redis_socket_timeout\", 5.0),",
+            "lineNumber": 195
+          },
+          {
+            "text": "                )",
+            "lineNumber": 196
+          },
+          {
+            "text": "                logger.info(\"Redis 已通过 Sentinel 连接: service=%s\", sentinel_name)",
+            "lineNumber": 197
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 198
+          },
+          {
+            "text": "                _redis = Redis.from_url(",
+            "lineNumber": 199
+          },
+          {
+            "text": "                    settings.redis_url,",
+            "lineNumber": 200
+          },
+          {
+            "text": "                    decode_responses=True,",
+            "lineNumber": 201
+          },
+          {
+            "text": "                    socket_connect_timeout=getattr(settings, \"redis_socket_connect_timeout\", 2.0),",
+            "lineNumber": 202
+          },
+          {
+            "text": "                    socket_timeout=getattr(settings, \"redis_socket_timeout\", 5.0),",
+            "lineNumber": 203
+          },
+          {
+            "text": "                    health_check_interval=getattr(settings, \"redis_health_check_interval\", 30) or 0,",
+            "lineNumber": 204
+          },
+          {
+            "text": "                    max_connections=getattr(settings, \"redis_max_connections\", 10),",
+            "lineNumber": 205
+          },
+          {
+            "text": "                )",
+            "lineNumber": 206
+          },
+          {
+            "text": "            return _redis",
+            "lineNumber": 207
+          },
+          {
+            "text": "        except Exception as e:",
+            "lineNumber": 208
+          },
+          {
+            "text": "            logger.exception(\"Redis 连接失败，问答缓存将不可用: %s\", e)",
+            "lineNumber": 209
+          },
+          {
+            "text": "            return None",
+            "lineNumber": 210,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 211
+          },
+          {
+            "lineNumber": 212
+          },
+          {
+            "text": "def _invalidate_redis() -&gt; None:",
+            "lineNumber": 213,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 214
+          }
+        ]
+      },
+      "score": 0.35254618525505066
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/TECH_REVIEW_AND_OPTIMIZATION.md",
+        "range": {
+          "startPosition": {
+            "line": 36
+          },
+          "endPosition": {
+            "line": 82
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "| **db_resilience** | PostgreSQL / SQLite / Milvus 连接池、重试、熔断、降级 | ✅ 已覆盖 |",
+            "lineNumber": 37
+          },
+          {
+            "text": "| **llm** | DeepSeek 多 endpoint、负载均衡、熔断 | ✅ 多节点时自动切换；单节点无重试 |",
+            "lineNumber": 38
+          },
+          {
+            "text": "| **answer_cache** | Redis 问答缓存、防击穿、本地 LRU | ✅ 断线懒重连；无 Redis 探活 |",
+            "lineNumber": 39
+          },
+          {
+            "text": "| **graph/app** | LangGraph 图、MemorySaver / Redis checkpointer | 依赖 Redis 时无降级 |",
+            "lineNumber": 40
+          },
+          {
+            "text": "| **doc/mineru_client** | MinerU 文档解析、信号量限流 | ❌ 无重试 |",
+            "lineNumber": 41
+          },
+          {
+            "text": "| **kb/rag** | BM25 + Milvus 混合检索 | ✅ 通过 db_resilience |",
+            "lineNumber": 42
+          },
+          {
+            "text": "| **kb/text2sql** | 自然语言转 SQL | ✅ 通过 db_resilience |",
+            "lineNumber": 43
+          },
+          {
+            "lineNumber": 44
+          },
+          {
+            "text": "### 1.2 请求链路与外部依赖",
+            "lineNumber": 45
+          },
+          {
+            "lineNumber": 46
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 47
+          },
+          {
+            "text": "客户端",
+            "lineNumber": 48
+          },
+          {
+            "text": "  → FastAPI (async)",
+            "lineNumber": 49
+          },
+          {
+            "text": "  → 会话恢复（PostgreSQL / Redis checkpointer）",
+            "lineNumber": 50
+          },
+          {
+            "text": "  → 轮数检查（max_conversation_turns=15）",
+            "lineNumber": 51
+          },
+          {
+            "text": "  → 问答缓存（Redis get_cached_answer + 防击穿锁）",
+            "lineNumber": 52
+          },
+          {
+            "text": "  → LangGraph ainvoke / 流式",
+            "lineNumber": 53
+          },
+          {
+            "text": "      → Supervisor → Chat / Knowledge Agent",
+            "lineNumber": 54
+          },
+          {
+            "text": "          → KnowledgeEngine",
+            "lineNumber": 55
+          },
+          {
+            "text": "              → QA Store（本地 JSON）",
+            "lineNumber": 56
+          },
+          {
+            "text": "              → Text2SQL（PostgreSQL via db_resilience）",
+            "lineNumber": 57
+          },
+          {
+            "text": "              → RAG（Milvus via db_resilience + BM25）",
+            "lineNumber": 58
+          },
+          {
+            "text": "              → LLM（DeepSeek via llm 路由）",
+            "lineNumber": 59
+          },
+          {
+            "text": "  → 写缓存、持久化（chat_history、qa_monitoring）",
+            "lineNumber": 60
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 61
+          },
+          {
+            "lineNumber": 62
+          },
+          {
+            "text": "| 依赖 | 用途 | 韧性 |",
+            "lineNumber": 63
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 64
+          },
+          {
+            "text": "| DeepSeek API | 大模型 | 多 endpoint 熔断；单 endpoint 无重试 |",
+            "lineNumber": 65
+          },
+          {
+            "text": "| BGE-M3 / Reranker | 向量/重排 | 进程内，无外部依赖 |",
+            "lineNumber": 66
+          },
+          {
+            "text": "| Milvus | 向量检索 | 重试 + 熔断 + 懒重连 |",
+            "lineNumber": 67
+          },
+          {
+            "text": "| PostgreSQL | 对话历史、QA 监控、Text2SQL | 重试 + 熔断 + 降级 |",
+            "lineNumber": 68
+          },
+          {
+            "text": "| Redis | 问答缓存、可选 checkpointer | 断线懒重连；无探活 |",
+            "lineNumber": 69
+          },
+          {
+            "text": "| MinerU | 文档解析 | 信号量限流；❌ 无重试 |",
+            "lineNumber": 70
+          },
+          {
+            "lineNumber": 71
+          },
+          {
+            "text": "---",
+            "lineNumber": 72
+          },
+          {
+            "lineNumber": 73
+          },
+          {
+            "text": "## 二、高并发性能",
+            "lineNumber": 74
+          },
+          {
+            "lineNumber": 75
+          },
+          {
+            "text": "### 2.1 现状",
+            "lineNumber": 76
+          },
+          {
+            "lineNumber": 77
+          },
+          {
+            "text": "| 维度 | 实现 | 配置 |",
+            "lineNumber": 78
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 79
+          },
+          {
+            "text": "| 异步路径 | API、图、知识库、MinerU 均 async；同步 IO 用 &#96;asyncio.to_thread&#96; | - |",
+            "lineNumber": 80
+          },
+          {
+            "text": "| 线程池 | 可选 &#96;asyncio_thread_pool_workers&#96;，lifespan 中设置 | 默认 0（用 Python 默认池） |",
+            "lineNumber": 81
+          },
+          {
+            "text": "| 连接池 | PostgreSQL: 5+10；Redis: 10；asyncpg: 10 | &#96;redis_max_connections&#96; 可配，DB 池参数硬编码 |",
+            "lineNumber": 82
+          }
+        ]
+      },
+      "score": 0.34685879945755005
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 394,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 395,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "def query_stream(self, question: str):",
+            "lineNumber": 394
+          },
+          {
+            "lineNumber": 431
+          },
+          {
+            "text": "        if not rag_result.chunks:",
+            "lineNumber": 432
+          },
+          {
+            "text": "            trace.final_status = \"rag_no_hit\"",
+            "lineNumber": 433
+          },
+          {
+            "text": "            trace.fallback_reason = \"no_retrieval_hit\"",
+            "lineNumber": 434
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(\"未找到相关知识，建议您换个问法或转人工客服。\"):",
+            "lineNumber": 435
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 436
+          },
+          {
+            "text": "            return",
+            "lineNumber": 437
+          },
+          {
+            "lineNumber": 438
+          },
+          {
+            "text": "        # 为了在返回前做“答案-文档相关度校验 + 最多 3 次重生成”，这里先生成最终答案，再按块输出。",
+            "lineNumber": 439
+          },
+          {
+            "text": "        answer_text = self._generate_grounded_answer(question, rag_result, trace=trace)",
+            "lineNumber": 440
+          },
+          {
+            "text": "        for c in self._yield_text_chunked(answer_text):",
+            "lineNumber": 441
+          },
+          {
+            "text": "            yield c",
+            "lineNumber": 442
+          },
+          {
+            "lineNumber": 443
+          },
+          {
+            "text": "        sources_block = _format_sources(rag_result)",
+            "lineNumber": 444
+          },
+          {
+            "text": "        if sources_block:",
+            "lineNumber": 445
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(\"\\n\\n\" + sources_block):",
+            "lineNumber": 446
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 447
+          },
+          {
+            "lineNumber": 448
+          },
+          {
+            "text": "    async def aquery(self, question: str) -&gt; Tuple[str, Optional[str]]:",
+            "lineNumber": 449
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 450
+          },
+          {
+            "text": "        异步：分步执行，仅 CPU/同步 IO 用线程池，RAG 生成用 ainvoke 不占线程，支持高并发。",
+            "lineNumber": 451
+          },
+          {
+            "text": "        返回 (回复文案, 待确认 SQL 或 None)。",
+            "lineNumber": 452
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 453
+          },
+          {
+            "text": "        trace = self._reset_trace()",
+            "lineNumber": 454
+          },
+          {
+            "text": "        # 1) QA",
+            "lineNumber": 455
+          },
+          {
+            "text": "        answer = await asyncio.to_thread(self.qa.find, question)",
+            "lineNumber": 456
+          },
+          {
+            "text": "        if answer:",
+            "lineNumber": 457
+          },
+          {
+            "text": "            trace.route = \"qa\"",
+            "lineNumber": 458
+          },
+          {
+            "text": "            trace.final_status = \"qa_hit\"",
+            "lineNumber": 459
+          },
+          {
+            "text": "            return (answer, None)",
+            "lineNumber": 460
+          },
+          {
+            "text": "        # 2) Text2SQL",
+            "lineNumber": 461
+          },
+          {
+            "text": "        result = await asyncio.to_thread(self.text2sql.query, question)",
+            "lineNumber": 462
+          },
+          {
+            "text": "        if result is not None:",
+            "lineNumber": 463
+          },
+          {
+            "text": "            trace.route = \"text2sql\"",
+            "lineNumber": 464
+          },
+          {
+            "text": "            if isinstance(result, Text2SQLConfirmRequired):",
+            "lineNumber": 465
+          },
+          {
+            "text": "                trace.final_status = \"text2sql_pending\"",
+            "lineNumber": 466
+          },
+          {
+            "text": "                trace.pending_sql = True",
+            "lineNumber": 467
+          },
+          {
+            "text": "                return (result.message, result.sql)",
+            "lineNumber": 468
+          },
+          {
+            "text": "            trace.final_status = \"text2sql_answer\"",
+            "lineNumber": 469
+          },
+          {
+            "text": "            return (result, None)",
+            "lineNumber": 470
+          },
+          {
+            "text": "        # 3) RAG：检索在线程池，生成用 ainvoke",
+            "lineNumber": 471
+          },
+          {
+            "text": "        trace.route = \"rag\"",
+            "lineNumber": 472
+          },
+          {
+            "text": "        rag_result = await asyncio.to_thread(",
+            "lineNumber": 473
+          },
+          {
+            "text": "            self.rag.retrieve_with_validation,",
+            "lineNumber": 474
+          },
+          {
+            "text": "            question, top_k=10",
+            "lineNumber": 475
+          }
+        ]
+      },
+      "score": 0.3385719656944275
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 109,
+            "column": 9
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 114
+          },
+          {
+            "text": "    知识库问答统一入口：按顺序尝试 QA 精准匹配 → Text2SQL → RAG。",
+            "lineNumber": 115
+          },
+          {
+            "text": "    其中 RAG 生成阶段使用的 LLM 仅限 DeepSeek（_get_llm），不调用 OpenAI。",
+            "lineNumber": 116
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 117
+          },
+          {
+            "lineNumber": 118
+          },
+          {
+            "text": "    def __init__(self):",
+            "lineNumber": 119
+          },
+          {
+            "text": "        \"\"\"初始化 QA 库、Text2SQL、RAG 检索器及 RAG 用 LLM 链（仅 DeepSeek）。\"\"\"",
+            "lineNumber": 120
+          },
+          {
+            "text": "        self.qa = QAStore()",
+            "lineNumber": 121
+          },
+          {
+            "text": "        self.text2sql = Text2SQL()",
+            "lineNumber": 122
+          },
+          {
+            "text": "        self.rag = get_rag_retriever()",
+            "lineNumber": 123
+          },
+          {
+            "text": "        self._llm = _get_llm()  # 仅 DeepSeek，禁止 OpenAI",
+            "lineNumber": 124
+          },
+          {
+            "text": "        self._rag_chain = _RAG_PROMPT | self._llm",
+            "lineNumber": 125
+          },
+          {
+            "text": "        self._last_trace = KnowledgeQueryTrace(final_status=\"init\")",
+            "lineNumber": 126
+          },
+          {
+            "lineNumber": 127
+          },
+          {
+            "text": "    def _reset_trace(self) -&gt; KnowledgeQueryTrace:",
+            "lineNumber": 128
+          },
+          {
+            "text": "        \"\"\"开始一次新的知识库问答前重置 trace。\"\"\"",
+            "lineNumber": 129
+          },
+          {
+            "lineNumber": 130
+          },
+          {
+            "text": "        self._last_trace = KnowledgeQueryTrace()",
+            "lineNumber": 131
+          },
+          {
+            "text": "        return self._last_trace",
+            "lineNumber": 132
+          },
+          {
+            "lineNumber": 133
+          },
+          {
+            "text": "    def get_last_trace(self) -&gt; dict[str, Any]:",
+            "lineNumber": 134
+          },
+          {
+            "text": "        \"\"\"返回最近一次 query / aquery / aquery_stream 的追踪信息。\"\"\"",
+            "lineNumber": 135
+          },
+          {
+            "lineNumber": 136
+          },
+          {
+            "text": "        return deepcopy(self._last_trace.to_dict())",
+            "lineNumber": 137
+          },
+          {
+            "lineNumber": 138
+          },
+          {
+            "text": "    def _build_rag_context(self, rag_result: RAGRetrieveResult) -&gt; str:",
+            "lineNumber": 139
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 140
+          }
+        ]
+      },
+      "score": 0.3320474624633789
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="semantic_search_full">
+<details>
+<summary>Tool use: **semantic_search_full**</summary>
+
+
+Parameters:
+
+```json
+{
+  "query": "Fallback or degradation when LLM or service fails?",
+  "topK": 10,
+  "explanation": ""
+}
+```
+Result:
+
+```json
+{
+  "codeResults": [
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 49
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# src/llm.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "大模型调用统一入口。",
+            "lineNumber": 3
+          },
+          {
+            "lineNumber": 4
+          },
+          {
+            "text": "本项目仅使用 DeepSeek（如 DeepSeek R1），禁止调用 OpenAI 自有模型（如 GPT-4）。",
+            "lineNumber": 5
+          },
+          {
+            "text": "在单一 API 基础上补充了多 Key/多 endpoint 负载均衡、失败熔断与自动切换：",
+            "lineNumber": 6
+          },
+          {
+            "text": "- 默认仍兼容原有 &#96;OPENAI_API_BASE&#96; + &#96;OPENAI_API_KEY&#96; 配置；",
+            "lineNumber": 7
+          },
+          {
+            "text": "- 若配置 &#96;DEEPSEEK_API_ENDPOINTS&#96;，则按“权重 + 当前并发负载”优先选择健康节点；",
+            "lineNumber": 8
+          },
+          {
+            "text": "- 连续失败达到阈值后暂时熔断，避免把流量持续打到异常节点。",
+            "lineNumber": 9
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 10
+          },
+          {
+            "lineNumber": 11
+          },
+          {
+            "text": "from __future__ import annotations",
+            "lineNumber": 12
+          },
+          {
+            "lineNumber": 13
+          },
+          {
+            "text": "import logging",
+            "lineNumber": 14
+          },
+          {
+            "text": "import threading",
+            "lineNumber": 15
+          },
+          {
+            "text": "import time",
+            "lineNumber": 16
+          },
+          {
+            "text": "from contextvars import ContextVar",
+            "lineNumber": 17
+          },
+          {
+            "text": "from dataclasses import dataclass, field",
+            "lineNumber": 18
+          },
+          {
+            "text": "from typing import Any, AsyncIterator, Iterator, Optional",
+            "lineNumber": 19
+          },
+          {
+            "lineNumber": 20
+          },
+          {
+            "text": "from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun",
+            "lineNumber": 21
+          },
+          {
+            "text": "from langchain_core.language_models import BaseChatModel",
+            "lineNumber": 22
+          },
+          {
+            "text": "from langchain_core.outputs import ChatGenerationChunk, ChatResult",
+            "lineNumber": 23
+          },
+          {
+            "text": "from pydantic import ConfigDict, PrivateAttr",
+            "lineNumber": 24
+          },
+          {
+            "lineNumber": 25
+          },
+          {
+            "text": "from config import get_settings",
+            "lineNumber": 26
+          },
+          {
+            "lineNumber": 27
+          },
+          {
+            "text": "logger = logging.getLogger(__name__)",
+            "lineNumber": 28
+          },
+          {
+            "text": "_LAST_ENDPOINT_NAME: ContextVar[str] = ContextVar(\"deepseek_last_endpoint_name\", default=\"\")",
+            "lineNumber": 29
+          },
+          {
+            "lineNumber": 30
+          },
+          {
+            "lineNumber": 31
+          },
+          {
+            "text": "def _is_retryable_error(exc: Exception) -&gt; bool:",
+            "lineNumber": 32,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"识别适合切换到其它节点重试的错误：超时、连接错误、429 与 5xx。\"\"\"",
+            "lineNumber": 33
+          },
+          {
+            "lineNumber": 34
+          },
+          {
+            "text": "    status_code = str(getattr(exc, \"status_code\", \"\") or \"\")",
+            "lineNumber": 35
+          },
+          {
+            "text": "    msg = (str(exc) or \"\").lower()",
+            "lineNumber": 36
+          },
+          {
+            "text": "    retryable_keywords = (\"timeout\", \"timed out\", \"connection\", \"temporarily\", \"rate limit\", \"429\")",
+            "lineNumber": 37
+          },
+          {
+            "text": "    if any(keyword in msg for keyword in retryable_keywords):",
+            "lineNumber": 38
+          },
+          {
+            "text": "        return True",
+            "lineNumber": 39
+          },
+          {
+            "text": "    return status_code.startswith(\"5\") or status_code == \"429\"",
+            "lineNumber": 40,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 41
+          },
+          {
+            "lineNumber": 42
+          },
+          {
+            "text": "@dataclass",
+            "lineNumber": 43
+          },
+          {
+            "text": "class _EndpointConfig:",
+            "lineNumber": 44,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"单个 DeepSeek 接入点配置。\"\"\"",
+            "lineNumber": 45
+          }
+        ]
+      },
+      "score": 0.40322640538215637
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/agents/supervisor.py",
+        "range": {
+          "startPosition": {
+            "line": 132,
+            "column": 95
+          },
+          "endPosition": {
+            "line": 172
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "async def supervisor_node_async(state: AgentState) -&gt; dict:",
+            "lineNumber": 136,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 137
+          },
+          {
+            "text": "    总控节点（异步）：混合规则 + LLM。规则能判则直接路由不调模型，歧义时再调 DeepSeek。",
+            "lineNumber": 138
+          },
+          {
+            "text": "    异常时返回需人工提示并结束本轮；可重试错误会重试若干次。",
+            "lineNumber": 139
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 140
+          },
+          {
+            "text": "    last = _get_last_user_text(state)",
+            "lineNumber": 141
+          },
+          {
+            "text": "    if not last:",
+            "lineNumber": 142
+          },
+          {
+            "text": "        return {\"next\": \"chat\"}",
+            "lineNumber": 143
+          },
+          {
+            "text": "    intent = _rule_based_intent(last)",
+            "lineNumber": 144
+          },
+          {
+            "text": "    if intent is not None:",
+            "lineNumber": 145
+          },
+          {
+            "text": "        return {\"next\": intent}",
+            "lineNumber": 146
+          },
+          {
+            "lineNumber": 147
+          },
+          {
+            "text": "    chain = _SUPERVISOR_PROMPT | _llm",
+            "lineNumber": 148
+          },
+          {
+            "text": "    max_retries = max(0, getattr(_settings, \"agent_llm_retry_times\", 2))",
+            "lineNumber": 149
+          },
+          {
+            "text": "    last_error = None",
+            "lineNumber": 150
+          },
+          {
+            "text": "    for attempt in range(max_retries + 1):",
+            "lineNumber": 151
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 152
+          },
+          {
+            "text": "            messages_to_send = await _messages_for_llm_with_summary(state)",
+            "lineNumber": 153
+          },
+          {
+            "text": "            response = await chain.ainvoke({\"messages\": messages_to_send})",
+            "lineNumber": 154
+          },
+          {
+            "text": "            out = (response.content or \"\").strip().lower()",
+            "lineNumber": 155
+          },
+          {
+            "text": "            if \"knowledge\" in out:",
+            "lineNumber": 156
+          },
+          {
+            "text": "                next_action: NextAction = \"knowledge\"",
+            "lineNumber": 157
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 158
+          },
+          {
+            "text": "                next_action = \"chat\"",
+            "lineNumber": 159
+          },
+          {
+            "text": "            return {\"next\": next_action}",
+            "lineNumber": 160
+          },
+          {
+            "text": "        except Exception as e:",
+            "lineNumber": 161
+          },
+          {
+            "text": "            last_error = e",
+            "lineNumber": 162
+          },
+          {
+            "text": "            if attempt &lt; max_retries and _is_retryable_error(e):",
+            "lineNumber": 163
+          },
+          {
+            "text": "                continue",
+            "lineNumber": 164
+          },
+          {
+            "text": "            break",
+            "lineNumber": 165
+          },
+          {
+            "text": "    # 重试耗尽后转人工，避免直接抛错导致 500",
+            "lineNumber": 166
+          },
+          {
+            "text": "    reply = getattr(_settings, \"agent_need_human_reply\", \"当前服务暂时异常，请稍后重试或转人工客服。\")",
+            "lineNumber": 167
+          },
+          {
+            "text": "    return {\"next\": \"human\", \"human_message\": reply}",
+            "lineNumber": 168,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 169
+          },
+          {
+            "lineNumber": 170
+          },
+          {
+            "text": "def route_to_agent(state: AgentState) -&gt; NextAction:",
+            "lineNumber": 171,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 172
+          }
+        ]
+      },
+      "score": 0.39951661229133606
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/TECH_REVIEW_AND_OPTIMIZATION.md",
+        "range": {
+          "startPosition": {
+            "line": 80
+          },
+          "endPosition": {
+            "line": 129
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "| 线程池 | 可选 &#96;asyncio_thread_pool_workers&#96;，lifespan 中设置 | 默认 0（用 Python 默认池） |",
+            "lineNumber": 81
+          },
+          {
+            "text": "| 连接池 | PostgreSQL: 5+10；Redis: 10；asyncpg: 10 | &#96;redis_max_connections&#96; 可配，DB 池参数硬编码 |",
+            "lineNumber": 82
+          },
+          {
+            "text": "| 限流 | MinerU: Semaphore(5) | &#96;mineru_concurrency_limit&#96; 可配 |",
+            "lineNumber": 83
+          },
+          {
+            "text": "| 缓存 | Redis 问答缓存 + 防击穿 + 可选本地 LRU | 已配置化 |",
+            "lineNumber": 84
+          },
+          {
+            "lineNumber": 85
+          },
+          {
+            "text": "### 2.2 缺口",
+            "lineNumber": 86
+          },
+          {
+            "lineNumber": 87
+          },
+          {
+            "text": "| 缺口 | 影响 | 位置 |",
+            "lineNumber": 88
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 89
+          },
+          {
+            "text": "| **无 API 全局限流** | 突发流量打满线程池/DB/LLM，导致雪崩 | api/main.py |",
+            "lineNumber": 90
+          },
+          {
+            "text": "| **DB 连接池参数不可配** | 高并发时无法按负载调优 | db_resilience.py |",
+            "lineNumber": 91
+          },
+          {
+            "text": "| **无 RAG 检索缓存** | 相同问题重复检索 Milvus + BM25，浪费资源 | kb/rag.py |",
+            "lineNumber": 92
+          },
+          {
+            "text": "| **多 worker 时内存状态不共享** | &#96;_parse_cache&#96;、&#96;_pending_sql&#96;、&#96;_interrupted_threads&#96; 在进程间隔离 | api/main.py |",
+            "lineNumber": 93
+          },
+          {
+            "lineNumber": 94
+          },
+          {
+            "text": "---",
+            "lineNumber": 95
+          },
+          {
+            "lineNumber": 96
+          },
+          {
+            "text": "## 三、稳定性",
+            "lineNumber": 97
+          },
+          {
+            "lineNumber": 98
+          },
+          {
+            "text": "### 3.1 现状",
+            "lineNumber": 99
+          },
+          {
+            "lineNumber": 100
+          },
+          {
+            "text": "| 维度 | 实现 |",
+            "lineNumber": 101
+          },
+          {
+            "text": "|------|------|",
+            "lineNumber": 102
+          },
+          {
+            "text": "| 错误处理 | 各层 try/except；部分异常未细分 |",
+            "lineNumber": 103
+          },
+          {
+            "text": "| 重试 | DB: 2 次；LLM: 多 endpoint 自动切换；Text2SQL: 执行错误 1 次 |",
+            "lineNumber": 104
+          },
+          {
+            "text": "| 熔断 | DB: 5 次；Milvus: 3 次；LLM: 3 次（可配置） |",
+            "lineNumber": 105
+          },
+          {
+            "text": "| 降级 | chat_history / qa_monitoring / Milvus 返回空或默认值 |",
+            "lineNumber": 106
+          },
+          {
+            "text": "| 超时 | agent_request_timeout=120s；LLM timeout；MinerU 120s |",
+            "lineNumber": 107
+          },
+          {
+            "lineNumber": 108
+          },
+          {
+            "text": "### 3.2 缺口",
+            "lineNumber": 109
+          },
+          {
+            "lineNumber": 110
+          },
+          {
+            "text": "| 缺口 | 影响 | 位置 |",
+            "lineNumber": 111
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 112
+          },
+          {
+            "text": "| **MinerU 无重试** | 5xx/超时/网络抖动直接失败，用户需手动重传 | mineru_client.py L393-427 |",
+            "lineNumber": 113
+          },
+          {
+            "text": "| **LLM 单 endpoint 无重试** | 单节点时一次失败即返回错误 | llm.py |",
+            "lineNumber": 114
+          },
+          {
+            "text": "| **DB 单条 SQL 无 statement_timeout** | 慢 SQL 长时间占用连接 | db_resilience.py |",
+            "lineNumber": 115
+          },
+          {
+            "text": "| **熔断参数分散** | DB/Milvus 阈值硬编码，运维无法统一调优 | db_resilience.py |",
+            "lineNumber": 116
+          },
+          {
+            "lineNumber": 117
+          },
+          {
+            "text": "---",
+            "lineNumber": 118
+          },
+          {
+            "lineNumber": 119
+          },
+          {
+            "text": "## 四、可用性",
+            "lineNumber": 120
+          },
+          {
+            "lineNumber": 121
+          },
+          {
+            "text": "### 4.1 现状",
+            "lineNumber": 122
+          },
+          {
+            "lineNumber": 123
+          },
+          {
+            "text": "| 维度 | 实现 |",
+            "lineNumber": 124
+          },
+          {
+            "text": "|------|------|",
+            "lineNumber": 125
+          },
+          {
+            "text": "| 单点故障 | LLM 多 endpoint；DB/Milvus 熔断降级 |",
+            "lineNumber": 126
+          },
+          {
+            "text": "| 健康检查 | &#96;/health&#96; 仅返回 &#96;{\"status\":\"ok\"}&#96; |",
+            "lineNumber": 127
+          },
+          {
+            "text": "| 优雅关闭 | lifespan 中关闭 Redis、dispose DB、取消 keepalive |",
+            "lineNumber": 128
+          }
+        ]
+      },
+      "score": 0.3735499083995819
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {
+            "line": 320,
+            "column": 5
+          },
+          "endPosition": {
+            "line": 480
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "class _DeepSeekChatRouter(BaseChatModel):",
+            "lineNumber": 324,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"把 LangChain ChatModel 请求路由到健康的 DeepSeek endpoint。\"\"\"",
+            "lineNumber": 325
+          },
+          {
+            "lineNumber": 326
+          },
+          {
+            "text": "    model_name: str = \"deepseek-chat\"",
+            "lineNumber": 327
+          },
+          {
+            "text": "    temperature: float = 0.0",
+            "lineNumber": 328
+          },
+          {
+            "lineNumber": 329
+          },
+          {
+            "text": "    model_config = ConfigDict(arbitrary_types_allowed=True)",
+            "lineNumber": 330
+          },
+          {
+            "lineNumber": 331
+          },
+          {
+            "text": "    _pool: _DeepSeekEndpointPool = PrivateAttr()",
+            "lineNumber": 332
+          },
+          {
+            "lineNumber": 333
+          },
+          {
+            "text": "    def __init__(self, **data: Any):",
+            "lineNumber": 334
+          },
+          {
+            "text": "        pool = data.pop(\"pool\")",
+            "lineNumber": 335
+          },
+          {
+            "text": "        super().__init__(**data)",
+            "lineNumber": 336
+          },
+          {
+            "text": "        self._pool = pool",
+            "lineNumber": 337
+          },
+          {
+            "lineNumber": 338
+          },
+          {
+            "text": "    @property",
+            "lineNumber": 339
+          },
+          {
+            "text": "    def _llm_type(self) -&gt; str:",
+            "lineNumber": 340
+          },
+          {
+            "text": "        return \"deepseek-router\"",
+            "lineNumber": 341
+          },
+          {
+            "lineNumber": 342
+          },
+          {
+            "text": "    @property",
+            "lineNumber": 343
+          },
+          {
+            "text": "    def _identifying_params(self) -&gt; dict[str, Any]:",
+            "lineNumber": 344
+          },
+          {
+            "text": "        return {\"model_name\": self.model_name, \"temperature\": self.temperature}",
+            "lineNumber": 345
+          },
+          {
+            "lineNumber": 346
+          },
+          {
+            "text": "    def _generate(",
+            "lineNumber": 347
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 348
+          },
+          {
+            "text": "        messages: list,",
+            "lineNumber": 349
+          },
+          {
+            "text": "        stop: Optional[list[str]] = None,",
+            "lineNumber": 350
+          },
+          {
+            "text": "        run_manager: Optional[CallbackManagerForLLMRun] = None,",
+            "lineNumber": 351
+          },
+          {
+            "text": "        **kwargs: Any,",
+            "lineNumber": 352
+          },
+          {
+            "text": "    ) -&gt; ChatResult:",
+            "lineNumber": 353
+          },
+          {
+            "text": "        last_error: Optional[Exception] = None",
+            "lineNumber": 354
+          },
+          {
+            "text": "        candidates = self._pool.ordered_candidates()",
+            "lineNumber": 355
+          },
+          {
+            "text": "        retries = max(0, int(getattr(get_settings(), \"agent_llm_retry_times\", 2)))",
+            "lineNumber": 356
+          },
+          {
+            "text": "        for state in candidates:",
+            "lineNumber": 357
+          },
+          {
+            "text": "            client = self._pool.get_client(state, self.model_name, self.temperature)",
+            "lineNumber": 358
+          },
+          {
+            "text": "            for attempt in range(retries + 1 if len(candidates) == 1 else 1):",
+            "lineNumber": 359
+          },
+          {
+            "text": "                self._pool.acquire(state)",
+            "lineNumber": 360
+          },
+          {
+            "text": "                try:",
+            "lineNumber": 361
+          },
+          {
+            "text": "                    _LAST_ENDPOINT_NAME.set(state.config.name or \"\")",
+            "lineNumber": 362
+          },
+          {
+            "text": "                    result = client._generate(messages, stop=stop, run_manager=run_manager, **kwargs)",
+            "lineNumber": 363
+          },
+          {
+            "text": "                    self._pool.release_success(state)",
+            "lineNumber": 364
+          },
+          {
+            "text": "                    return result",
+            "lineNumber": 365
+          },
+          {
+            "text": "                except Exception as exc:",
+            "lineNumber": 366
+          },
+          {
+            "text": "                    self._pool.release_failure(state, exc)",
+            "lineNumber": 367
+          },
+          {
+            "text": "                    last_error = exc",
+            "lineNumber": 368
+          },
+          {
+            "text": "                    if not _is_retryable_error(exc):",
+            "lineNumber": 369
+          },
+          {
+            "text": "                        raise",
+            "lineNumber": 370
+          },
+          {
+            "text": "                    if attempt &lt; retries and len(candidates) == 1:",
+            "lineNumber": 371
+          },
+          {
+            "text": "                        time.sleep(1.0 * (2 ** attempt))",
+            "lineNumber": 372
+          },
+          {
+            "text": "                        continue",
+            "lineNumber": 373
+          },
+          {
+            "text": "                    break",
+            "lineNumber": 374
+          },
+          {
+            "text": "        if last_error is not None:",
+            "lineNumber": 375
+          },
+          {
+            "text": "            raise last_error",
+            "lineNumber": 376
+          },
+          {
+            "text": "        raise RuntimeError(\"未配置可用的 DeepSeek endpoint。\")",
+            "lineNumber": 377
+          },
+          {
+            "lineNumber": 378
+          },
+          {
+            "text": "    async def _agenerate(",
+            "lineNumber": 379
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 380
+          },
+          {
+            "text": "        messages: list,",
+            "lineNumber": 381
+          },
+          {
+            "text": "        stop: Optional[list[str]] = None,",
+            "lineNumber": 382
+          },
+          {
+            "text": "        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,",
+            "lineNumber": 383
+          },
+          {
+            "text": "        **kwargs: Any,",
+            "lineNumber": 384
+          },
+          {
+            "text": "    ) -&gt; ChatResult:",
+            "lineNumber": 385
+          },
+          {
+            "text": "        ",
+            "lineNumber": 386
+          }
+        ]
+      },
+      "score": 0.3570931851863861
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/DB_RESILIENCE.md",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 49
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# 数据库连接韧性与高并发应对",
+            "lineNumber": 1
+          },
+          {
+            "lineNumber": 2
+          },
+          {
+            "text": "## 一、概述",
+            "lineNumber": 3
+          },
+          {
+            "lineNumber": 4
+          },
+          {
+            "text": "所有数据库连接（PostgreSQL、SQLite、Milvus）统一通过 &#96;src/db_resilience.py&#96; 管理，提供：",
+            "lineNumber": 5
+          },
+          {
+            "text": "- **连接池复用**：按 URI 缓存 Engine / asyncpg Pool / Milvus Collection，避免每次请求建连销毁。",
+            "lineNumber": 6
+          },
+          {
+            "text": "- **自动重试**：连接失败时指数退避重试（默认 2 次）。",
+            "lineNumber": 7
+          },
+          {
+            "text": "- **熔断保护**：连续失败达阈值后短时拒绝请求，避免雪崩。",
+            "lineNumber": 8
+          },
+          {
+            "text": "- **优雅降级**：非关键路径在数据库不可用时返回默认值而非报错。",
+            "lineNumber": 9
+          },
+          {
+            "text": "- **懒重连**：Milvus 连接断开后下次操作自动尝试重连，无需重启服务。",
+            "lineNumber": 10
+          },
+          {
+            "text": "- **高并发限流**：通过连接池大小 + 溢出上限 + 获取超时控制排队。",
+            "lineNumber": 11
+          },
+          {
+            "lineNumber": 12
+          },
+          {
+            "text": "---",
+            "lineNumber": 13
+          },
+          {
+            "lineNumber": 14
+          },
+          {
+            "text": "## 二、架构",
+            "lineNumber": 15
+          },
+          {
+            "lineNumber": 16
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 17
+          },
+          {
+            "text": "请求 → safe_connection() / safe_async_connection()",
+            "lineNumber": 18
+          },
+          {
+            "text": "         ├── 熔断器检查（OPEN → 降级/拒绝）",
+            "lineNumber": 19
+          },
+          {
+            "text": "         ├── 获取 Engine/Pool（复用缓存）",
+            "lineNumber": 20
+          },
+          {
+            "text": "         ├── 获取连接（pool_timeout 排队）",
+            "lineNumber": 21
+          },
+          {
+            "text": "         ├── 成功 → record_success → 恢复 CLOSED",
+            "lineNumber": 22
+          },
+          {
+            "text": "         └── 失败 → record_failure → 指数退避重试",
+            "lineNumber": 23
+          },
+          {
+            "text": "                     └── 连续失败 → 熔断 OPEN（recovery_seconds 后半开探测）",
+            "lineNumber": 24
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 25
+          },
+          {
+            "lineNumber": 26
+          },
+          {
+            "text": "---",
+            "lineNumber": 27
+          },
+          {
+            "lineNumber": 28
+          },
+          {
+            "text": "## 三、熔断器状态机",
+            "lineNumber": 29
+          },
+          {
+            "lineNumber": 30
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 31
+          },
+          {
+            "text": "CLOSED ──(连续 N 次失败)──→ OPEN ──(冷却期到)──→ HALF_OPEN",
+            "lineNumber": 32
+          },
+          {
+            "text": "  ↑                                                    │",
+            "lineNumber": 33
+          },
+          {
+            "text": "  └──────────(探测成功)────────────────────────────────┘",
+            "lineNumber": 34
+          },
+          {
+            "text": "                                                        │",
+            "lineNumber": 35
+          },
+          {
+            "text": "  OPEN ←──────────(探测失败)────────────────────────────┘",
+            "lineNumber": 36
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 37
+          },
+          {
+            "lineNumber": 38
+          },
+          {
+            "text": "| 参数 | 默认值 | 说明 |",
+            "lineNumber": 39
+          },
+          {
+            "text": "|------|--------|------|",
+            "lineNumber": 40
+          },
+          {
+            "text": "| &#96;failure_threshold&#96; | 5 | 连续失败多少次后熔断 |",
+            "lineNumber": 41
+          },
+          {
+            "text": "| &#96;recovery_seconds&#96; | 30 | 熔断持续时间，到期后放行一次探测 |",
+            "lineNumber": 42
+          },
+          {
+            "lineNumber": 43
+          },
+          {
+            "text": "---",
+            "lineNumber": 44
+          },
+          {
+            "lineNumber": 45
+          },
+          {
+            "text": "## 四、连接池参数",
+            "lineNumber": 46
+          },
+          {
+            "lineNumber": 47
+          },
+          {
+            "text": "### 同步（SQLAlchemy Engine）",
+            "lineNumber": 48
+          }
+        ]
+      },
+      "score": 0.35559916496276855
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 464,
+            "column": 48
+          },
+          "endPosition": {
+            "line": 533
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "def milvus_operation_with_retry(",
+            "lineNumber": 468,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 469,
+            "isSignature": true
+          },
+          {
+            "text": "    collection_name: str,",
+            "lineNumber": 470,
+            "isSignature": true
+          },
+          {
+            "text": "    operation,",
+            "lineNumber": 471,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 472,
+            "isSignature": true
+          },
+          {
+            "text": "    retries: int = 2,",
+            "lineNumber": 473,
+            "isSignature": true
+          },
+          {
+            "text": "    retry_delay: float = 0.5,",
+            "lineNumber": 474,
+            "isSignature": true
+          },
+          {
+            "text": "    critical: bool = False,",
+            "lineNumber": 475,
+            "isSignature": true
+          },
+          {
+            "text": "    default=None,",
+            "lineNumber": 476,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 477,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 478
+          },
+          {
+            "text": "    执行 Milvus 操作（search / insert / flush 等），失败时自动重连重试。",
+            "lineNumber": 479
+          },
+          {
+            "lineNumber": 480
+          },
+          {
+            "text": "    参数：",
+            "lineNumber": 481
+          },
+          {
+            "text": "    - operation: 可调用对象，签名 operation(collection) -&gt; result。",
+            "lineNumber": 482
+          },
+          {
+            "text": "    - critical: True 时失败抛异常；False 时返回 default。",
+            "lineNumber": 483
+          },
+          {
+            "text": "    - default: 降级时的默认返回值。",
+            "lineNumber": 484
+          },
+          {
+            "lineNumber": 485
+          },
+          {
+            "text": "    用法：",
+            "lineNumber": 486
+          },
+          {
+            "text": "        results = milvus_operation_with_retry(",
+            "lineNumber": 487
+          },
+          {
+            "text": "            uri, coll_name,",
+            "lineNumber": 488
+          },
+          {
+            "text": "            lambda coll: coll.search(...),",
+            "lineNumber": 489
+          },
+          {
+            "text": "            default=[],",
+            "lineNumber": 490
+          },
+          {
+            "text": "        )",
+            "lineNumber": 491
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 492
+          },
+          {
+            "text": "    breaker = _get_milvus_breaker(uri)",
+            "lineNumber": 493
+          },
+          {
+            "lineNumber": 494
+          },
+          {
+            "text": "    if not breaker.allow_request():",
+            "lineNumber": 495
+          },
+          {
+            "text": "        if critical:",
+            "lineNumber": 496
+          },
+          {
+            "text": "            raise ConnectionError(f\"Milvus 熔断中: {uri[:40]}/{collection_name}\")",
+            "lineNumber": 497
+          },
+          {
+            "text": "        logger.warning(\"Milvus 熔断中，降级处理: %s/%s\", uri[:40], collection_name)",
+            "lineNumber": 498
+          },
+          {
+            "text": "        return default",
+            "lineNumber": 499
+          },
+          {
+            "lineNumber": 500
+          },
+          {
+            "text": "    last_err = None",
+            "lineNumber": 501
+          },
+          {
+            "text": "    for attempt in range(1, retries + 2):",
+            "lineNumber": 502
+          },
+          {
+            "text": "        coll = get_milvus_collection(uri, collection_name)",
+            "lineNumber": 503
+          },
+          {
+            "text": "        if coll is None:",
+            "lineNumber": 504
+          },
+          {
+            "text": "            if critical:",
+            "lineNumber": 505
+          },
+          {
+            "text": "                raise ConnectionError(f\"Milvus collection 不可用: {collection_name}\")",
+            "lineNumber": 506
+          },
+          {
+            "text": "            return default",
+            "lineNumber": 507
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 508
+          },
+          {
+            "text": "            result = operation(coll)",
+            "lineNumber": 509
+          },
+          {
+            "text": "            breaker.record_success()",
+            "lineNumber": 510
+          },
+          {
+            "text": "            return result",
+            "lineNumber": 511
+          },
+          {
+            "text": "        except Exception as e:",
+            "lineNumber": 512
+          },
+          {
+            "text": "            last_err = e",
+            "lineNumber": 513
+          },
+          {
+            "text": "            breaker.record_failure()",
+            "lineNumber": 514
+          },
+          {
+            "text": "            invalidate_milvus_collection(uri, collection_name)",
+            "lineNumber": 515
+          },
+          {
+            "text": "            if attempt &lt;= retries:",
+            "lineNumber": 516
+          },
+          {
+            "text": "                delay = retry_delay * (2 ** (attempt - 1))",
+            "lineNumber": 517
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 518
+          },
+          {
+            "text": "                    \"Milvus 操作失败（第 %d/%d 次），%.1fs 后重试: %s\",",
+            "lineNumber": 519
+          },
+          {
+            "text": "                    attempt, retries + 1, delay, e,",
+            "lineNumber": 520
+          },
+          {
+            "text": "                )",
+            "lineNumber": 521
+          },
+          {
+            "text": "                time.sleep(delay)",
+            "lineNumber": 522
+          },
+          {
+            "lineNumber": 523
+          },
+          {
+            "text": "    if critical:",
+            "lineNumber": 524
+          },
+          {
+            "text": "        raise ConnectionError(f\"Milvus 操作失败（已重试 {retries} 次）: {last_err}\") from last_err",
+            "lineNumber": 525
+          },
+          {
+            "text": "    logger.error(\"Milvus 操作失败（已重试），降级处理: %s\", last_err)",
+            "lineNumber": 526
+          },
+          {
+            "text": "    return default",
+            "lineNumber": 527,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 528
+          },
+          {
+            "lineNumber": 529
+          },
+          {
+            "text": "# ---------- 状态查询 ----------",
+            "lineNumber": 530
+          },
+          {
+            "lineNumber": 531
+          },
+          {
+            "text": "def get_all_breaker_status() -&gt; list:",
+            "lineNumber": 532,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 533
+          }
+        ]
+      },
+      "score": 0.34462666511535645
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {
+            "line": 103
+          },
+          "endPosition": {
+            "line": 284
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 104,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 105,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class _DeepSeekEndpointPool:",
+            "lineNumber": 104,
+            "isSignature": true
+          },
+          {
+            "text": "def acquire(self, state: _EndpointState) -&gt; None:",
+            "lineNumber": 190
+          },
+          {
+            "lineNumber": 203
+          },
+          {
+            "text": "            failures,",
+            "lineNumber": 204
+          },
+          {
+            "text": "        )",
+            "lineNumber": 205
+          },
+          {
+            "lineNumber": 206
+          },
+          {
+            "text": "    def release_success(self, state: _EndpointState) -&gt; None:",
+            "lineNumber": 207
+          },
+          {
+            "text": "        \"\"\"请求成功：关闭熔断并清空连续失败计数。\"\"\"",
+            "lineNumber": 208
+          },
+          {
+            "lineNumber": 209
+          },
+          {
+            "text": "        with self._lock:",
+            "lineNumber": 210
+          },
+          {
+            "text": "            was_open = state.opened_until &gt; time.time()",
+            "lineNumber": 211
+          },
+          {
+            "text": "            state.inflight = max(0, state.inflight - 1)",
+            "lineNumber": 212
+          },
+          {
+            "text": "            state.failures = 0",
+            "lineNumber": 213
+          },
+          {
+            "text": "            state.opened_until = 0.0",
+            "lineNumber": 214
+          },
+          {
+            "text": "            current_inflight = state.inflight",
+            "lineNumber": 215
+          },
+          {
+            "text": "        logger.debug(",
+            "lineNumber": 216
+          },
+          {
+            "text": "            \"LLM endpoint success: name=%s inflight=%s circuit_recovered=%s\",",
+            "lineNumber": 217
+          },
+          {
+            "text": "            state.config.name or \"unknown\",",
+            "lineNumber": 218
+          },
+          {
+            "text": "            current_inflight,",
+            "lineNumber": 219
+          },
+          {
+            "text": "            was_open,",
+            "lineNumber": 220
+          },
+          {
+            "text": "        )",
+            "lineNumber": 221
+          },
+          {
+            "lineNumber": 222
+          },
+          {
+            "text": "    def release_failure(self, state: _EndpointState, exc: Exception) -&gt; None:",
+            "lineNumber": 223
+          },
+          {
+            "text": "        \"\"\"请求失败：若为可切换错误则累计失败并触发熔断。\"\"\"",
+            "lineNumber": 224
+          },
+          {
+            "lineNumber": 225
+          },
+          {
+            "text": "        with self._lock:",
+            "lineNumber": 226
+          },
+          {
+            "text": "            state.inflight = max(0, state.inflight - 1)",
+            "lineNumber": 227
+          },
+          {
+            "text": "            if not _is_retryable_error(exc):",
+            "lineNumber": 228
+          },
+          {
+            "text": "                current_inflight = state.inflight",
+            "lineNumber": 229
+          },
+          {
+            "text": "                error_text = str(exc)",
+            "lineNumber": 230
+          },
+          {
+            "text": "                endpoint_name = state.config.name or \"unknown\"",
+            "lineNumber": 231
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 232
+          },
+          {
+            "text": "                    \"LLM endpoint non-retryable failure: name=%s inflight=%s error=%s\",",
+            "lineNumber": 233
+          },
+          {
+            "text": "                    endpoint_name,",
+            "lineNumber": 234
+          },
+          {
+            "text": "                    current_inflight,",
+            "lineNumber": 235
+          },
+          {
+            "text": "                    error_text,",
+            "lineNumber": 236
+          },
+          {
+            "text": "                )",
+            "lineNumber": 237
+          },
+          {
+            "text": "                return",
+            "lineNumber": 238
+          },
+          {
+            "text": "            state.failures += 1",
+            "lineNumber": 239
+          },
+          {
+            "text": "            current_inflight = state.inflight",
+            "lineNumber": 240
+          },
+          {
+            "text": "            failures = state.failures",
+            "lineNumber": 241
+          },
+          {
+            "text": "            threshold = self._failure_threshold",
+            "lineNumber": 242
+          },
+          {
+            "text": "            error_text = str(exc)",
+            "lineNumber": 243
+          },
+          {
+            "text": "            if state.failures &gt;= self._failure_threshold:",
+            "lineNumber": 244
+          },
+          {
+            "text": "                state.opened_until = time.time() + self._open_seconds",
+            "lineNumber": 245
+          }
+        ]
+      },
+      "score": 0.3380044102668762
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/agents/chat_agent.py",
+        "range": {
+          "startPosition": {
+            "line": 73,
+            "column": 95
+          },
+          "endPosition": {
+            "line": 104
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "async def chat_agent_node_async(state: AgentState) -&gt; dict:",
+            "lineNumber": 77,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"闲聊节点（异步）：不阻塞事件循环。异常时返回需人工提示并结束本轮，可重试错误会重试。\"\"\"",
+            "lineNumber": 78
+          },
+          {
+            "text": "    chain = _CHAT_PROMPT | _llm",
+            "lineNumber": 79
+          },
+          {
+            "text": "    max_retries = max(0, getattr(_settings, \"agent_llm_retry_times\", 2))",
+            "lineNumber": 80
+          },
+          {
+            "text": "    for attempt in range(max_retries + 1):",
+            "lineNumber": 81
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 82
+          },
+          {
+            "text": "            messages_to_send = await _messages_for_llm_with_summary(state)",
+            "lineNumber": 83
+          },
+          {
+            "text": "            response = await chain.ainvoke({\"messages\": messages_to_send})",
+            "lineNumber": 84
+          },
+          {
+            "text": "            return {",
+            "lineNumber": 85
+          },
+          {
+            "text": "                \"messages\": [AIMessage(content=response.content or \"您好，请问有什么可以帮您？\")],",
+            "lineNumber": 86
+          },
+          {
+            "text": "                \"next\": \"__end__\",",
+            "lineNumber": 87
+          },
+          {
+            "text": "                \"route\": \"chat\",",
+            "lineNumber": 88
+          },
+          {
+            "text": "            }",
+            "lineNumber": 89
+          },
+          {
+            "text": "        except Exception as e:",
+            "lineNumber": 90
+          },
+          {
+            "text": "            if attempt &lt; max_retries and _is_retryable_error(e):",
+            "lineNumber": 91
+          },
+          {
+            "text": "                continue",
+            "lineNumber": 92
+          },
+          {
+            "text": "            reply = getattr(_settings, \"agent_need_human_reply\", \"当前服务暂时异常，请稍后重试或转人工客服。\")",
+            "lineNumber": 93
+          },
+          {
+            "text": "            return {\"next\": \"human\", \"human_message\": reply}",
+            "lineNumber": 94,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 95
+          },
+          {
+            "lineNumber": 96
+          },
+          {
+            "text": "def chat_agent_stream(state: AgentState):",
+            "lineNumber": 97,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 98
+          }
+        ]
+      },
+      "score": 0.3376944065093994
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/TECH_REVIEW_AND_OPTIMIZATION.md",
+        "range": {
+          "startPosition": {
+            "line": 36
+          },
+          "endPosition": {
+            "line": 82
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "| **db_resilience** | PostgreSQL / SQLite / Milvus 连接池、重试、熔断、降级 | ✅ 已覆盖 |",
+            "lineNumber": 37
+          },
+          {
+            "text": "| **llm** | DeepSeek 多 endpoint、负载均衡、熔断 | ✅ 多节点时自动切换；单节点无重试 |",
+            "lineNumber": 38
+          },
+          {
+            "text": "| **answer_cache** | Redis 问答缓存、防击穿、本地 LRU | ✅ 断线懒重连；无 Redis 探活 |",
+            "lineNumber": 39
+          },
+          {
+            "text": "| **graph/app** | LangGraph 图、MemorySaver / Redis checkpointer | 依赖 Redis 时无降级 |",
+            "lineNumber": 40
+          },
+          {
+            "text": "| **doc/mineru_client** | MinerU 文档解析、信号量限流 | ❌ 无重试 |",
+            "lineNumber": 41
+          },
+          {
+            "text": "| **kb/rag** | BM25 + Milvus 混合检索 | ✅ 通过 db_resilience |",
+            "lineNumber": 42
+          },
+          {
+            "text": "| **kb/text2sql** | 自然语言转 SQL | ✅ 通过 db_resilience |",
+            "lineNumber": 43
+          },
+          {
+            "lineNumber": 44
+          },
+          {
+            "text": "### 1.2 请求链路与外部依赖",
+            "lineNumber": 45
+          },
+          {
+            "lineNumber": 46
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 47
+          },
+          {
+            "text": "客户端",
+            "lineNumber": 48
+          },
+          {
+            "text": "  → FastAPI (async)",
+            "lineNumber": 49
+          },
+          {
+            "text": "  → 会话恢复（PostgreSQL / Redis checkpointer）",
+            "lineNumber": 50
+          },
+          {
+            "text": "  → 轮数检查（max_conversation_turns=15）",
+            "lineNumber": 51
+          },
+          {
+            "text": "  → 问答缓存（Redis get_cached_answer + 防击穿锁）",
+            "lineNumber": 52
+          },
+          {
+            "text": "  → LangGraph ainvoke / 流式",
+            "lineNumber": 53
+          },
+          {
+            "text": "      → Supervisor → Chat / Knowledge Agent",
+            "lineNumber": 54
+          },
+          {
+            "text": "          → KnowledgeEngine",
+            "lineNumber": 55
+          },
+          {
+            "text": "              → QA Store（本地 JSON）",
+            "lineNumber": 56
+          },
+          {
+            "text": "              → Text2SQL（PostgreSQL via db_resilience）",
+            "lineNumber": 57
+          },
+          {
+            "text": "              → RAG（Milvus via db_resilience + BM25）",
+            "lineNumber": 58
+          },
+          {
+            "text": "              → LLM（DeepSeek via llm 路由）",
+            "lineNumber": 59
+          },
+          {
+            "text": "  → 写缓存、持久化（chat_history、qa_monitoring）",
+            "lineNumber": 60
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 61
+          },
+          {
+            "lineNumber": 62
+          },
+          {
+            "text": "| 依赖 | 用途 | 韧性 |",
+            "lineNumber": 63
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 64
+          },
+          {
+            "text": "| DeepSeek API | 大模型 | 多 endpoint 熔断；单 endpoint 无重试 |",
+            "lineNumber": 65
+          },
+          {
+            "text": "| BGE-M3 / Reranker | 向量/重排 | 进程内，无外部依赖 |",
+            "lineNumber": 66
+          },
+          {
+            "text": "| Milvus | 向量检索 | 重试 + 熔断 + 懒重连 |",
+            "lineNumber": 67
+          },
+          {
+            "text": "| PostgreSQL | 对话历史、QA 监控、Text2SQL | 重试 + 熔断 + 降级 |",
+            "lineNumber": 68
+          },
+          {
+            "text": "| Redis | 问答缓存、可选 checkpointer | 断线懒重连；无探活 |",
+            "lineNumber": 69
+          },
+          {
+            "text": "| MinerU | 文档解析 | 信号量限流；❌ 无重试 |",
+            "lineNumber": 70
+          },
+          {
+            "lineNumber": 71
+          },
+          {
+            "text": "---",
+            "lineNumber": 72
+          },
+          {
+            "lineNumber": 73
+          },
+          {
+            "text": "## 二、高并发性能",
+            "lineNumber": 74
+          },
+          {
+            "lineNumber": 75
+          },
+          {
+            "text": "### 2.1 现状",
+            "lineNumber": 76
+          },
+          {
+            "lineNumber": 77
+          },
+          {
+            "text": "| 维度 | 实现 | 配置 |",
+            "lineNumber": 78
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 79
+          },
+          {
+            "text": "| 异步路径 | API、图、知识库、MinerU 均 async；同步 IO 用 &#96;asyncio.to_thread&#96; | - |",
+            "lineNumber": 80
+          },
+          {
+            "text": "| 线程池 | 可选 &#96;asyncio_thread_pool_workers&#96;，lifespan 中设置 | 默认 0（用 Python 默认池） |",
+            "lineNumber": 81
+          },
+          {
+            "text": "| 连接池 | PostgreSQL: 5+10；Redis: 10；asyncpg: 10 | &#96;redis_max_connections&#96; 可配，DB 池参数硬编码 |",
+            "lineNumber": 82
+          }
+        ]
+      },
+      "score": 0.33587193489074707
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/TECH_REVIEW_AND_OPTIMIZATION.md",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 38
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# 项目技术方案审查与优化建议",
+            "lineNumber": 1
+          },
+          {
+            "lineNumber": 2
+          },
+          {
+            "text": "&gt; 审查范围：高并发性能、稳定性、可用性  ",
+            "lineNumber": 3
+          },
+          {
+            "text": "&gt; 审查日期：2025-03  ",
+            "lineNumber": 4
+          },
+          {
+            "text": "&gt; **已实施**：P0/P1/P2 优化项均已落地，见下方「已实施优化」章节。",
+            "lineNumber": 5
+          },
+          {
+            "lineNumber": 6
+          },
+          {
+            "text": "---",
+            "lineNumber": 7
+          },
+          {
+            "lineNumber": 8
+          },
+          {
+            "text": "## 已实施优化（2025-03）",
+            "lineNumber": 9
+          },
+          {
+            "lineNumber": 10
+          },
+          {
+            "text": "| 优先级 | 优化项 | 实现位置 |",
+            "lineNumber": 11
+          },
+          {
+            "text": "|--------|--------|----------|",
+            "lineNumber": 12
+          },
+          {
+            "text": "| P0 | 健康检查增强 | &#96;api/main.py&#96; &#96;/health&#96; 探测 DB/Redis/Milvus/LLM，返回 status/details/breakers |",
+            "lineNumber": 13
+          },
+          {
+            "text": "| P0 | API 全局限流 | &#96;api/main.py&#96; 中间件 + &#96;api_max_concurrent_requests&#96; |",
+            "lineNumber": 14
+          },
+          {
+            "text": "| P0 | MinerU 重试 | &#96;mineru_client.py&#96; &#96;mineru_retry_times&#96;，5xx/超时/连接错误指数退避 |",
+            "lineNumber": 15
+          },
+          {
+            "text": "| P1 | 连接池参数可配置 | &#96;config/settings.py&#96; + &#96;db_resilience.py&#96; |",
+            "lineNumber": 16
+          },
+          {
+            "text": "| P1 | DB statement_timeout | &#96;postgresql_statement_timeout_ms&#96;，通过 connect_args 注入 |",
+            "lineNumber": 17
+          },
+          {
+            "text": "| P1 | 优雅关闭 | &#96;run.py&#96; &#96;timeout_graceful_shutdown&#96; |",
+            "lineNumber": 18
+          },
+          {
+            "text": "| P1 | /health/ready | &#96;api/main.py&#96; 深度检查，任一依赖不可用返回 503 |",
+            "lineNumber": 19
+          },
+          {
+            "text": "| P2 | LLM 单 endpoint 重试 | &#96;llm.py&#96; 单节点时按 &#96;agent_llm_retry_times&#96; 重试 |",
+            "lineNumber": 20
+          },
+          {
+            "text": "| P2 | 熔断参数可配置 | &#96;db_circuit_breaker_threshold&#96;、&#96;db_circuit_breaker_recovery_seconds&#96; |",
+            "lineNumber": 21
+          },
+          {
+            "text": "| P2 | RAG 检索缓存 | &#96;rag.py&#96; &#96;rag_retrieval_cache_max_entries&#96;、&#96;rag_retrieval_cache_ttl_seconds&#96; |",
+            "lineNumber": 22
+          },
+          {
+            "text": "| P2 | /health 集成熔断状态 | &#96;get_all_breaker_status()&#96; 已包含在 &#96;/health&#96; 响应 |",
+            "lineNumber": 23
+          },
+          {
+            "text": "| P3 | Redis Sentinel | &#96;redis_sentinel_service_name&#96;、&#96;redis_sentinel_nodes&#96; 配置后 answer_cache 经 Sentinel 连接 |",
+            "lineNumber": 24
+          },
+          {
+            "text": "| P3 | 多 worker 共享状态 | &#96;shared_state_redis_url&#96; 配置后解析缓存/待确认 SQL/中断状态存 Redis（&#96;src/shared_state.py&#96;） |",
+            "lineNumber": 25
+          },
+          {
+            "text": "| P3 | 异步客户端说明 | 见 ASYNC_CONCURRENCY.md：PostgreSQL 已支持 asyncpg；Milvus 待官方 async SDK |",
+            "lineNumber": 26
+          },
+          {
+            "lineNumber": 27
+          },
+          {
+            "text": "---",
+            "lineNumber": 28
+          },
+          {
+            "lineNumber": 29
+          },
+          {
+            "text": "## 一、项目架构概览",
+            "lineNumber": 30
+          },
+          {
+            "lineNumber": 31
+          },
+          {
+            "text": "### 1.1 核心模块与职责",
+            "lineNumber": 32
+          },
+          {
+            "lineNumber": 33
+          },
+          {
+            "text": "| 模块 | 职责 | 韧性现状 |",
+            "lineNumber": 34
+          },
+          {
+            "text": "|------|------|----------|",
+            "lineNumber": 35
+          },
+          {
+            "text": "| **api/main.py** | HTTP 入口、lifespan、会话隔离、超时 | 无 API 限流；/health 仅返回 ok |",
+            "lineNumber": 36
+          },
+          {
+            "text": "| **db_resilience** | PostgreSQL / SQLite / Milvus 连接池、重试、熔断、降级 | ✅ 已覆盖 |",
+            "lineNumber": 37
+          },
+          {
+            "text": "| **llm** | DeepSeek 多 endpoint、负载均衡、熔断 | ✅ 多节点时自动切换；单节点无重试 |",
+            "lineNumber": 38
+          }
+        ]
+      },
+      "score": 0.3348267078399658
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {
+            "line": 323
+          },
+          "endPosition": {
+            "line": 499
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 324,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 325,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class _DeepSeekChatRouter(BaseChatModel):",
+            "lineNumber": 324,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 445
+          },
+          {
+            "lineNumber": 446
+          },
+          {
+            "text": "    async def _astream(",
+            "lineNumber": 447
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 448
+          },
+          {
+            "text": "        messages: list,",
+            "lineNumber": 449
+          },
+          {
+            "text": "        stop: Optional[list[str]] = None,",
+            "lineNumber": 450
+          },
+          {
+            "text": "        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,",
+            "lineNumber": 451
+          },
+          {
+            "text": "        **kwargs: Any,",
+            "lineNumber": 452
+          },
+          {
+            "text": "    ) -&gt; AsyncIterator[ChatGenerationChunk]:",
+            "lineNumber": 453
+          },
+          {
+            "text": "        import asyncio",
+            "lineNumber": 454
+          },
+          {
+            "text": "        last_error: Optional[Exception] = None",
+            "lineNumber": 455
+          },
+          {
+            "text": "        candidates = self._pool.ordered_candidates()",
+            "lineNumber": 456
+          },
+          {
+            "text": "        retries = max(0, int(getattr(get_settings(), \"agent_llm_retry_times\", 2)))",
+            "lineNumber": 457
+          },
+          {
+            "text": "        for state in candidates:",
+            "lineNumber": 458
+          },
+          {
+            "text": "            client = self._pool.get_client(state, self.model_name, self.temperature)",
+            "lineNumber": 459
+          },
+          {
+            "text": "            for attempt in range(retries + 1 if len(candidates) == 1 else 1):",
+            "lineNumber": 460
+          },
+          {
+            "text": "                self._pool.acquire(state)",
+            "lineNumber": 461
+          },
+          {
+            "text": "                yielded = False",
+            "lineNumber": 462
+          },
+          {
+            "text": "                try:",
+            "lineNumber": 463
+          },
+          {
+            "text": "                    _LAST_ENDPOINT_NAME.set(state.config.name or \"\")",
+            "lineNumber": 464
+          },
+          {
+            "text": "                    async for chunk in client._astream(messages, stop=stop, run_manager=run_manager, **kwargs):",
+            "lineNumber": 465
+          },
+          {
+            "text": "                        yielded = True",
+            "lineNumber": 466
+          },
+          {
+            "text": "                        yield chunk",
+            "lineNumber": 467
+          },
+          {
+            "text": "                    self._pool.release_success(state)",
+            "lineNumber": 468
+          },
+          {
+            "text": "                    return",
+            "lineNumber": 469
+          },
+          {
+            "text": "                except Exception as exc:",
+            "lineNumber": 470
+          },
+          {
+            "text": "                    self._pool.release_failure(state, exc)",
+            "lineNumber": 471
+          },
+          {
+            "text": "                    last_error = exc",
+            "lineNumber": 472
+          },
+          {
+            "text": "                    if yielded or not _is_retryable_error(exc):",
+            "lineNumber": 473
+          },
+          {
+            "text": "                        raise",
+            "lineNumber": 474
+          },
+          {
+            "text": "                    if attempt &lt; retries and len(candidates) == 1:",
+            "lineNumber": 475
+          },
+          {
+            "text": "                        await asyncio.sleep(1.0 * (2 ** attempt))",
+            "lineNumber": 476
+          },
+          {
+            "text": "                        continue",
+            "lineNumber": 477
+          },
+          {
+            "text": "                    break",
+            "lineNumber": 478
+          },
+          {
+            "text": "        if last_error is not None:",
+            "lineNumber": 479
+          },
+          {
+            "text": "            raise last_error",
+            "lineNumber": 480
+          },
+          {
+            "text": "        raise RuntimeError(\"未配置可用的 DeepSeek endpoint。\")",
+            "lineNumber": 481,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 482
+          },
+          {
+            "lineNumber": 483
+          },
+          {
+            "text": "def get_deepseek_llm(",
+            "lineNumber": 484,
+            "isSignature": true
+          },
+          {
+            "text": "    temperature: float = 0,",
+            "lineNumber": 485,
+            "isSignature": true
+          },
+          {
+            "text": "    model: str | None = None,",
+            "lineNumber": 486,
+            "isSignature": true
+          },
+          {
+            "text": ") -&gt; BaseChatModel:",
+            "lineNumber": 487,
+            "isSignature": true
+          },
+          {
+            "text": "    ",
+            "lineNumber": 488
+          }
+        ]
+      },
+      "score": 0.33468329906463623
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {
+            "line": 103
+          },
+          "endPosition": {
+            "line": 288,
+            "column": 29
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 104,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 105,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 223,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 224,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class _DeepSeekEndpointPool:",
+            "lineNumber": 104,
+            "isSignature": true
+          },
+          {
+            "text": "def release_failure(self, state: _EndpointState, exc: Exception) -&gt; None:",
+            "lineNumber": 223
+          },
+          {
+            "lineNumber": 242
+          },
+          {
+            "text": "            error_text = str(exc)",
+            "lineNumber": 243
+          },
+          {
+            "text": "            if state.failures &gt;= self._failure_threshold:",
+            "lineNumber": 244
+          },
+          {
+            "text": "                state.opened_until = time.time() + self._open_seconds",
+            "lineNumber": 245
+          },
+          {
+            "text": "                seconds_until_retry = round(max(0.0, state.opened_until - time.time()), 3)",
+            "lineNumber": 246
+          },
+          {
+            "text": "                endpoint_name = state.config.name or \"unknown\"",
+            "lineNumber": 247
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 248
+          },
+          {
+            "text": "                    \"LLM endpoint circuit opened: name=%s inflight=%s failures=%s threshold=%s retry_after_seconds=%s error=%s\",",
+            "lineNumber": 249
+          },
+          {
+            "text": "                    endpoint_name,",
+            "lineNumber": 250
+          },
+          {
+            "text": "                    current_inflight,",
+            "lineNumber": 251
+          },
+          {
+            "text": "                    failures,",
+            "lineNumber": 252
+          },
+          {
+            "text": "                    threshold,",
+            "lineNumber": 253
+          },
+          {
+            "text": "                    seconds_until_retry,",
+            "lineNumber": 254
+          },
+          {
+            "text": "                    error_text,",
+            "lineNumber": 255
+          },
+          {
+            "text": "                )",
+            "lineNumber": 256
+          },
+          {
+            "text": "                return",
+            "lineNumber": 257
+          },
+          {
+            "text": "        logger.warning(",
+            "lineNumber": 258
+          },
+          {
+            "text": "            \"LLM endpoint retryable failure: name=%s inflight=%s failures=%s threshold=%s error=%s\",",
+            "lineNumber": 259
+          },
+          {
+            "text": "            state.config.name or \"unknown\",",
+            "lineNumber": 260
+          },
+          {
+            "text": "            current_inflight,",
+            "lineNumber": 261
+          },
+          {
+            "text": "            failures,",
+            "lineNumber": 262
+          },
+          {
+            "text": "            threshold,",
+            "lineNumber": 263
+          },
+          {
+            "text": "            error_text,",
+            "lineNumber": 264
+          },
+          {
+            "text": "        )",
+            "lineNumber": 265
+          },
+          {
+            "lineNumber": 266
+          },
+          {
+            "text": "    def get_client(self, state: _EndpointState, model_name: str, temperature: float):",
+            "lineNumber": 267
+          },
+          {
+            "text": "        \"\"\"按 endpoint + 模型参数复用 ChatOpenAI 客户端。\"\"\"",
+            "lineNumber": 268
+          },
+          {
+            "lineNumber": 269
+          },
+          {
+            "text": "        from langchain_openai import ChatOpenAI",
+            "lineNumber": 270
+          },
+          {
+            "lineNumber": 271
+          },
+          {
+            "text": "        key = (model_name, float(temperature))",
+            "lineNumber": 272
+          },
+          {
+            "text": "        with self._lock:",
+            "lineNumber": 273
+          },
+          {
+            "text": "            client = state.clients.get(key)",
+            "lineNumber": 274
+          },
+          {
+            "text": "            if client is None:",
+            "lineNumber": 275
+          },
+          {
+            "text": "                client = ChatOpenAI(",
+            "lineNumber": 276
+          },
+          {
+            "text": "                    model=model_name,",
+            "lineNumber": 277
+          },
+          {
+            "text": "                    base_url=state.config.base_url,",
+            "lineNumber": 278
+          },
+          {
+            "text": "                    api_key=state.config.api_key,",
+            "lineNumber": 279
+          },
+          {
+            "text": "                    temperature=temperature,",
+            "lineNumber": 280
+          },
+          {
+            "text": "                    timeout=self._timeout_seconds,",
+            "lineNumber": 281
+          },
+          {
+            "text": "                    max_retries=0,",
+            "lineNumber": 282
+          },
+          {
+            "text": "                )",
+            "lineNumber": 283
+          },
+          {
+            "text": "                state.clients[key] = client",
+            "lineNumber": 284
+          },
+          {
+            "text": "            return client",
+            "lineNumber": 285,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 286
+          },
+          {
+            "lineNumber": 287
+          },
+          {
+            "text": "_POOL: Optional[_DeepSeekEndpointPool] = None",
+            "lineNumber": 288
+          },
+          {
+            "text": "_POOL_LOCK = threading.Lock()",
+            "lineNumber": 289
+          }
+        ]
+      },
+      "score": 0.3326716423034668
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 171,
+            "column": 24
+          },
+          "endPosition": {
+            "line": 230,
+            "column": 33
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "@contextmanager",
+            "lineNumber": 175
+          },
+          {
+            "text": "def safe_connection(",
+            "lineNumber": 176,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 177,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 178,
+            "isSignature": true
+          },
+          {
+            "text": "    retries: int = 2,",
+            "lineNumber": 179,
+            "isSignature": true
+          },
+          {
+            "text": "    retry_delay: float = 0.5,",
+            "lineNumber": 180,
+            "isSignature": true
+          },
+          {
+            "text": "    critical: bool = True,",
+            "lineNumber": 181,
+            "isSignature": true
+          },
+          {
+            "text": "    pool_size: Optional[int] = None,",
+            "lineNumber": 182,
+            "isSignature": true
+          },
+          {
+            "text": "    max_overflow: Optional[int] = None,",
+            "lineNumber": 183,
+            "isSignature": true
+          },
+          {
+            "text": "    pool_timeout: Optional[int] = None,",
+            "lineNumber": 184,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 185,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 186
+          },
+          {
+            "text": "    安全获取数据库连接的上下文管理器，内置重试 + 熔断。",
+            "lineNumber": 187
+          },
+          {
+            "text": "    连接池参数未显式传入时从配置读取（postgresql_pool_size 等）。",
+            "lineNumber": 188
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 189
+          },
+          {
+            "text": "    breaker = _get_breaker(uri)",
+            "lineNumber": 190
+          },
+          {
+            "lineNumber": 191
+          },
+          {
+            "text": "    if not breaker.allow_request():",
+            "lineNumber": 192
+          },
+          {
+            "text": "        if critical:",
+            "lineNumber": 193
+          },
+          {
+            "text": "            raise ConnectionError(f\"数据库熔断中（{breaker.status()['state']}），暂时拒绝连接\")",
+            "lineNumber": 194
+          },
+          {
+            "text": "        logger.warning(\"数据库熔断中，降级处理\")",
+            "lineNumber": 195
+          },
+          {
+            "text": "        yield None",
+            "lineNumber": 196
+          },
+          {
+            "text": "        return",
+            "lineNumber": 197
+          },
+          {
+            "lineNumber": 198
+          },
+          {
+            "text": "    cfg = _db_config()",
+            "lineNumber": 199
+          },
+          {
+            "text": "    ps = pool_size if pool_size is not None else cfg[\"pool_size\"]",
+            "lineNumber": 200
+          },
+          {
+            "text": "    mo = max_overflow if max_overflow is not None else cfg[\"max_overflow\"]",
+            "lineNumber": 201
+          },
+          {
+            "text": "    pt = pool_timeout if pool_timeout is not None else cfg[\"pool_timeout\"]",
+            "lineNumber": 202
+          },
+          {
+            "text": "    engine = get_engine(uri, pool_size=ps, max_overflow=mo, pool_timeout=pt)",
+            "lineNumber": 203
+          },
+          {
+            "text": "    last_err = None",
+            "lineNumber": 204
+          },
+          {
+            "lineNumber": 205
+          },
+          {
+            "text": "    for attempt in range(1, retries + 2):",
+            "lineNumber": 206
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 207
+          },
+          {
+            "text": "            with engine.connect() as conn:",
+            "lineNumber": 208
+          },
+          {
+            "text": "                breaker.record_success()",
+            "lineNumber": 209
+          },
+          {
+            "text": "                yield conn",
+            "lineNumber": 210
+          },
+          {
+            "text": "                return",
+            "lineNumber": 211
+          },
+          {
+            "text": "        except Exception as e:",
+            "lineNumber": 212
+          },
+          {
+            "text": "            last_err = e",
+            "lineNumber": 213
+          },
+          {
+            "text": "            breaker.record_failure()",
+            "lineNumber": 214
+          },
+          {
+            "text": "            if attempt &lt;= retries:",
+            "lineNumber": 215
+          },
+          {
+            "text": "                delay = retry_delay * (2 ** (attempt - 1))",
+            "lineNumber": 216
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 217
+          },
+          {
+            "text": "                    \"数据库连接失败（第 %d/%d 次），%.1fs 后重试: %s\",",
+            "lineNumber": 218
+          },
+          {
+            "text": "                    attempt, retries + 1, delay, e,",
+            "lineNumber": 219
+          },
+          {
+            "text": "                )",
+            "lineNumber": 220
+          },
+          {
+            "text": "                time.sleep(delay)",
+            "lineNumber": 221
+          },
+          {
+            "lineNumber": 222
+          },
+          {
+            "text": "    if critical:",
+            "lineNumber": 223
+          },
+          {
+            "text": "        raise ConnectionError(f\"数据库连接失败（已重试 {retries} 次）: {last_err}\") from last_err",
+            "lineNumber": 224
+          },
+          {
+            "text": "    logger.error(\"数据库连接失败（已重试），降级处理: %s\", last_err)",
+            "lineNumber": 225
+          },
+          {
+            "text": "    yield None",
+            "lineNumber": 226,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 227
+          },
+          {
+            "lineNumber": 228
+          },
+          {
+            "text": "# ---------- 异步连接池管理（asyncpg） ----------",
+            "lineNumber": 229
+          },
+          {
+            "lineNumber": 230
+          },
+          {
+            "text": "_async_pools: Dict[str, Any] = {}",
+            "lineNumber": 231
+          }
+        ]
+      },
+      "score": 0.3325538635253906
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {
+            "line": 323
+          },
+          "endPosition": {
+            "line": 480
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 324,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 325,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 347,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 354,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class _DeepSeekChatRouter(BaseChatModel):",
+            "lineNumber": 324,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 377
+          },
+          {
+            "lineNumber": 378
+          },
+          {
+            "text": "    async def _agenerate(",
+            "lineNumber": 379
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 380
+          },
+          {
+            "text": "        messages: list,",
+            "lineNumber": 381
+          },
+          {
+            "text": "        stop: Optional[list[str]] = None,",
+            "lineNumber": 382
+          },
+          {
+            "text": "        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,",
+            "lineNumber": 383
+          },
+          {
+            "text": "        **kwargs: Any,",
+            "lineNumber": 384
+          },
+          {
+            "text": "    ) -&gt; ChatResult:",
+            "lineNumber": 385
+          },
+          {
+            "text": "        import asyncio",
+            "lineNumber": 386
+          },
+          {
+            "text": "        last_error: Optional[Exception] = None",
+            "lineNumber": 387
+          },
+          {
+            "text": "        candidates = self._pool.ordered_candidates()",
+            "lineNumber": 388
+          },
+          {
+            "text": "        retries = max(0, int(getattr(get_settings(), \"agent_llm_retry_times\", 2)))",
+            "lineNumber": 389
+          },
+          {
+            "text": "        for state in candidates:",
+            "lineNumber": 390
+          },
+          {
+            "text": "            client = self._pool.get_client(state, self.model_name, self.temperature)",
+            "lineNumber": 391
+          },
+          {
+            "text": "            for attempt in range(retries + 1 if len(candidates) == 1 else 1):",
+            "lineNumber": 392
+          },
+          {
+            "text": "                self._pool.acquire(state)",
+            "lineNumber": 393
+          },
+          {
+            "text": "                try:",
+            "lineNumber": 394
+          },
+          {
+            "text": "                    _LAST_ENDPOINT_NAME.set(state.config.name or \"\")",
+            "lineNumber": 395
+          },
+          {
+            "text": "                    result = await client._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)",
+            "lineNumber": 396
+          },
+          {
+            "text": "                    self._pool.release_success(state)",
+            "lineNumber": 397
+          },
+          {
+            "text": "                    return result",
+            "lineNumber": 398
+          },
+          {
+            "text": "                except Exception as exc:",
+            "lineNumber": 399
+          },
+          {
+            "text": "                    self._pool.release_failure(state, exc)",
+            "lineNumber": 400
+          },
+          {
+            "text": "                    last_error = exc",
+            "lineNumber": 401
+          },
+          {
+            "text": "                    if not _is_retryable_error(exc):",
+            "lineNumber": 402
+          },
+          {
+            "text": "                        raise",
+            "lineNumber": 403
+          },
+          {
+            "text": "                    if attempt &lt; retries and len(candidates) == 1:",
+            "lineNumber": 404
+          },
+          {
+            "text": "                        await asyncio.sleep(1.0 * (2 ** attempt))",
+            "lineNumber": 405
+          },
+          {
+            "text": "                        continue",
+            "lineNumber": 406
+          },
+          {
+            "text": "                    break",
+            "lineNumber": 407
+          },
+          {
+            "text": "        if last_error is not None:",
+            "lineNumber": 408
+          },
+          {
+            "text": "            raise last_error",
+            "lineNumber": 409
+          },
+          {
+            "text": "        raise RuntimeError(\"未配置可用的 DeepSeek endpoint。\")",
+            "lineNumber": 410
+          },
+          {
+            "lineNumber": 411
+          },
+          {
+            "text": "    def _stream(",
+            "lineNumber": 412
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 413
+          },
+          {
+            "text": "        messages: list,",
+            "lineNumber": 414
+          },
+          {
+            "text": "        stop: Optional[list[str]] = None,",
+            "lineNumber": 415
+          },
+          {
+            "text": "        run_manager: Optional[CallbackManagerForLLMRun] = None,",
+            "lineNumber": 416
+          },
+          {
+            "text": "        **kwargs: Any,",
+            "lineNumber": 417
+          },
+          {
+            "text": "    ) -&gt; Iterator[ChatGenerationChunk]:",
+            "lineNumber": 418
+          },
+          {
+            "text": "        ",
+            "lineNumber": 419
+          }
+        ]
+      },
+      "score": 0.3241404891014099
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {
+            "line": 323
+          },
+          "endPosition": {
+            "line": 480
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 324,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 325,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class _DeepSeekChatRouter(BaseChatModel):",
+            "lineNumber": 324,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 410
+          },
+          {
+            "lineNumber": 411
+          },
+          {
+            "text": "    def _stream(",
+            "lineNumber": 412
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 413
+          },
+          {
+            "text": "        messages: list,",
+            "lineNumber": 414
+          },
+          {
+            "text": "        stop: Optional[list[str]] = None,",
+            "lineNumber": 415
+          },
+          {
+            "text": "        run_manager: Optional[CallbackManagerForLLMRun] = None,",
+            "lineNumber": 416
+          },
+          {
+            "text": "        **kwargs: Any,",
+            "lineNumber": 417
+          },
+          {
+            "text": "    ) -&gt; Iterator[ChatGenerationChunk]:",
+            "lineNumber": 418
+          },
+          {
+            "text": "        last_error: Optional[Exception] = None",
+            "lineNumber": 419
+          },
+          {
+            "text": "        candidates = self._pool.ordered_candidates()",
+            "lineNumber": 420
+          },
+          {
+            "text": "        retries = max(0, int(getattr(get_settings(), \"agent_llm_retry_times\", 2)))",
+            "lineNumber": 421
+          },
+          {
+            "text": "        for state in candidates:",
+            "lineNumber": 422
+          },
+          {
+            "text": "            client = self._pool.get_client(state, self.model_name, self.temperature)",
+            "lineNumber": 423
+          },
+          {
+            "text": "            for attempt in range(retries + 1 if len(candidates) == 1 else 1):",
+            "lineNumber": 424
+          },
+          {
+            "text": "                self._pool.acquire(state)",
+            "lineNumber": 425
+          },
+          {
+            "text": "                yielded = False",
+            "lineNumber": 426
+          },
+          {
+            "text": "                try:",
+            "lineNumber": 427
+          },
+          {
+            "text": "                    _LAST_ENDPOINT_NAME.set(state.config.name or \"\")",
+            "lineNumber": 428
+          },
+          {
+            "text": "                    for chunk in client._stream(messages, stop=stop, run_manager=run_manager, **kwargs):",
+            "lineNumber": 429
+          },
+          {
+            "text": "                        yielded = True",
+            "lineNumber": 430
+          },
+          {
+            "text": "                        yield chunk",
+            "lineNumber": 431
+          },
+          {
+            "text": "                    self._pool.release_success(state)",
+            "lineNumber": 432
+          },
+          {
+            "text": "                    return",
+            "lineNumber": 433
+          },
+          {
+            "text": "                except Exception as exc:",
+            "lineNumber": 434
+          },
+          {
+            "text": "                    self._pool.release_failure(state, exc)",
+            "lineNumber": 435
+          },
+          {
+            "text": "                    last_error = exc",
+            "lineNumber": 436
+          },
+          {
+            "text": "                    if yielded or not _is_retryable_error(exc):",
+            "lineNumber": 437
+          },
+          {
+            "text": "                        raise",
+            "lineNumber": 438
+          },
+          {
+            "text": "                    if attempt &lt; retries and len(candidates) == 1:",
+            "lineNumber": 439
+          },
+          {
+            "text": "                        time.sleep(1.0 * (2 ** attempt))",
+            "lineNumber": 440
+          },
+          {
+            "text": "                        continue",
+            "lineNumber": 441
+          },
+          {
+            "text": "                    break",
+            "lineNumber": 442
+          },
+          {
+            "text": "        if last_error is not None:",
+            "lineNumber": 443
+          },
+          {
+            "text": "            raise last_error",
+            "lineNumber": 444
+          },
+          {
+            "text": "        raise RuntimeError(\"未配置可用的 DeepSeek endpoint。\")",
+            "lineNumber": 445
+          },
+          {
+            "lineNumber": 446
+          },
+          {
+            "text": "    async def _astream(",
+            "lineNumber": 447
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 448
+          },
+          {
+            "text": "        messages: list,",
+            "lineNumber": 449
+          },
+          {
+            "text": "        stop: Optional[list[str]] = None,",
+            "lineNumber": 450
+          },
+          {
+            "text": "        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,",
+            "lineNumber": 451
+          },
+          {
+            "text": "        **kwargs: Any,",
+            "lineNumber": 452
+          },
+          {
+            "text": "    ) -&gt; AsyncIterator[ChatGenerationChunk]:",
+            "lineNumber": 453
+          },
+          {
+            "text": "        ",
+            "lineNumber": 454
+          }
+        ]
+      },
+      "score": 0.32018280029296875
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/TECH_REVIEW_AND_OPTIMIZATION.md",
+        "range": {
+          "startPosition": {
+            "line": 127
+          },
+          "endPosition": {
+            "line": 164
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "| 优雅关闭 | lifespan 中关闭 Redis、dispose DB、取消 keepalive |",
+            "lineNumber": 128
+          },
+          {
+            "lineNumber": 129
+          },
+          {
+            "text": "### 4.2 缺口",
+            "lineNumber": 130
+          },
+          {
+            "lineNumber": 131
+          },
+          {
+            "text": "| 缺口 | 影响 | 位置 |",
+            "lineNumber": 132
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 133
+          },
+          {
+            "text": "| **/health 不探测依赖** | K8s/负载均衡无法区分“进程存活”与“依赖可用” | api/main.py L479-482 |",
+            "lineNumber": 134
+          },
+          {
+            "text": "| **无 /health/ready 深度检查** | 无法用于 readiness 探针 | - |",
+            "lineNumber": 135
+          },
+          {
+            "text": "| **无优雅关闭等待** | SIGTERM 后立即退出，进行中请求被中断 | run.py、api/main.py |",
+            "lineNumber": 136
+          },
+          {
+            "text": "| **无 timeout_graceful_shutdown** | uvicorn 默认行为可能截断响应 | run.py |",
+            "lineNumber": 137
+          },
+          {
+            "lineNumber": 138
+          },
+          {
+            "text": "---",
+            "lineNumber": 139
+          },
+          {
+            "lineNumber": 140
+          },
+          {
+            "text": "## 五、优化建议（按优先级）",
+            "lineNumber": 141
+          },
+          {
+            "lineNumber": 142
+          },
+          {
+            "text": "### P0：高优先级（建议优先实施）",
+            "lineNumber": 143
+          },
+          {
+            "lineNumber": 144
+          },
+          {
+            "text": "| 序号 | 优化项 | 改动方向 | 涉及文件 |",
+            "lineNumber": 145
+          },
+          {
+            "text": "|------|--------|----------|----------|",
+            "lineNumber": 146
+          },
+          {
+            "text": "| 1 | **健康检查增强** | &#96;/health&#96; 增加 DB ping、Redis ping、Milvus 连接、LLM 至少一个 endpoint 可用；返回 &#96;status: ok | degraded&#96; 及 &#96;details&#96; | api/main.py |",
+            "lineNumber": 147
+          },
+          {
+            "text": "| 2 | **API 全局限流** | 增加 &#96;api_max_concurrent_requests&#96; 配置，用 &#96;asyncio.Semaphore&#96; 或 slowapi 限制并发；超限返回 503 | api/main.py、config/settings.py |",
+            "lineNumber": 148
+          },
+          {
+            "text": "| 3 | **MinerU 重试** | 对 5xx/超时/连接错误做指数退避重试 2–3 次 | mineru_client.py &#96;_parse_via_api_async&#96; |",
+            "lineNumber": 149
+          },
+          {
+            "lineNumber": 150
+          },
+          {
+            "text": "### P1：中高优先级",
+            "lineNumber": 151
+          },
+          {
+            "lineNumber": 152
+          },
+          {
+            "text": "| 序号 | 优化项 | 改动方向 | 涉及文件 |",
+            "lineNumber": 153
+          },
+          {
+            "text": "|------|--------|----------|----------|",
+            "lineNumber": 154
+          },
+          {
+            "text": "| 4 | **连接池参数可配置** | 新增 &#96;postgresql_pool_size&#96;、&#96;postgresql_max_overflow&#96;；db_resilience 从配置读取 | config/settings.py、db_resilience.py |",
+            "lineNumber": 155
+          },
+          {
+            "text": "| 5 | **DB statement_timeout** | 在 &#96;safe_connection&#96; 或 engine 中设置 &#96;connect_args={\"options\":\"-c statement_timeout=30000\"}&#96; 等 | db_resilience.py |",
+            "lineNumber": 156
+          },
+          {
+            "text": "| 6 | **优雅关闭** | lifespan 收到关闭信号后停止接收新请求；run.py 传递 &#96;timeout_graceful_shutdown=30&#96; 给 uvicorn | api/main.py、run.py |",
+            "lineNumber": 157
+          },
+          {
+            "text": "| 7 | **/health/ready 深度检查** | 新增 &#96;/health/ready&#96;，执行 DB/Redis/Milvus/LLM 探测，供 K8s readiness 使用 | api/main.py |",
+            "lineNumber": 158
+          },
+          {
+            "lineNumber": 159
+          },
+          {
+            "text": "### P2：中优先级",
+            "lineNumber": 160
+          },
+          {
+            "lineNumber": 161
+          },
+          {
+            "text": "| 序号 | 优化项 | 改动方向 | 涉及文件 |",
+            "lineNumber": 162
+          },
+          {
+            "text": "|------|--------|----------|----------|",
+            "lineNumber": 163
+          },
+          {
+            "text": "| 8 | **LLM 单 endpoint 重试** | 单节点时对可重试错误（超时、5xx）做 2–3 次重试 | llm.py |",
+            "lineNumber": 164
+          }
+        ]
+      },
+      "score": 0.3116304874420166
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/agents/knowledge_agent.py",
+        "range": {
+          "startPosition": {
+            "line": 47,
+            "column": 95
+          },
+          "endPosition": {
+            "line": 77,
+            "column": 60
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "async def knowledge_agent_node_async(state: AgentState) -&gt; dict:",
+            "lineNumber": 51,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 52
+          },
+          {
+            "text": "    知识库节点（异步）：不阻塞事件循环，内部使用 engine.aquery。",
+            "lineNumber": 53
+          },
+          {
+            "text": "    当存在待确认 SQL（删除/修改）时，将 pending_sql 写入 state，供 API 确认执行。",
+            "lineNumber": 54
+          },
+          {
+            "text": "    异常时返回需人工提示并结束本轮，可重试错误会重试。",
+            "lineNumber": 55
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 56
+          },
+          {
+            "text": "    last = _get_last_user_text(state)",
+            "lineNumber": 57
+          },
+          {
+            "text": "    if not last:",
+            "lineNumber": 58
+          },
+          {
+            "text": "        return {",
+            "lineNumber": 59
+          },
+          {
+            "text": "            \"messages\": [AIMessage(content=\"请直接输入您要咨询的业务或数据问题。\")],",
+            "lineNumber": 60
+          },
+          {
+            "text": "            \"next\": \"__end__\",",
+            "lineNumber": 61
+          },
+          {
+            "text": "        }",
+            "lineNumber": 62
+          },
+          {
+            "text": "    from config import get_settings",
+            "lineNumber": 63
+          },
+          {
+            "text": "    settings = get_settings()",
+            "lineNumber": 64
+          },
+          {
+            "text": "    max_retries = max(0, getattr(settings, \"agent_llm_retry_times\", 2))",
+            "lineNumber": 65
+          },
+          {
+            "text": "    reply = getattr(settings, \"agent_need_human_reply\", \"当前服务暂时异常，请稍后重试或转人工客服。\")",
+            "lineNumber": 66
+          },
+          {
+            "text": "    for attempt in range(max_retries + 1):",
+            "lineNumber": 67
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 68
+          },
+          {
+            "text": "            engine = _get_kb_engine()",
+            "lineNumber": 69
+          },
+          {
+            "text": "            answer, pending_sql = await engine.aquery(last)",
+            "lineNumber": 70
+          },
+          {
+            "text": "            out: dict = {\"messages\": [AIMessage(content=answer)], \"next\": \"__end__\", \"route\": \"knowledge\", \"qa_trace\": engine.get_last_trace()}",
+            "lineNumber": 71
+          },
+          {
+            "text": "            if pending_sql:",
+            "lineNumber": 72
+          },
+          {
+            "text": "                out[\"pending_sql\"] = pending_sql",
+            "lineNumber": 73
+          },
+          {
+            "text": "            return out",
+            "lineNumber": 74
+          },
+          {
+            "text": "        except Exception as e:",
+            "lineNumber": 75
+          },
+          {
+            "text": "            if attempt &lt; max_retries and _is_retryable_error(e):",
+            "lineNumber": 76
+          },
+          {
+            "text": "                continue",
+            "lineNumber": 77
+          },
+          {
+            "text": "            return {\"next\": \"human\", \"human_message\": reply}",
+            "lineNumber": 78,
+            "isSignature": true
+          }
+        ]
+      },
+      "score": 0.3060174882411957
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 96
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# src/db_resilience.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "数据库连接韧性层：连接池复用、重试、熔断、高并发限流、降级。",
+            "lineNumber": 3
+          },
+          {
+            "lineNumber": 4
+          },
+          {
+            "text": "覆盖范围：",
+            "lineNumber": 5
+          },
+          {
+            "text": "- PostgreSQL / SQLite（SQLAlchemy 同步 + asyncpg 异步）",
+            "lineNumber": 6
+          },
+          {
+            "text": "- Milvus 向量数据库（pymilvus）",
+            "lineNumber": 7
+          },
+          {
+            "lineNumber": 8
+          },
+          {
+            "text": "设计目标：",
+            "lineNumber": 9
+          },
+          {
+            "text": "- 所有数据库连接统一走此模块，避免各处散落的连接创建。",
+            "lineNumber": 10
+          },
+          {
+            "text": "- 连接失败时自动重试（指数退避），连续失败后熔断（短时拒绝，避免雪崩）。",
+            "lineNumber": 11
+          },
+          {
+            "text": "- 熔断期间对非关键路径返回降级结果而非抛异常。",
+            "lineNumber": 12
+          },
+          {
+            "text": "- Milvus 支持懒重连：连接断开后下次操作自动尝试重连。",
+            "lineNumber": 13
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 14
+          },
+          {
+            "text": "import asyncio",
+            "lineNumber": 15
+          },
+          {
+            "text": "import logging",
+            "lineNumber": 16
+          },
+          {
+            "text": "import threading",
+            "lineNumber": 17
+          },
+          {
+            "text": "import time",
+            "lineNumber": 18
+          },
+          {
+            "text": "from contextlib import contextmanager, asynccontextmanager",
+            "lineNumber": 19
+          },
+          {
+            "text": "from typing import Any, Dict, Optional",
+            "lineNumber": 20
+          },
+          {
+            "lineNumber": 21
+          },
+          {
+            "text": "from config import get_settings",
+            "lineNumber": 22
+          },
+          {
+            "lineNumber": 23
+          },
+          {
+            "text": "logger = logging.getLogger(__name__)",
+            "lineNumber": 24
+          },
+          {
+            "lineNumber": 25
+          },
+          {
+            "lineNumber": 26
+          },
+          {
+            "text": "def _db_config():",
+            "lineNumber": 27,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"从配置读取连接池与熔断参数。\"\"\"",
+            "lineNumber": 28
+          },
+          {
+            "text": "    s = get_settings()",
+            "lineNumber": 29
+          },
+          {
+            "text": "    return {",
+            "lineNumber": 30
+          },
+          {
+            "text": "        \"pool_size\": max(1, getattr(s, \"postgresql_pool_size\", 5)),",
+            "lineNumber": 31
+          },
+          {
+            "text": "        \"max_overflow\": max(0, getattr(s, \"postgresql_max_overflow\", 10)),",
+            "lineNumber": 32
+          },
+          {
+            "text": "        \"pool_timeout\": max(1, getattr(s, \"postgresql_pool_timeout\", 10)),",
+            "lineNumber": 33
+          },
+          {
+            "text": "        \"cb_threshold\": max(1, getattr(s, \"db_circuit_breaker_threshold\", 5)),",
+            "lineNumber": 34
+          },
+          {
+            "text": "        \"cb_recovery\": max(5.0, float(getattr(s, \"db_circuit_breaker_recovery_seconds\", 30))),",
+            "lineNumber": 35
+          },
+          {
+            "text": "        \"statement_timeout_ms\": max(0, getattr(s, \"postgresql_statement_timeout_ms\", 0)),",
+            "lineNumber": 36
+          },
+          {
+            "text": "    }",
+            "lineNumber": 37,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 38
+          },
+          {
+            "lineNumber": 39
+          },
+          {
+            "text": "# ---------- 熔断器 ----------",
+            "lineNumber": 40
+          },
+          {
+            "lineNumber": 41
+          },
+          {
+            "text": "class CircuitBreaker:",
+            "lineNumber": 42,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 43
+          }
+        ]
+      },
+      "score": 0.3007620871067047
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./config/settings.py",
+        "range": {
+          "startPosition": {
+            "line": 22
+          },
+          "endPosition": {
+            "line": 212
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 23,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 24,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class Settings(BaseSettings):",
+            "lineNumber": 23,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 79
+          },
+          {
+            "text": "    mineru_api_url: str = \"\"",
+            "lineNumber": 80
+          },
+          {
+            "text": "    # 本地部署时通常不需要 token，留空即可；若服务端要求鉴权再填写",
+            "lineNumber": 81
+          },
+          {
+            "text": "    mineru_api_token: str = \"\"",
+            "lineNumber": 82
+          },
+          {
+            "text": "    # True：使用本地 MinerU 时配置 mineru_api_url 即可；url 为空则使用占位解析",
+            "lineNumber": 83
+          },
+          {
+            "text": "    mineru_use_local: bool = True",
+            "lineNumber": 84
+          },
+          {
+            "text": "    # 并发控制：同时调用 MinerU API 的最大数量，超出时排队等待，避免打满 MinerU",
+            "lineNumber": 85
+          },
+          {
+            "text": "    mineru_concurrency_limit: int = 5",
+            "lineNumber": 86
+          },
+          {
+            "text": "    # MinerU API 单次请求超时（秒）",
+            "lineNumber": 87
+          },
+          {
+            "text": "    mineru_timeout_seconds: int = 120",
+            "lineNumber": 88
+          },
+          {
+            "text": "    # MinerU 请求失败时重试次数（5xx/超时/连接错误），0 表示不重试",
+            "lineNumber": 89
+          },
+          {
+            "text": "    mineru_retry_times: int = 2",
+            "lineNumber": 90
+          },
+          {
+            "lineNumber": 91
+          },
+          {
+            "text": "    # ---------- 路径 ----------",
+            "lineNumber": 92
+          },
+          {
+            "text": "    upload_dir: str = \"./data/uploads\"",
+            "lineNumber": 93
+          },
+          {
+            "text": "    qa_data_path: str = \"./data/high_freq_qa.json\"",
+            "lineNumber": 94
+          },
+          {
+            "lineNumber": 95
+          },
+          {
+            "text": "    # ---------- 对话与上下文（性能与隔离） ----------",
+            "lineNumber": 96
+          },
+          {
+            "text": "    max_conversation_turns: int = 15  # 单对话最多轮数，超过后提示新开对话",
+            "lineNumber": 97
+          },
+          {
+            "text": "    llm_context_window_turns: int = 10  # 喂给大模型的最近轮数（节省 token），窗口内全量保留不压缩",
+            "lineNumber": 98
+          },
+          {
+            "text": "    llm_context_summarize_old: bool = True  # 是否将窗口外的旧对话压缩为摘要后一并喂给大模型（避免早期信息丢失）",
+            "lineNumber": 99
+          },
+          {
+            "text": "    # 单条消息字符上限（约等于 token 控制）：历史消息超过则截断，当前轮用户输入不截断",
+            "lineNumber": 100
+          },
+          {
+            "text": "    llm_context_max_chars_per_message_old: int = 600  # 历史轮每条消息最大字符数，0 表示不截断",
+            "lineNumber": 101
+          },
+          {
+            "text": "    llm_context_max_chars_per_message_latest: int = 0   # 当前轮用户消息最大字符数，0 表示不截断",
+            "lineNumber": 102
+          },
+          {
+            "text": "    # 旧对话摘要时送入 LLM 的对话文本最大字符数，0 表示不限制（默认 8000）",
+            "lineNumber": 103
+          },
+          {
+            "text": "    llm_context_summary_input_max_chars: int = 8000",
+            "lineNumber": 104
+          },
+          {
+            "lineNumber": 105
+          },
+          {
+            "text": "    # ---------- 异常与人工介入 ----------",
+            "lineNumber": 106
+          },
+          {
+            "text": "    agent_request_timeout_seconds: int = 120  # 单次请求超时，超时后可提示用户打断或转人工",
+            "lineNumber": 107
+          },
+          {
+            "text": "    agent_llm_retry_times: int = 2  # LLM 调用失败时重试次数（如超时、5xx）",
+            "lineNumber": 108
+          },
+          {
+            "text": "    agent_need_human_reply: str = \"当前服务暂时异常，请稍后重试或转人工客服。\"  # 节点异常时统一提示",
+            "lineNumber": 109
+          },
+          {
+            "lineNumber": 110
+          },
+          {
+            "text": "    # ---------- 异步高并发 ----------",
+            "lineNumber": 111
+          },
+          {
+            "text": "    # 线程池大小：asyncio.to_thread 使用的默认 executor 的 max_workers；0 表示使用 Python 默认（约 min(32, cpu+4)）",
+            "lineNumber": 112
+          }
+        ]
+      },
+      "score": 0.2994798421859741
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 36,
+            "column": 5
+          },
+          "endPosition": {
+            "line": 96
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# ---------- 熔断器 ----------",
+            "lineNumber": 40
+          },
+          {
+            "lineNumber": 41
+          },
+          {
+            "text": "class CircuitBreaker:",
+            "lineNumber": 42,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 43
+          },
+          {
+            "text": "    简易熔断器：连续失败达到阈值后进入 OPEN 状态，拒绝请求；",
+            "lineNumber": 44
+          },
+          {
+            "text": "    经过冷却期后进入 HALF_OPEN，放行一次探测；探测成功则恢复 CLOSED。",
+            "lineNumber": 45
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 46
+          },
+          {
+            "lineNumber": 47
+          },
+          {
+            "text": "    def __init__(self, failure_threshold: int = 5, recovery_seconds: float = 30.0, name: str = \"\"):",
+            "lineNumber": 48
+          },
+          {
+            "text": "        self._failure_threshold = failure_threshold",
+            "lineNumber": 49
+          },
+          {
+            "text": "        self._recovery_seconds = recovery_seconds",
+            "lineNumber": 50
+          },
+          {
+            "text": "        self._name = name or \"db\"",
+            "lineNumber": 51
+          },
+          {
+            "text": "        self._failures = 0",
+            "lineNumber": 52
+          },
+          {
+            "text": "        self._last_failure_time = 0.0",
+            "lineNumber": 53
+          },
+          {
+            "text": "        self._state = \"CLOSED\"  # CLOSED | OPEN | HALF_OPEN",
+            "lineNumber": 54
+          },
+          {
+            "text": "        self._lock = threading.Lock()",
+            "lineNumber": 55
+          },
+          {
+            "lineNumber": 56
+          },
+          {
+            "text": "    @property",
+            "lineNumber": 57
+          },
+          {
+            "text": "    def state(self) -&gt; str:",
+            "lineNumber": 58
+          },
+          {
+            "text": "        with self._lock:",
+            "lineNumber": 59
+          },
+          {
+            "text": "            if self._state == \"OPEN\":",
+            "lineNumber": 60
+          },
+          {
+            "text": "                if time.monotonic() - self._last_failure_time &gt;= self._recovery_seconds:",
+            "lineNumber": 61
+          },
+          {
+            "text": "                    self._state = \"HALF_OPEN\"",
+            "lineNumber": 62
+          },
+          {
+            "text": "            return self._state",
+            "lineNumber": 63
+          },
+          {
+            "lineNumber": 64
+          },
+          {
+            "text": "    def allow_request(self) -&gt; bool:",
+            "lineNumber": 65
+          },
+          {
+            "text": "        s = self.state",
+            "lineNumber": 66
+          },
+          {
+            "text": "        return s in (\"CLOSED\", \"HALF_OPEN\")",
+            "lineNumber": 67
+          },
+          {
+            "lineNumber": 68
+          },
+          {
+            "text": "    def record_success(self) -&gt; None:",
+            "lineNumber": 69
+          },
+          {
+            "text": "        with self._lock:",
+            "lineNumber": 70
+          },
+          {
+            "text": "            self._failures = 0",
+            "lineNumber": 71
+          },
+          {
+            "text": "            if self._state != \"CLOSED\":",
+            "lineNumber": 72
+          },
+          {
+            "text": "                logger.info(\"[%s] 熔断器恢复 CLOSED\", self._name)",
+            "lineNumber": 73
+          },
+          {
+            "text": "            self._state = \"CLOSED\"",
+            "lineNumber": 74
+          },
+          {
+            "lineNumber": 75
+          },
+          {
+            "text": "    def record_failure(self) -&gt; None:",
+            "lineNumber": 76
+          },
+          {
+            "text": "        with self._lock:",
+            "lineNumber": 77
+          },
+          {
+            "text": "            self._failures += 1",
+            "lineNumber": 78
+          },
+          {
+            "text": "            self._last_failure_time = time.monotonic()",
+            "lineNumber": 79
+          },
+          {
+            "text": "            if self._failures &gt;= self._failure_threshold and self._state == \"CLOSED\":",
+            "lineNumber": 80
+          },
+          {
+            "text": "                self._state = \"OPEN\"",
+            "lineNumber": 81
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 82
+          },
+          {
+            "text": "                    \"[%s] 连续 %d 次失败，熔断器 OPEN（%ds 后半开探测）\",",
+            "lineNumber": 83
+          },
+          {
+            "text": "                    self._name, self._failures, int(self._recovery_seconds),",
+            "lineNumber": 84
+          },
+          {
+            "text": "                )",
+            "lineNumber": 85
+          },
+          {
+            "text": "            elif self._state == \"HALF_OPEN\":",
+            "lineNumber": 86
+          },
+          {
+            "text": "                self._state = \"OPEN\"",
+            "lineNumber": 87
+          },
+          {
+            "text": "                logger.warning(\"[%s] 半开探测失败，熔断器重新 OPEN\", self._name)",
+            "lineNumber": 88
+          },
+          {
+            "lineNumber": 89
+          },
+          {
+            "text": "    def status(self) -&gt; dict:",
+            "lineNumber": 90
+          },
+          {
+            "text": "        return",
+            "lineNumber": 91
+          }
+        ]
+      },
+      "score": 0.29820460081100464
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/db_resilience.py",
+        "range": {
+          "startPosition": {
+            "line": 288,
+            "column": 112
+          },
+          "endPosition": {
+            "line": 345
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 235,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 244,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "@asynccontextmanager",
+            "lineNumber": 292
+          },
+          {
+            "text": "async def safe_async_connection(",
+            "lineNumber": 293,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 294,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 295,
+            "isSignature": true
+          },
+          {
+            "text": "    critical: bool = True,",
+            "lineNumber": 296,
+            "isSignature": true
+          },
+          {
+            "text": "    retries: int = 2,",
+            "lineNumber": 297,
+            "isSignature": true
+          },
+          {
+            "text": "    retry_delay: float = 0.5,",
+            "lineNumber": 298,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 299,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 300
+          },
+          {
+            "text": "    异步安全获取 asyncpg 连接，内置重试 + 熔断。",
+            "lineNumber": 301
+          },
+          {
+            "lineNumber": 302
+          },
+          {
+            "text": "    critical=False 时熔断/失败后 yield None（降级）。",
+            "lineNumber": 303
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 304
+          },
+          {
+            "text": "    breaker = _get_breaker(uri)",
+            "lineNumber": 305
+          },
+          {
+            "lineNumber": 306
+          },
+          {
+            "text": "    if not breaker.allow_request():",
+            "lineNumber": 307
+          },
+          {
+            "text": "        if critical:",
+            "lineNumber": 308
+          },
+          {
+            "text": "            raise ConnectionError(f\"数据库熔断中（{breaker.status()['state']}），暂时拒绝连接\")",
+            "lineNumber": 309
+          },
+          {
+            "text": "        logger.warning(\"数据库熔断中（async），降级处理\")",
+            "lineNumber": 310
+          },
+          {
+            "text": "        yield None",
+            "lineNumber": 311
+          },
+          {
+            "text": "        return",
+            "lineNumber": 312
+          },
+          {
+            "lineNumber": 313
+          },
+          {
+            "text": "    last_err = None",
+            "lineNumber": 314
+          },
+          {
+            "text": "    for attempt in range(1, retries + 2):",
+            "lineNumber": 315
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 316
+          },
+          {
+            "text": "            pool = await get_async_pool(uri)",
+            "lineNumber": 317
+          },
+          {
+            "text": "            async with pool.acquire() as conn:",
+            "lineNumber": 318
+          },
+          {
+            "text": "                breaker.record_success()",
+            "lineNumber": 319
+          },
+          {
+            "text": "                yield conn",
+            "lineNumber": 320
+          },
+          {
+            "text": "                return",
+            "lineNumber": 321
+          },
+          {
+            "text": "        except Exception as e:",
+            "lineNumber": 322
+          },
+          {
+            "text": "            last_err = e",
+            "lineNumber": 323
+          },
+          {
+            "text": "            breaker.record_failure()",
+            "lineNumber": 324
+          },
+          {
+            "text": "            if attempt &lt;= retries:",
+            "lineNumber": 325
+          },
+          {
+            "text": "                delay = retry_delay * (2 ** (attempt - 1))",
+            "lineNumber": 326
+          },
+          {
+            "text": "                logger.warning(",
+            "lineNumber": 327
+          },
+          {
+            "text": "                    \"异步数据库连接失败（第 %d/%d 次），%.1fs 后重试: %s\",",
+            "lineNumber": 328
+          },
+          {
+            "text": "                    attempt, retries + 1, delay, e,",
+            "lineNumber": 329
+          },
+          {
+            "text": "                )",
+            "lineNumber": 330
+          },
+          {
+            "text": "                await asyncio.sleep(delay)",
+            "lineNumber": 331
+          },
+          {
+            "lineNumber": 332
+          },
+          {
+            "text": "    if critical:",
+            "lineNumber": 333
+          },
+          {
+            "text": "        raise ConnectionError(f\"异步数据库连接失败（已重试 {retries} 次）: {last_err}\") from last_err",
+            "lineNumber": 334
+          },
+          {
+            "text": "    logger.error(\"异步数据库连接失败（已重试），降级处理: %s\", last_err)",
+            "lineNumber": 335
+          },
+          {
+            "text": "    yield None",
+            "lineNumber": 336,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 337
+          },
+          {
+            "lineNumber": 338
+          },
+          {
+            "text": "async def dispose_all_async_pools() -&gt; None:",
+            "lineNumber": 339,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"关闭所有 asyncpg 连接池。\"\"\"",
+            "lineNumber": 340
+          }
+        ]
+      },
+      "score": 0.29810360074043274
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/llm.py",
+        "range": {
+          "startPosition": {
+            "line": 100,
+            "column": 5
+          },
+          "endPosition": {
+            "line": 284
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "class _DeepSeekEndpointPool:",
+            "lineNumber": 104,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"进程内共享的 DeepSeek 节点池。\"\"\"",
+            "lineNumber": 105
+          },
+          {
+            "lineNumber": 106
+          },
+          {
+            "text": "    def __init__(self):",
+            "lineNumber": 107
+          },
+          {
+            "text": "        s = get_settings()",
+            "lineNumber": 108
+          },
+          {
+            "text": "        self._states = [_EndpointState(config=item) for item in _parse_deepseek_endpoints()]",
+            "lineNumber": 109
+          },
+          {
+            "text": "        self._failure_threshold = max(1, int(getattr(s, \"deepseek_circuit_breaker_failures\", 3)))",
+            "lineNumber": 110
+          },
+          {
+            "text": "        self._open_seconds = max(5, int(getattr(s, \"deepseek_circuit_breaker_open_seconds\", 30)))",
+            "lineNumber": 111
+          },
+          {
+            "text": "        self._timeout_seconds = max(1, int(getattr(s, \"agent_request_timeout_seconds\", 120)))",
+            "lineNumber": 112
+          },
+          {
+            "text": "        self._lock = threading.Lock()",
+            "lineNumber": 113
+          },
+          {
+            "text": "        self._round_robin_cursor = 0",
+            "lineNumber": 114
+          },
+          {
+            "lineNumber": 115
+          },
+          {
+            "text": "    def _healthy_states_locked(self) -&gt; list[_EndpointState]:",
+            "lineNumber": 116
+          },
+          {
+            "text": "        now = time.time()",
+            "lineNumber": 117
+          },
+          {
+            "text": "        healthy = [state for state in self._states if state.opened_until &lt;= now]",
+            "lineNumber": 118
+          },
+          {
+            "text": "        if healthy:",
+            "lineNumber": 119
+          },
+          {
+            "text": "            return healthy",
+            "lineNumber": 120
+          },
+          {
+            "text": "        if not self._states:",
+            "lineNumber": 121
+          },
+          {
+            "text": "            return []",
+            "lineNumber": 122
+          },
+          {
+            "text": "        # 所有节点都熔断时，放行“最早到期”的 1 个节点进入半开状态做探测。",
+            "lineNumber": 123
+          },
+          {
+            "text": "        return [min(self._states, key=lambda state: state.opened_until)]",
+            "lineNumber": 124
+          },
+          {
+            "lineNumber": 125
+          },
+          {
+            "text": "    @staticmethod",
+            "lineNumber": 126
+          },
+          {
+            "text": "    def _weighted_load_score(state: _EndpointState) -&gt; float:",
+            "lineNumber": 127
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 128
+          },
+          {
+            "text": "        计算节点当前负载分数，分数越小越应优先被选择。",
+            "lineNumber": 129
+          },
+          {
+            "lineNumber": 130
+          },
+          {
+            "text": "        这里用 &#96;inflight / weight&#96; 近似表达：",
+            "lineNumber": 131
+          },
+          {
+            "text": "        - inflight 越低，说明当前并发越小；",
+            "lineNumber": 132
+          },
+          {
+            "text": "        - weight 越高，说明该节点理论承载能力越强；",
+            "lineNumber": 133
+          },
+          {
+            "text": "        因此高权重节点在相同并发下会得到更低分，更容易继续接流量。",
+            "lineNumber": 134
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 135
+          },
+          {
+            "lineNumber": 136
+          },
+          {
+            "text": "        return state.inflight / max(1, state.config.weight)",
+            "lineNumber": 137
+          },
+          {
+            "lineNumber": 138
+          },
+          {
+            "text": "    def ordered_candidates(self) -&gt; list[_EndpointState]:",
+            "lineNumber": 139
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 140
+          }
+        ]
+      },
+      "score": 0.2970595359802246
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 930
+          },
+          "endPosition": {
+            "line": 1256
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 931,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 941,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_impl(",
+            "lineNumber": 931,
+            "isSignature": true
+          },
+          {
+            "text": "    request: Request,",
+            "lineNumber": 932,
+            "isSignature": true
+          },
+          {
+            "text": "    req: ChatRequest,",
+            "lineNumber": 933,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 934,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 935,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 936,
+            "isSignature": true
+          },
+          {
+            "text": "    config: dict,",
+            "lineNumber": 937,
+            "isSignature": true
+          },
+          {
+            "text": "    graph,",
+            "lineNumber": 938,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: float,",
+            "lineNumber": 939,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 940,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1139
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 1140
+          },
+          {
+            "text": "            result = await asyncio.wait_for(",
+            "lineNumber": 1141
+          },
+          {
+            "text": "                graph.ainvoke({\"messages\": messages}, config),",
+            "lineNumber": 1142
+          },
+          {
+            "text": "                timeout=float(getattr(settings, \"agent_request_timeout_seconds\", 120)),",
+            "lineNumber": 1143
+          },
+          {
+            "text": "            )",
+            "lineNumber": 1144
+          },
+          {
+            "text": "        except asyncio.TimeoutError:",
+            "lineNumber": 1145
+          },
+          {
+            "text": "            observation_id = str(uuid.uuid4())",
+            "lineNumber": 1146
+          },
+          {
+            "text": "            reply_text = \"请求处理超时，您可以重新发送或转人工客服。\"",
+            "lineNumber": 1147
+          },
+          {
+            "text": "            await _save_qa_observation_async(",
+            "lineNumber": 1148
+          },
+          {
+            "text": "                _build_observation_payload(",
+            "lineNumber": 1149
+          },
+          {
+            "text": "                    observation_id=observation_id,",
+            "lineNumber": 1150
+          },
+          {
+            "text": "                    thread_id=thread_id,",
+            "lineNumber": 1151
+          },
+          {
+            "text": "                    conversation_id=conversation_id,",
+            "lineNumber": 1152
+          },
+          {
+            "text": "                    user_id=user_id,",
+            "lineNumber": 1153
+          },
+          {
+            "text": "                    question=req.message,",
+            "lineNumber": 1154
+          },
+          {
+            "text": "                    answer=reply_text,",
+            "lineNumber": 1155
+          },
+          {
+            "text": "                    route=\"timeout\",",
+            "lineNumber": 1156
+          },
+          {
+            "text": "                    response_mode=\"sync\",",
+            "lineNumber": 1157
+          },
+          {
+            "text": "                    success=False,",
+            "lineNumber": 1158
+          },
+          {
+            "text": "                    latency_ms=int((time.perf_counter() - started_at) * 1000),",
+            "lineNumber": 1159
+          },
+          {
+            "text": "                    fallback_reason=\"timeout\",",
+            "lineNumber": 1160
+          },
+          {
+            "text": "                )",
+            "lineNumber": 1161
+          },
+          {
+            "text": "            )",
+            "lineNumber": 1162
+          },
+          {
+            "text": "            return ChatResponse(",
+            "lineNumber": 1163
+          },
+          {
+            "text": "                reply=reply_text,",
+            "lineNumber": 1164
+          },
+          {
+            "text": "                conversation_id=conversation_id,",
+            "lineNumber": 1165
+          },
+          {
+            "text": "                observation_id=observation_id,",
+            "lineNumber": 1166
+          },
+          {
+            "text": "            )",
+            "lineNumber": 1167
+          },
+          {
+            "text": "        except asyncio.CancelledError:",
+            "lineNumber": 1168
+          },
+          {
+            "text": "            observation_id = str(uuid.uuid4())",
+            "lineNumber": 1169
+          }
+        ]
+      },
+      "score": 0.2965534031391144
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/DB_RESILIENCE.md",
+        "range": {
+          "startPosition": {
+            "line": 42
+          },
+          "endPosition": {
+            "line": 93
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "---",
+            "lineNumber": 44
+          },
+          {
+            "lineNumber": 45
+          },
+          {
+            "text": "## 四、连接池参数",
+            "lineNumber": 46
+          },
+          {
+            "lineNumber": 47
+          },
+          {
+            "text": "### 同步（SQLAlchemy Engine）",
+            "lineNumber": 48
+          },
+          {
+            "lineNumber": 49
+          },
+          {
+            "text": "| 参数 | 默认值 | 说明 |",
+            "lineNumber": 50
+          },
+          {
+            "text": "|------|--------|------|",
+            "lineNumber": 51
+          },
+          {
+            "text": "| &#96;pool_size&#96; | 5 | 常驻连接数 |",
+            "lineNumber": 52
+          },
+          {
+            "text": "| &#96;max_overflow&#96; | 10 | 超出 pool_size 后允许的临时连接数（总上限 = pool_size + max_overflow） |",
+            "lineNumber": 53
+          },
+          {
+            "text": "| &#96;pool_timeout&#96; | 10 | 从池中获取连接的最大等待秒数（高并发排队上限） |",
+            "lineNumber": 54
+          },
+          {
+            "text": "| &#96;pool_recycle&#96; | 1800 | 连接回收周期（秒），避免数据库侧超时断连 |",
+            "lineNumber": 55
+          },
+          {
+            "text": "| &#96;pool_pre_ping&#96; | True | 每次取连接前发 ping，自动丢弃已断开的连接 |",
+            "lineNumber": 56
+          },
+          {
+            "lineNumber": 57
+          },
+          {
+            "text": "### 异步（asyncpg Pool）",
+            "lineNumber": 58
+          },
+          {
+            "lineNumber": 59
+          },
+          {
+            "text": "| 参数 | 默认值 | 说明 |",
+            "lineNumber": 60
+          },
+          {
+            "text": "|------|--------|------|",
+            "lineNumber": 61
+          },
+          {
+            "text": "| &#96;min_size&#96; | 2 | 最小连接数 |",
+            "lineNumber": 62
+          },
+          {
+            "text": "| &#96;max_size&#96; | 10 | 最大连接数 |",
+            "lineNumber": 63
+          },
+          {
+            "text": "| &#96;command_timeout&#96; | 15 | 单条 SQL 超时（秒） |",
+            "lineNumber": 64
+          },
+          {
+            "lineNumber": 65
+          },
+          {
+            "text": "---",
+            "lineNumber": 66
+          },
+          {
+            "lineNumber": 67
+          },
+          {
+            "text": "## 五、降级策略",
+            "lineNumber": 68
+          },
+          {
+            "lineNumber": 69
+          },
+          {
+            "text": "| 模块 | 降级行为 |",
+            "lineNumber": 70
+          },
+          {
+            "text": "|------|----------|",
+            "lineNumber": 71
+          },
+          {
+            "text": "| &#96;chat_history&#96; load_messages | 返回空消息列表（对话从零开始，不影响当前轮） |",
+            "lineNumber": 72
+          },
+          {
+            "text": "| &#96;chat_history&#96; append_messages | 跳过持久化（本轮消息仅在内存中，重启后丢失） |",
+            "lineNumber": 73
+          },
+          {
+            "text": "| &#96;chat_history&#96; runtime_state | 返回默认值（无待确认 SQL、未中断） |",
+            "lineNumber": 74
+          },
+          {
+            "text": "| &#96;chat_history&#96; session 操作 | 跳过或返回空（会话列表暂时不可用） |",
+            "lineNumber": 75
+          },
+          {
+            "text": "| &#96;qa_monitoring&#96; save_observation | 跳过（本轮监控数据丢失，不影响问答） |",
+            "lineNumber": 76
+          },
+          {
+            "text": "| &#96;qa_monitoring&#96; 查询类 | 返回空列表/零值结果 |",
+            "lineNumber": 77
+          },
+          {
+            "text": "| &#96;text2sql&#96; _validate_sql_syntax | 抛异常（关键路径，SQL 校验不可降级） |",
+            "lineNumber": 78
+          },
+          {
+            "text": "| &#96;text2sql&#96; _execute_sql | 返回 connection 类型错误（告知用户数据库不可用） |",
+            "lineNumber": 79
+          },
+          {
+            "lineNumber": 80
+          },
+          {
+            "text": "---",
+            "lineNumber": 81
+          },
+          {
+            "lineNumber": 82
+          },
+          {
+            "text": "## 六、配置项（config/settings.py）",
+            "lineNumber": 83
+          },
+          {
+            "lineNumber": 84
+          },
+          {
+            "text": "| 配置 | 默认 | 说明 |",
+            "lineNumber": 85
+          },
+          {
+            "text": "|------|------|------|",
+            "lineNumber": 86
+          },
+          {
+            "text": "| &#96;postgresql_pool_size&#96; | 5 | 连接池常驻连接数 |",
+            "lineNumber": 87
+          },
+          {
+            "text": "| &#96;postgresql_max_overflow&#96; | 10 | 超出 pool_size 的临时连接数 |",
+            "lineNumber": 88
+          },
+          {
+            "text": "| &#96;postgresql_pool_timeout&#96; | 10 | 获取连接超时（秒） |",
+            "lineNumber": 89
+          },
+          {
+            "text": "| &#96;postgresql_statement_timeout_ms&#96; | 0 | 单条 SQL 超时（毫秒），0 表示不限制 |",
+            "lineNumber": 90
+          },
+          {
+            "text": "| &#96;db_circuit_breaker_threshold&#96; | 5 | 连续失败达该次数后熔断 |",
+            "lineNumber": 91
+          },
+          {
+            "text": "| &#96;db_circuit_breaker_recovery_seconds&#96; | 30 | 熔断持续时间 |",
+            "lineNumber": 92
+          }
+        ]
+      },
+      "score": 0.29488736391067505
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/LOGGING.md",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 27
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# 项目日志等级约定",
+            "lineNumber": 1
+          },
+          {
+            "lineNumber": 2
+          },
+          {
+            "text": "本文档约定异常与常规输出的日志等级，便于生产环境按级别过滤与排查。",
+            "lineNumber": 3
+          },
+          {
+            "lineNumber": 4
+          },
+          {
+            "text": "## 1. 等级含义与使用场景",
+            "lineNumber": 5
+          },
+          {
+            "lineNumber": 6
+          },
+          {
+            "text": "| 等级 | 用途 | 典型场景 |",
+            "lineNumber": 7
+          },
+          {
+            "text": "|------|------|----------|",
+            "lineNumber": 8
+          },
+          {
+            "text": "| **DEBUG** | 调试与预期内流水 | 单次 Redis 非连接类异常、答案超长跳过写缓存、关闭连接时异常、LLM 选点/熔断恢复等详细流水 |",
+            "lineNumber": 9
+          },
+          {
+            "text": "| **INFO** | 启动与关键配置 | 线程池大小、PostgreSQL 长期记忆/监控启用、探活启动、应用生命周期相关 |",
+            "lineNumber": 10
+          },
+          {
+            "text": "| **WARNING** | 可恢复的异常与降级 | Redis/DB 读写失败（会重连或降级）、探活失败、恢复会话失败、对话历史/问答监控读写失败、LLM 端点熔断或单次失败 |",
+            "lineNumber": 11
+          },
+          {
+            "text": "| **ERROR** | 需关注的不可用或初始化失败 | Redis 首次连接失败导致缓存功能不可用、关键依赖初始化失败 |",
+            "lineNumber": 12
+          },
+          {
+            "text": "| **EXCEPTION** | 需排查时的完整堆栈 | 仅在需保留 traceback 时使用（如首次连接失败），等价于 error + traceback |",
+            "lineNumber": 13
+          },
+          {
+            "lineNumber": 14
+          },
+          {
+            "text": "## 2. 异常输出原则",
+            "lineNumber": 15
+          },
+          {
+            "lineNumber": 16
+          },
+          {
+            "text": "- **可恢复**：重试/重连/降级后业务仍可继续 → **WARNING**（如 Redis 断线后置空客户端、下次重连；DB 读写失败后本次请求降级）。",
+            "lineNumber": 17
+          },
+          {
+            "text": "- **不可恢复或影响功能**：本次进程内功能不可用且不会自动恢复 → **ERROR**（如 Redis 首次建连失败且未配置降级）。",
+            "lineNumber": 18
+          },
+          {
+            "text": "- **预期内或单次噪音**：如单次 get/set 非连接类异常、答案超长不写 → **DEBUG**。",
+            "lineNumber": 19
+          },
+          {
+            "text": "- **关闭/清理阶段**的异常（如 lifespan 关闭 Redis）→ **DEBUG**，避免正常关闭时刷 WARNING。",
+            "lineNumber": 20
+          },
+          {
+            "lineNumber": 21
+          },
+          {
+            "text": "## 3. 各模块约定",
+            "lineNumber": 22
+          },
+          {
+            "lineNumber": 23
+          },
+          {
+            "text": "- **answer_cache**：首次连接失败 → ERROR（+ exception 带 traceback）；读写时连接类失败 → WARNING；非连接类单次异常、关闭连接异常、答案超长跳过 → DEBUG。",
+            "lineNumber": 24
+          },
+          {
+            "text": "- **api/main**：PostgreSQL 探活失败/任务异常（会持续重试）、恢复人工介入会话失败 → WARNING；启动阶段配置与启用 → INFO。",
+            "lineNumber": 25
+          },
+          {
+            "text": "- **chat_history / qa_monitoring**：各类 DB 读写或建表失败（业务降级）→ WARNING。",
+            "lineNumber": 26
+          },
+          {
+            "text": "- **llm**：端点熔断、非可重试失败、可重试失败计数 → WARNING；选点/成功流水 → DEBUG（默认 INFO 下不刷屏）。",
+            "lineNumber": 27
+          }
+        ]
+      },
+      "score": 0.28997910022735596
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have a good picture. Let me also check:
+1. API-level concurrency limit (middleware)
+2. RAG retrieval cache in rag.py
+3. MinerU retry/fallback
+4. config/settings for all related keys
+5. docs/REDIS_CACHE.md for cache doc
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/REDIS_CACHE.md</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/llm.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "api_max_concurrent|api_concurrency_limit|concurrency",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "api_max_concurrent|api_concurrency_limit|concurrency",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 10,
+  "totalMatches": 63,
+  "topFiles": [
+    {
+      "uri": "docs/TECH_REVIEW_AND_OPTIMIZATION.md",
+      "matchCount": 3
+    },
+    {
+      "uri": ".specstory/history/2026-03-11_05-30Z-项目优化建议.md",
+      "matchCount": 28
+    },
+    {
+      "uri": "api/main.py",
+      "matchCount": 3
+    },
+    {
+      "uri": "config/settings.py",
+      "matchCount": 2
+    },
+    {
+      "uri": ".specstory/history/2026-03-08_02-52Z-项目技术方案梳理.md",
+      "matchCount": 1
+    },
+    {
+      "uri": "src/doc/mineru_client.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "docs/ASYNC_CONCURRENCY.md",
+      "matchCount": 1
+    },
+    {
+      "uri": "docs/DOC_PARSING_AND_VALIDATION.md",
+      "matchCount": 1
+    },
+    {
+      "uri": ".specstory/history/2026-03-07_03-48Z-基于langgraph的知识库智能体设计.md",
+      "matchCount": 1
+    },
+    {
+      "uri": ".specstory/history/2026-03-07_15-28Z-casual-greeting.md",
+      "matchCount": 22
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have a good picture. Let me also read RAG cache in rag.py and Milvus critical/default in db_resilience, and check knowledge_agent/chat_agent for fallback.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/rag.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "critical|default|降级|fallback",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src",
+  "glob": "*.py",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "critical|default|降级|fallback",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src",
+  "outputMode": "content",
+  "totalFiles": 10,
+  "totalMatches": 126,
+  "topFiles": [
+    {
+      "uri": "src/doc/validation.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "src/db_resilience.py",
+      "matchCount": 27
+    },
+    {
+      "uri": "src/llm.py",
+      "matchCount": 3
+    },
+    {
+      "uri": "src/kb/text2sql.py",
+      "matchCount": 12
+    },
+    {
+      "uri": "src/qa_monitoring.py",
+      "matchCount": 26
+    },
+    {
+      "uri": "src/doc/mineru_client.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "src/doc/milvus_upload.py",
+      "matchCount": 6
+    },
+    {
+      "uri": "src/kb/engine.py",
+      "matchCount": 15
+    },
+    {
+      "uri": "src/kb/rag.py",
+      "matchCount": 3
+    },
+    {
+      "uri": "src/chat_history.py",
+      "matchCount": 32
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have a comprehensive picture. Let me also quickly check config/settings for all related keys so the doc table is accurate.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "cache|circuit|breaker|pool_size|max_overflow|retry|timeout|concurrent|semaphore",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/config/settings.py",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "cache|circuit|breaker|pool_size|max_overflow|retry|timeout|concurrent|semaphore",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/config/settings.py",
+  "outputMode": "content",
+  "totalFiles": 1,
+  "totalMatches": 27,
+  "topFiles": [
+    {
+      "uri": "config/settings.py",
+      "matchCount": 27
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/rag.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have everything. Let me create a single doc that organizes: 1) Cache strategies (answer cache, RAG retrieval cache, hot key, single-flight), 2) Circuit breaker (DB, Milvus, DeepSeek LLM), 3) Degradation (DB/Milvus/LLM/supervisor fallback). I'll add a new doc or extend an existing one. The user asked to "整理" (organize/collate), so a dedicated doc makes sense - e.g. docs/HIGH_CONCURRENCY_STRATEGY.md or add a section to ASYNC_CONCURRENCY.md. A dedicated doc is clearer for "缓存、熔断、降级策略".
+</details></think>
+
+---
+
+
+正在创建一份专门文档，整理高并发场景下的缓存、熔断与降级策略。
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+The doc is written. Let me add a short pointer in ASYNC_CONCURRENCY.md so people can find this doc easily.
+</details></think>
+
+---
+
+
+在异步并发文档中增加指向该文档的引用：
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/ASYNC_CONCURRENCY.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Done. I'll give the user a brief summary.
+</details></think>
+
+---
+
+
+已整理成一份文档，并加好了在异步并发文档里的引用。
+
+## 新建文档：`docs/HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md`
+
+文档按「缓存 → 熔断 → 降级」组织，并附带限流与配置速查，结构如下：
+
+### 一、缓存策略
+- **问答缓存**：Redis 存「问题→答案」、可选进程内 LRU 热 key、防击穿单飞锁；配置项与 [REDIS_CACHE.md](docs/REDIS_CACHE.md) 对齐。
+- **RAG 检索缓存**：`rag.py` 中 BM25+向量+重排结果的进程内 LRU，`rag_retrieval_cache_max_entries` / `rag_retrieval_cache_ttl_seconds`。
+
+### 二、熔断策略
+- **数据库**：`db_resilience.py` 的 CLOSED→OPEN→HALF_OPEN 状态机，阈值与恢复时间可配；关键/非关键路径通过 `critical` 区分。
+- **Milvus**：同一套熔断与重试，RAG 与文档上传使用 `critical=False` 并设 `default` 降级。
+- **DeepSeek LLM**：按节点熔断、多节点自动切换、按 `inflight/weight` 选节点；相关配置一并列出。
+
+### 三、降级策略
+- **按调用方**：对话历史、问答监控、RAG 检索、文档上传等用 `critical=False`，失败时返回空/跳过；Text2SQL 等关键路径为 `critical=True`。
+- **总控/LLM**：总控重试耗尽后返回「转人工」提示（`agent_need_human_reply`），避免直接 500。
+- **RAG fallback_reason**：列出 `no_retrieval_hit`、`empty_context`、`low_grounding_after_regeneration` 等，说明用途。
+
+### 四、限流与并发
+- API 全局限流、会话锁、MinerU 并发、线程池大小；并指向 [ASYNC_CONCURRENCY.md](docs/ASYNC_CONCURRENCY.md) 的会话锁小节。
+
+### 五、配置速查
+- 用环境变量列表汇总上述缓存、熔断、限流相关配置，便于运维和调参。
+
+在 `docs/ASYNC_CONCURRENCY.md` 开头增加了一行引用，指向这份新文档，便于从「异步与高并发」直接跳到「缓存、熔断、降级」说明。
+
+---
+
+_**User**_
+
+你直接讲讲,我面试时需要解释这方面的设计思路
+
+---
+
+1
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user sent "1" - this is a very short message. In context, they had just asked me to "直接讲讲" (explain directly) how to explain the high-concurrency cache/circuit-breaker/degradation design in an interview. I gave them a written doc. Now "1" could mean:
+
+1. They're acknowledging / confirming (like "好的" or "1" as in "got it")
+2. They want me to continue with point 1 or section 1
+3. They're testing or accidentally sent "1"
+4. They want "one" more thing - e.g. a shorter verbal version for the interview
+
+Given the previous message was "你直接讲讲,我面试时需要解释这方面的设计思路" and I created a doc, the most helpful follow-up would be to give them a **spoken-style, interview-ready summary** they can say out loud - concise, structured, and easy to remember. "1" might mean "go ahead" or "first point" - I'll interpret it as: give them the direct, verbal explanation they can use in an interview (the "直接讲讲" part), in a compact form.
+
+I'll provide a short, spoken-style 设计思路 summary they can use in an interview.
+</details></think>
+
+---
+
+
+可以按下面这套话术在面试里讲，控制在 2 分钟内：
+
+---
+
+**开场（一句话定调）**  
+「我们这套系统是面向高并发的对话/RAG 服务，所以在设计上重点做了三件事：缓存减压力、熔断防雪崩、降级保可用。」
+
+---
+
+**1. 缓存设计思路**
+
+「缓存主要是两层：  
+- **问答缓存**：用户问题归一化后做 key，答案存 Redis，相同或相似问题直接命中就返回，不走到 LLM 和检索，减轻下游压力。高并发下还做了两件事——同一问题多个请求只让一个回源、其余等结果再读缓存，避免缓存击穿；热点问题用进程内 LRU 先查本地再查 Redis，减轻热 key 压力。  
+- **RAG 检索缓存**：相同 query 的 BM25+向量+重排结果做进程内 LRU 缓存，相同问题重复问时少打 Milvus 和模型，降低成本、提高响应。」
+
+---
+
+**2. 熔断设计思路**
+
+「下游不稳定时，不能一直把流量打过去，所以对 DB、Milvus、LLM 都做了熔断：  
+- 连续失败达到阈值就**熔断**，短时间内不再请求该节点，避免雪崩。  
+- 过一段时间进入**半开**，放少量请求探测，成功就恢复，失败再熔断。  
+- DB 和 Milvus 用同一套「重试 + 熔断」的韧性层；LLM 是多节点时按节点熔断，并会选负载低的健康节点，单节点也会配合重试。这样单点故障或抖动时，系统能快速止损而不是被拖垮。」
+
+---
+
+**3. 降级设计思路**
+
+「降级的原则是：**核心对话能继续，非核心功能可以弱化或跳过**。  
+- 对话历史、问答监控这类写库操作都标成非关键路径，失败就记录日志、返回空或跳过，不阻塞用户对话。  
+- RAG 检索、文档上传里 Milvus 失败就返回空列表或 0，由业务层做提示，而不是整体 500。  
+- 总控里 LLM 重试几次仍失败时，不直接抛错，而是返回「当前服务异常，请稍后或转人工」这类话术，相当于把异常转成可控的降级回复，保证接口不因为下游挂掉而大面积 500。」  
+
+---
+
+**收尾（可选）**  
+「整体上就是：用缓存降负载、用熔断防雪崩、用降级保可用，再配合 API 全局限流和会话级锁，控制并发和写冲突，这样在高并发和部分依赖故障时系统仍能稳定服务。」
+
+---
+
+面试时如果被追问「你们熔断阈值怎么定的」「降级后怎么恢复」「缓存和 DB 一致性」等，再结合你们项目里的具体配置（如 DB 5 次熔断、30 秒恢复、对话历史 critical=False）按上面思路展开即可。
+
+---
+
+_**User**_
+
+那你再针对这部分的问答整理些高频问题并给出答案
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user wants me to create a Q&A document with high-frequency interview questions and answers specifically for the cache, circuit breaker, and degradation design we documented. I'll add this to the project - either as a new section in the existing doc or a separate FAQ file. A dedicated "面试高频问答" section or file would be most useful.
+
+I'll create questions that interviewers commonly ask about:
+1. Cache - why cache, cache penetration/breakdown/avalanche, consistency, TTL, hot key
+2. Circuit breaker - why, state machine, threshold choice, half-open
+3. Degradation - what to degrade, critical vs non-critical, user experience
+4. Combined - how they work together, real scenarios
+
+Then provide concise but complete answers based on the actual project design.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have enough context. I'll add a new section at the end of HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md for "面试高频问答"，with Q&A pairs covering cache, circuit breaker, degradation, and combined scenarios.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I'll append a new section "七、面试高频问答" before the final "六、小结" and then keep 六、小结. Actually looking at the structure again - 六 is "小结", so I'll add "七、面试高频问答" after 六、小结.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Done. I've added a full "七、面试高频问答" section with 15 Q&A pairs covering cache (Q1-Q5), circuit breaker (Q6-Q9), degradation (Q10-Q12), and combined/scenario questions (Q13-Q15). The answers are grounded in the actual project design and are concise enough to recite in an interview.
+</details></think>
+
+---
+
+
+已经在该文档里加了 **「七、面试高频问答」**，共 15 道题，按主题分好了，方便你面试前过一遍。
+
+**缓存（Q1–Q5）**  
+- 问答缓存 vs RAG 检索缓存的区别  
+- 缓存击穿：单飞锁、分桶  
+- 热 key：进程内 LRU  
+- 缓存与 DB/知识库一致性、Redis 挂掉时的行为  
+
+**熔断（Q6–Q9）**  
+- 熔断的目的、和重试的区别  
+- 状态机与半开的作用  
+- 阈值/恢复时间怎么定  
+- 全部熔断时的处理（半开探测 + 总控降级）  
+
+**降级（Q10–Q12）**  
+- 关键 vs 非关键路径、如何降级  
+- 用户侧表现  
+- 降级如何自动恢复  
+
+**综合与场景（Q13–Q15）**  
+- 一次请求里缓存、熔断、降级如何配合  
+- 还有哪些并发与稳定性控制（限流、会话锁等）  
+- 若继续优化会动哪一块（开放性题）  
+
+答案都按你们项目里的实现写的（单飞锁、critical、DB/Milvus/LLM 熔断、总控转人工等），面试时可以直接用，必要时补一句「我们项目里是 XXX 实现的」即可。
+
+---
+
+_**User**_
+
+如何设计高可用低延迟的rag?
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user is asking how to design a high-availability, low-latency RAG system. This is a design/architecture question. I should:
+
+1. Draw on what this project already does (from the docs and code we've seen) - caching, circuit breaker, degradation, async, retrieval cache, etc.
+2. Structure the answer in a way that's both general best practices and grounded in their codebase, so they can use it in interviews or for actual design.
+
+I'll write a concise but comprehensive design doc section or a new doc that covers:
+- High availability: redundancy, circuit breaker, degradation, health check, multi-node LLM, DB/Redis resilience
+- Low latency: caching (answer + retrieval), async pipeline, connection pool, optional pre-warming, chunk size/retrieval count tuning, streaming
+
+I can add this as a new section in the existing HIGH_CONCURRENCY doc, or create a short dedicated doc. Given the user already has that doc open and the question is related (HA + latency in RAG context), I'll add a new section "八、高可用与低延迟 RAG 设计要点" in the same file, so all interview-ready material stays together. Or create a separate doc like docs/RAG_HA_LOW_LATENCY_DESIGN.md for clearer structure.
+
+A dedicated doc might be better for "如何设计高可用低延迟的 RAG" as it's a broader design question. I'll create docs/RAG_HA_LOW_LATENCY_DESIGN.md and keep it practical, referencing the existing cache/circuit/degradation doc where relevant.
+</details></think>
+
+---
+
+
+整理一份高可用、低延迟 RAG 的设计要点文档，并对照项目实现做说明。
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="semantic_search_full">
+<details>
+<summary>Tool use: **semantic_search_full**</summary>
+
+
+Parameters:
+
+```json
+{
+  "query": "RAG retrieve stream generate answer pipeline flow",
+  "includePattern": "src/kb",
+  "topK": 10,
+  "explanation": ""
+}
+```
+Result:
+
+```json
+{
+  "codeResults": [
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 392
+          },
+          {
+            "lineNumber": 393
+          },
+          {
+            "text": "    def query_stream(self, question: str):",
+            "lineNumber": 394
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 395
+          },
+          {
+            "text": "        知识库流式回答：先出首字再逐 chunk。依次尝试 QA → Text2SQL → RAG，首个有结果即流式输出。",
+            "lineNumber": 396
+          },
+          {
+            "text": "        Yields: 文本片段（str）。",
+            "lineNumber": 397
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 398
+          },
+          {
+            "text": "        trace = self._reset_trace()",
+            "lineNumber": 399
+          },
+          {
+            "text": "        # 1) QA 精准匹配",
+            "lineNumber": 400
+          },
+          {
+            "text": "        answer = self.qa.find(question)",
+            "lineNumber": 401
+          },
+          {
+            "text": "        if answer:",
+            "lineNumber": 402
+          },
+          {
+            "text": "            trace.route = \"qa\"",
+            "lineNumber": 403
+          },
+          {
+            "text": "            trace.final_status = \"qa_hit\"",
+            "lineNumber": 404
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(answer):",
+            "lineNumber": 405
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 406
+          },
+          {
+            "text": "            return",
+            "lineNumber": 407
+          },
+          {
+            "lineNumber": 408
+          },
+          {
+            "text": "        # 2) Text2SQL（可能为待确认 SQL，统一按文案流式输出）",
+            "lineNumber": 409
+          },
+          {
+            "text": "        result = self.text2sql.query(question)",
+            "lineNumber": 410
+          },
+          {
+            "text": "        if result is not None:",
+            "lineNumber": 411
+          },
+          {
+            "text": "            trace.route = \"text2sql\"",
+            "lineNumber": 412
+          },
+          {
+            "text": "            trace.final_status = \"text2sql_pending\" if isinstance(result, Text2SQLConfirmRequired) else \"text2sql_answer\"",
+            "lineNumber": 413
+          },
+          {
+            "text": "            trace.pending_sql = isinstance(result, Text2SQLConfirmRequired)",
+            "lineNumber": 414
+          },
+          {
+            "text": "            msg = result.message if isinstance(result, Text2SQLConfirmRequired) else result",
+            "lineNumber": 415
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(msg):",
+            "lineNumber": 416
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 417
+          },
+          {
+            "text": "            return",
+            "lineNumber": 418
+          },
+          {
+            "lineNumber": 419
+          },
+          {
+            "text": "        # 3) RAG：检索后流式生成",
+            "lineNumber": 420
+          },
+          {
+            "text": "        trace.route = \"rag\"",
+            "lineNumber": 421
+          },
+          {
+            "text": "        rag_result = self.rag.retrieve_with_validation(",
+            "lineNumber": 422
+          },
+          {
+            "text": "            question, top_k=10, use_rerank=True, rerank_top=5",
+            "lineNumber": 423
+          },
+          {
+            "text": "        )",
+            "lineNumber": 424
+          },
+          {
+            "text": "        trace.retrieve_attempt = rag_result.attempt",
+            "lineNumber": 425
+          },
+          {
+            "text": "        trace.source_count = len(rag_result.chunks)",
+            "lineNumber": 426
+          },
+          {
+            "text": "        trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))",
+            "lineNumber": 427
+          },
+          {
+            "text": "        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))",
+            "lineNumber": 428
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 429
+          },
+          {
+            "text": "            trace.top_match_score = max(e.match_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 430
+          },
+          {
+            "text": "            trace.top_normalized_score = max(e.normalized_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 431
+          },
+          {
+            "text": "        if not rag_result.chunks:",
+            "lineNumber": 432
+          },
+          {
+            "text": "            trace.final_status = \"rag_no_hit\"",
+            "lineNumber": 433
+          }
+        ]
+      },
+      "score": 0.6212261319160461
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "async def aquery(self, question: str) -&gt; Tuple[str, Optional[str]]:",
+            "lineNumber": 449
+          },
+          {
+            "lineNumber": 491
+          },
+          {
+            "text": "        return (answer_text, None)",
+            "lineNumber": 492
+          },
+          {
+            "lineNumber": 493
+          },
+          {
+            "text": "    async def aquery_stream(",
+            "lineNumber": 494
+          },
+          {
+            "text": "        self, question: str, pending_sql_out: Optional[List[str]] = None",
+            "lineNumber": 495
+          },
+          {
+            "text": "    ) -&gt; AsyncIterator[str]:",
+            "lineNumber": 496
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 497
+          },
+          {
+            "text": "        异步流式回答：先出首字再逐 chunk；RAG 使用 LLM astream，其余在线程池执行后按段 yield。",
+            "lineNumber": 498
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 499
+          },
+          {
+            "text": "        trace = self._reset_trace()",
+            "lineNumber": 500
+          },
+          {
+            "text": "        # 1) QA",
+            "lineNumber": 501
+          },
+          {
+            "text": "        answer = await asyncio.to_thread(self.qa.find, question)",
+            "lineNumber": 502
+          },
+          {
+            "text": "        if answer:",
+            "lineNumber": 503
+          },
+          {
+            "text": "            trace.route = \"qa\"",
+            "lineNumber": 504
+          },
+          {
+            "text": "            trace.final_status = \"qa_hit\"",
+            "lineNumber": 505
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(answer):",
+            "lineNumber": 506
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 507
+          },
+          {
+            "text": "            return",
+            "lineNumber": 508
+          },
+          {
+            "lineNumber": 509
+          },
+          {
+            "text": "        # 2) Text2SQL（可能为待确认 SQL）",
+            "lineNumber": 510
+          },
+          {
+            "text": "        result = await asyncio.to_thread(self.text2sql.query, question)",
+            "lineNumber": 511
+          },
+          {
+            "text": "        if result is not None:",
+            "lineNumber": 512
+          },
+          {
+            "text": "            trace.route = \"text2sql\"",
+            "lineNumber": 513
+          },
+          {
+            "text": "            # 删除/修改类需人工确认：将 SQL 放入 pending_sql_out 供 API 写入 _pending_sql",
+            "lineNumber": 514
+          },
+          {
+            "text": "            if isinstance(result, Text2SQLConfirmRequired):",
+            "lineNumber": 515
+          },
+          {
+            "text": "                trace.final_status = \"text2sql_pending\"",
+            "lineNumber": 516
+          },
+          {
+            "text": "                trace.pending_sql = True",
+            "lineNumber": 517
+          },
+          {
+            "text": "                if pending_sql_out is not None:",
+            "lineNumber": 518
+          },
+          {
+            "text": "                    pending_sql_out.append(result.sql)",
+            "lineNumber": 519
+          },
+          {
+            "text": "                for chunk in self._yield_text_chunked(result.message):",
+            "lineNumber": 520
+          },
+          {
+            "text": "                    yield chunk",
+            "lineNumber": 521
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 522
+          },
+          {
+            "text": "                trace.final_status = \"text2sql_answer\"",
+            "lineNumber": 523
+          },
+          {
+            "text": "                for chunk in self._yield_text_chunked(result):",
+            "lineNumber": 524
+          },
+          {
+            "text": "                    yield chunk",
+            "lineNumber": 525
+          },
+          {
+            "text": "            return",
+            "lineNumber": 526
+          },
+          {
+            "lineNumber": 527
+          },
+          {
+            "text": "        # 3) RAG：检索在线程池，生成用 astream",
+            "lineNumber": 528
+          },
+          {
+            "text": "        trace.route = \"rag\"",
+            "lineNumber": 529
+          },
+          {
+            "text": "        rag_result = await asyncio.to_thread(",
+            "lineNumber": 530
+          },
+          {
+            "text": "            self.rag.retrieve_with_validation,",
+            "lineNumber": 531
+          },
+          {
+            "text": "            question, top_k=10, use_rerank=True, rerank_top=5,",
+            "lineNumber": 532
+          },
+          {
+            "text": "        )",
+            "lineNumber": 533
+          },
+          {
+            "text": "        trace.retrieve_attempt = rag_result.attempt",
+            "lineNumber": 534
+          },
+          {
+            "text": "        trace.source_count = len(rag_result.chunks)",
+            "lineNumber": 535
+          },
+          {
+            "text": "        trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))",
+            "lineNumber": 536
+          },
+          {
+            "text": "        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))",
+            "lineNumber": 537
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 538
+          },
+          {
+            "text": "            trace.top_match_score =",
+            "lineNumber": 539
+          }
+        ]
+      },
+      "score": 0.6088361144065857
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 198,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 204,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "async def _generate_grounded_answer_async(",
+            "lineNumber": 267
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 268
+          },
+          {
+            "text": "        question: str,",
+            "lineNumber": 269
+          },
+          {
+            "text": "        rag_result: RAGRetrieveResult,",
+            "lineNumber": 270
+          },
+          {
+            "text": "        trace: Optional[KnowledgeQueryTrace] = None,",
+            "lineNumber": 271
+          },
+          {
+            "text": "    ) -&gt; str:",
+            "lineNumber": 272
+          },
+          {
+            "lineNumber": 328
+          },
+          {
+            "text": "        return (",
+            "lineNumber": 329
+          },
+          {
+            "text": "            \"根据当前检索结果无法确认，建议您补充更具体的问题或转人工客服。\"",
+            "lineNumber": 330
+          },
+          {
+            "text": "            if last_score &lt; min_score",
+            "lineNumber": 331
+          },
+          {
+            "text": "            else last_answer",
+            "lineNumber": 332
+          },
+          {
+            "text": "        )",
+            "lineNumber": 333
+          },
+          {
+            "lineNumber": 334
+          },
+          {
+            "text": "    def query(self, question: str) -&gt; Tuple[str, Optional[str]]:",
+            "lineNumber": 335
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 336
+          },
+          {
+            "text": "        依次尝试 QA、Text2SQL、RAG，返回 (回复文案, 待确认 SQL 或 None)。",
+            "lineNumber": 337
+          },
+          {
+            "text": "        当 Text2SQL 返回删除/修改类需人工确认时，第二项为待执行 SQL，由上层写入 state.pending_sql 并交 API 确认执行。",
+            "lineNumber": 338
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 339
+          },
+          {
+            "text": "        trace = self._reset_trace()",
+            "lineNumber": 340
+          },
+          {
+            "text": "        # 1) 高频 QA 精准匹配",
+            "lineNumber": 341
+          },
+          {
+            "text": "        answer = self.qa.find(question)",
+            "lineNumber": 342
+          },
+          {
+            "text": "        if answer:",
+            "lineNumber": 343
+          },
+          {
+            "text": "            trace.route = \"qa\"",
+            "lineNumber": 344
+          },
+          {
+            "text": "            trace.final_status = \"qa_hit\"",
+            "lineNumber": 345
+          },
+          {
+            "text": "            return (answer, None)",
+            "lineNumber": 346
+          },
+          {
+            "lineNumber": 347
+          },
+          {
+            "text": "        # 2) 结构化数据 Text2SQL（可能返回待确认 SQL）",
+            "lineNumber": 348
+          },
+          {
+            "text": "        result = self.text2sql.query(question)",
+            "lineNumber": 349
+          },
+          {
+            "text": "        if result is not None:",
+            "lineNumber": 350
+          },
+          {
+            "text": "            trace.route = \"text2sql\"",
+            "lineNumber": 351
+          },
+          {
+            "text": "            if isinstance(result, Text2SQLConfirmRequired):",
+            "lineNumber": 352
+          },
+          {
+            "text": "                trace.final_status = \"text2sql_pending\"",
+            "lineNumber": 353
+          },
+          {
+            "text": "                trace.pending_sql = True",
+            "lineNumber": 354
+          },
+          {
+            "text": "                return (result.message, result.sql)",
+            "lineNumber": 355
+          },
+          {
+            "text": "            trace.final_status = \"text2sql_answer\"",
+            "lineNumber": 356
+          },
+          {
+            "text": "            return (result, None)",
+            "lineNumber": 357
+          },
+          {
+            "lineNumber": 358
+          },
+          {
+            "text": "        # 3) RAG：带评估与重检，并返回依据来源",
+            "lineNumber": 359
+          },
+          {
+            "text": "        trace.route = \"rag\"",
+            "lineNumber": 360
+          },
+          {
+            "text": "        rag_result = self.rag.retrieve_with_validation(",
+            "lineNumber": 361
+          },
+          {
+            "text": "            question, top_k=10, use_rerank=True, rerank_top=5",
+            "lineNumber": 362
+          },
+          {
+            "text": "        )",
+            "lineNumber": 363
+          },
+          {
+            "text": "        trace.retrieve_attempt = rag_result.attempt",
+            "lineNumber": 364
+          },
+          {
+            "text": "        trace.source_count = len(rag_result.chunks)",
+            "lineNumber": 365
+          },
+          {
+            "text": "        trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))",
+            "lineNumber": 366
+          },
+          {
+            "text": "        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))",
+            "lineNumber": 367
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 368
+          },
+          {
+            "text": "            trace.top_match_score =",
+            "lineNumber": 369
+          }
+        ]
+      },
+      "score": 0.5615493655204773
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 394,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 395,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "def query_stream(self, question: str):",
+            "lineNumber": 394
+          },
+          {
+            "lineNumber": 431
+          },
+          {
+            "text": "        if not rag_result.chunks:",
+            "lineNumber": 432
+          },
+          {
+            "text": "            trace.final_status = \"rag_no_hit\"",
+            "lineNumber": 433
+          },
+          {
+            "text": "            trace.fallback_reason = \"no_retrieval_hit\"",
+            "lineNumber": 434
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(\"未找到相关知识，建议您换个问法或转人工客服。\"):",
+            "lineNumber": 435
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 436
+          },
+          {
+            "text": "            return",
+            "lineNumber": 437
+          },
+          {
+            "lineNumber": 438
+          },
+          {
+            "text": "        # 为了在返回前做“答案-文档相关度校验 + 最多 3 次重生成”，这里先生成最终答案，再按块输出。",
+            "lineNumber": 439
+          },
+          {
+            "text": "        answer_text = self._generate_grounded_answer(question, rag_result, trace=trace)",
+            "lineNumber": 440
+          },
+          {
+            "text": "        for c in self._yield_text_chunked(answer_text):",
+            "lineNumber": 441
+          },
+          {
+            "text": "            yield c",
+            "lineNumber": 442
+          },
+          {
+            "lineNumber": 443
+          },
+          {
+            "text": "        sources_block = _format_sources(rag_result)",
+            "lineNumber": 444
+          },
+          {
+            "text": "        if sources_block:",
+            "lineNumber": 445
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(\"\\n\\n\" + sources_block):",
+            "lineNumber": 446
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 447
+          },
+          {
+            "lineNumber": 448
+          },
+          {
+            "text": "    async def aquery(self, question: str) -&gt; Tuple[str, Optional[str]]:",
+            "lineNumber": 449
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 450
+          },
+          {
+            "text": "        异步：分步执行，仅 CPU/同步 IO 用线程池，RAG 生成用 ainvoke 不占线程，支持高并发。",
+            "lineNumber": 451
+          },
+          {
+            "text": "        返回 (回复文案, 待确认 SQL 或 None)。",
+            "lineNumber": 452
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 453
+          },
+          {
+            "text": "        trace = self._reset_trace()",
+            "lineNumber": 454
+          },
+          {
+            "text": "        # 1) QA",
+            "lineNumber": 455
+          },
+          {
+            "text": "        answer = await asyncio.to_thread(self.qa.find, question)",
+            "lineNumber": 456
+          },
+          {
+            "text": "        if answer:",
+            "lineNumber": 457
+          },
+          {
+            "text": "            trace.route = \"qa\"",
+            "lineNumber": 458
+          },
+          {
+            "text": "            trace.final_status = \"qa_hit\"",
+            "lineNumber": 459
+          },
+          {
+            "text": "            return (answer, None)",
+            "lineNumber": 460
+          },
+          {
+            "text": "        # 2) Text2SQL",
+            "lineNumber": 461
+          },
+          {
+            "text": "        result = await asyncio.to_thread(self.text2sql.query, question)",
+            "lineNumber": 462
+          },
+          {
+            "text": "        if result is not None:",
+            "lineNumber": 463
+          },
+          {
+            "text": "            trace.route = \"text2sql\"",
+            "lineNumber": 464
+          },
+          {
+            "text": "            if isinstance(result, Text2SQLConfirmRequired):",
+            "lineNumber": 465
+          },
+          {
+            "text": "                trace.final_status = \"text2sql_pending\"",
+            "lineNumber": 466
+          },
+          {
+            "text": "                trace.pending_sql = True",
+            "lineNumber": 467
+          },
+          {
+            "text": "                return (result.message, result.sql)",
+            "lineNumber": 468
+          },
+          {
+            "text": "            trace.final_status = \"text2sql_answer\"",
+            "lineNumber": 469
+          },
+          {
+            "text": "            return (result, None)",
+            "lineNumber": 470
+          },
+          {
+            "text": "        # 3) RAG：检索在线程池，生成用 ainvoke",
+            "lineNumber": 471
+          },
+          {
+            "text": "        trace.route = \"rag\"",
+            "lineNumber": 472
+          },
+          {
+            "text": "        rag_result = await asyncio.to_thread(",
+            "lineNumber": 473
+          },
+          {
+            "text": "            self.rag.retrieve_with_validation,",
+            "lineNumber": 474
+          },
+          {
+            "text": "            question, top_k=10",
+            "lineNumber": 475
+          }
+        ]
+      },
+      "score": 0.5614044666290283
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 394,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 395,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "async def aquery(self, question: str) -&gt; Tuple[str, Optional[str]]:",
+            "lineNumber": 449
+          },
+          {
+            "lineNumber": 472
+          },
+          {
+            "text": "        rag_result = await asyncio.to_thread(",
+            "lineNumber": 473
+          },
+          {
+            "text": "            self.rag.retrieve_with_validation,",
+            "lineNumber": 474
+          },
+          {
+            "text": "            question, top_k=10, use_rerank=True, rerank_top=5,",
+            "lineNumber": 475
+          },
+          {
+            "text": "        )",
+            "lineNumber": 476
+          },
+          {
+            "text": "        trace.retrieve_attempt = rag_result.attempt",
+            "lineNumber": 477
+          },
+          {
+            "text": "        trace.source_count = len(rag_result.chunks)",
+            "lineNumber": 478
+          },
+          {
+            "text": "        trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))",
+            "lineNumber": 479
+          },
+          {
+            "text": "        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))",
+            "lineNumber": 480
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 481
+          },
+          {
+            "text": "            trace.top_match_score = max(e.match_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 482
+          },
+          {
+            "text": "            trace.top_normalized_score = max(e.normalized_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 483
+          },
+          {
+            "text": "        if not rag_result.chunks:",
+            "lineNumber": 484
+          },
+          {
+            "text": "            trace.final_status = \"rag_no_hit\"",
+            "lineNumber": 485
+          },
+          {
+            "text": "            trace.fallback_reason = \"no_retrieval_hit\"",
+            "lineNumber": 486
+          },
+          {
+            "text": "            return (\"未找到相关知识，建议您换个问法或转人工客服。\", None)",
+            "lineNumber": 487
+          },
+          {
+            "text": "        answer_text = await self._generate_grounded_answer_async(question, rag_result, trace=trace)",
+            "lineNumber": 488
+          },
+          {
+            "text": "        sources_block = _format_sources(rag_result)",
+            "lineNumber": 489
+          },
+          {
+            "text": "        if sources_block:",
+            "lineNumber": 490
+          },
+          {
+            "text": "            return (answer_text + \"\\n\\n\" + sources_block, None)",
+            "lineNumber": 491
+          },
+          {
+            "text": "        return (answer_text, None)",
+            "lineNumber": 492
+          },
+          {
+            "lineNumber": 493
+          },
+          {
+            "text": "    async def aquery_stream(",
+            "lineNumber": 494
+          },
+          {
+            "text": "        self, question: str, pending_sql_out: Optional[List[str]] = None",
+            "lineNumber": 495
+          },
+          {
+            "text": "    ) -&gt; AsyncIterator[str]:",
+            "lineNumber": 496
+          },
+          {
+            "text": "        ",
+            "lineNumber": 497
+          }
+        ]
+      },
+      "score": 0.5443345904350281
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 109,
+            "column": 9
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 114
+          },
+          {
+            "text": "    知识库问答统一入口：按顺序尝试 QA 精准匹配 → Text2SQL → RAG。",
+            "lineNumber": 115
+          },
+          {
+            "text": "    其中 RAG 生成阶段使用的 LLM 仅限 DeepSeek（_get_llm），不调用 OpenAI。",
+            "lineNumber": 116
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 117
+          },
+          {
+            "lineNumber": 118
+          },
+          {
+            "text": "    def __init__(self):",
+            "lineNumber": 119
+          },
+          {
+            "text": "        \"\"\"初始化 QA 库、Text2SQL、RAG 检索器及 RAG 用 LLM 链（仅 DeepSeek）。\"\"\"",
+            "lineNumber": 120
+          },
+          {
+            "text": "        self.qa = QAStore()",
+            "lineNumber": 121
+          },
+          {
+            "text": "        self.text2sql = Text2SQL()",
+            "lineNumber": 122
+          },
+          {
+            "text": "        self.rag = get_rag_retriever()",
+            "lineNumber": 123
+          },
+          {
+            "text": "        self._llm = _get_llm()  # 仅 DeepSeek，禁止 OpenAI",
+            "lineNumber": 124
+          },
+          {
+            "text": "        self._rag_chain = _RAG_PROMPT | self._llm",
+            "lineNumber": 125
+          },
+          {
+            "text": "        self._last_trace = KnowledgeQueryTrace(final_status=\"init\")",
+            "lineNumber": 126
+          },
+          {
+            "lineNumber": 127
+          },
+          {
+            "text": "    def _reset_trace(self) -&gt; KnowledgeQueryTrace:",
+            "lineNumber": 128
+          },
+          {
+            "text": "        \"\"\"开始一次新的知识库问答前重置 trace。\"\"\"",
+            "lineNumber": 129
+          },
+          {
+            "lineNumber": 130
+          },
+          {
+            "text": "        self._last_trace = KnowledgeQueryTrace()",
+            "lineNumber": 131
+          },
+          {
+            "text": "        return self._last_trace",
+            "lineNumber": 132
+          },
+          {
+            "lineNumber": 133
+          },
+          {
+            "text": "    def get_last_trace(self) -&gt; dict[str, Any]:",
+            "lineNumber": 134
+          },
+          {
+            "text": "        \"\"\"返回最近一次 query / aquery / aquery_stream 的追踪信息。\"\"\"",
+            "lineNumber": 135
+          },
+          {
+            "lineNumber": 136
+          },
+          {
+            "text": "        return deepcopy(self._last_trace.to_dict())",
+            "lineNumber": 137
+          },
+          {
+            "lineNumber": 138
+          },
+          {
+            "text": "    def _build_rag_context(self, rag_result: RAGRetrieveResult) -&gt; str:",
+            "lineNumber": 139
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 140
+          }
+        ]
+      },
+      "score": 0.47145259380340576
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554,
+            "column": 27
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 494,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 497,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "async def aquery_stream(",
+            "lineNumber": 494
+          },
+          {
+            "text": "        self, question: str, pending_sql_out: Optional[List[str]] = None",
+            "lineNumber": 495
+          },
+          {
+            "text": "    ) -&gt; AsyncIterator[str]:",
+            "lineNumber": 496
+          },
+          {
+            "lineNumber": 536
+          },
+          {
+            "text": "        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))",
+            "lineNumber": 537
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 538
+          },
+          {
+            "text": "            trace.top_match_score = max(e.match_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 539
+          },
+          {
+            "text": "            trace.top_normalized_score = max(e.normalized_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 540
+          },
+          {
+            "text": "        if not rag_result.chunks:",
+            "lineNumber": 541
+          },
+          {
+            "text": "            trace.final_status = \"rag_no_hit\"",
+            "lineNumber": 542
+          },
+          {
+            "text": "            trace.fallback_reason = \"no_retrieval_hit\"",
+            "lineNumber": 543
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(\"未找到相关知识，建议您换个问法或转人工客服。\"):",
+            "lineNumber": 544
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 545
+          },
+          {
+            "text": "            return",
+            "lineNumber": 546
+          },
+          {
+            "lineNumber": 547
+          },
+          {
+            "text": "        answer_text = await self._generate_grounded_answer_async(question, rag_result, trace)",
+            "lineNumber": 548
+          },
+          {
+            "text": "        for c in self._yield_text_chunked(answer_text):",
+            "lineNumber": 549
+          },
+          {
+            "text": "            yield c",
+            "lineNumber": 550
+          },
+          {
+            "lineNumber": 551
+          },
+          {
+            "text": "        sources_block = _format_sources(rag_result)",
+            "lineNumber": 552
+          },
+          {
+            "text": "        if sources_block:",
+            "lineNumber": 553
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(\"\\n\\n\" + sources_block):",
+            "lineNumber": 554
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 555,
+            "isSignature": true
+          }
+        ]
+      },
+      "score": 0.4708631932735443
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "def _answer_grounding_score(self, answer_text: str, rag_result: RAGRetrieveResult) -&gt; float:",
+            "lineNumber": 178
+          },
+          {
+            "text": " for text in candidates)",
+            "lineNumber": 196
+          },
+          {
+            "lineNumber": 197
+          },
+          {
+            "text": "    def _generate_grounded_answer(",
+            "lineNumber": 198
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 199
+          },
+          {
+            "text": "        question: str,",
+            "lineNumber": 200
+          },
+          {
+            "text": "        rag_result: RAGRetrieveResult,",
+            "lineNumber": 201
+          },
+          {
+            "text": "        trace: Optional[KnowledgeQueryTrace] = None,",
+            "lineNumber": 202
+          },
+          {
+            "text": "    ) -&gt; str:",
+            "lineNumber": 203
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 204
+          },
+          {
+            "text": "        基于检索结果生成最终答案；若答案与检索文档关联度低，则视为可能幻觉并重生成，最多 3 次。",
+            "lineNumber": 205
+          },
+          {
+            "text": "        超过最大次数仍不达标时返回保守兜底文案。",
+            "lineNumber": 206
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 207
+          },
+          {
+            "text": "        context = self._build_rag_context(rag_result)",
+            "lineNumber": 208
+          },
+          {
+            "text": "        if not context.strip():",
+            "lineNumber": 209
+          },
+          {
+            "text": "            if trace is not None:",
+            "lineNumber": 210
+          },
+          {
+            "text": "                trace.final_status = \"rag_no_context\"",
+            "lineNumber": 211
+          },
+          {
+            "text": "                trace.fallback_reason = \"empty_context\"",
+            "lineNumber": 212
+          },
+          {
+            "text": "            return \"未找到相关知识，建议您换个问法或转人工客服。\"",
+            "lineNumber": 213
+          },
+          {
+            "lineNumber": 214
+          },
+          {
+            "text": "        settings = get_settings()",
+            "lineNumber": 215
+          },
+          {
+            "text": "        min_score = float(getattr(settings, \"rag_answer_grounding_min_score\", 0.18))",
+            "lineNumber": 216
+          },
+          {
+            "text": "        max_times = max(1, int(getattr(settings, \"rag_answer_max_regenerate_times\", 3)))",
+            "lineNumber": 217
+          },
+          {
+            "text": "        selected_templates = select_prompt_templates(question)",
+            "lineNumber": 218
+          },
+          {
+            "text": "        scenario_guidance = render_prompt_template_guidance(question)",
+            "lineNumber": 219
+          },
+          {
+            "text": "        if trace is not None:",
+            "lineNumber": 220
+          },
+          {
+            "text": "            trace.scenario_templates = [item.name for item in selected_templates]",
+            "lineNumber": 221
+          },
+          {
+            "text": "        retry_note = \"\"",
+            "lineNumber": 222
+          },
+          {
+            "text": "        last_answer = \"\"",
+            "lineNumber": 223
+          },
+          {
+            "text": "        last_score = 0.0",
+            "lineNumber": 224
+          },
+          {
+            "text": "        for attempt in range(max_times):",
+            "lineNumber": 225
+          },
+          {
+            "text": "            try:",
+            "lineNumber": 226
+          },
+          {
+            "text": "                resp = self._rag_chain.invoke",
+            "lineNumber": 227
+          }
+        ]
+      },
+      "score": 0.43850386142730713
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 198,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 204,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "async def _generate_grounded_answer_async(",
+            "lineNumber": 267
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 268
+          },
+          {
+            "text": "        question: str,",
+            "lineNumber": 269
+          },
+          {
+            "text": "        rag_result: RAGRetrieveResult,",
+            "lineNumber": 270
+          },
+          {
+            "text": "        trace: Optional[KnowledgeQueryTrace] = None,",
+            "lineNumber": 271
+          },
+          {
+            "text": "    ) -&gt; str:",
+            "lineNumber": 272
+          },
+          {
+            "lineNumber": 292
+          },
+          {
+            "text": "        for attempt in range(max_times):",
+            "lineNumber": 293
+          },
+          {
+            "text": "            try:",
+            "lineNumber": 294
+          },
+          {
+            "text": "                resp = await self._rag_chain.ainvoke(",
+            "lineNumber": 295
+          },
+          {
+            "text": "                    {",
+            "lineNumber": 296
+          },
+          {
+            "text": "                        \"context\": context,",
+            "lineNumber": 297
+          },
+          {
+            "text": "                        \"question\": question,",
+            "lineNumber": 298
+          },
+          {
+            "text": "                        \"scenario_guidance\": scenario_guidance,",
+            "lineNumber": 299
+          },
+          {
+            "text": "                        \"retry_note\": retry_note,",
+            "lineNumber": 300
+          },
+          {
+            "text": "                    }",
+            "lineNumber": 301
+          },
+          {
+            "text": "                )",
+            "lineNumber": 302
+          },
+          {
+            "text": "                answer_text = (resp.content or \"\").strip()",
+            "lineNumber": 303
+          },
+          {
+            "text": "            except Exception:",
+            "lineNumber": 304
+          },
+          {
+            "text": "                answer_text = \"\"",
+            "lineNumber": 305
+          },
+          {
+            "text": "            if not answer_text:",
+            "lineNumber": 306
+          },
+          {
+            "text": "                answer_text = \"根据当前检索结果无法确认，建议您补充问题或转人工客服。\"",
+            "lineNumber": 307
+          },
+          {
+            "text": "            score = self._answer_grounding_score(answer_text, rag_result)",
+            "lineNumber": 308
+          },
+          {
+            "text": "            has_citations = self._answer_has_evidence_citations(answer_text)",
+            "lineNumber": 309
+          },
+          {
+            "text": "            last_answer = answer_text",
+            "lineNumber": 310
+          },
+          {
+            "text": "            last_score = score",
+            "lineNumber": 311
+          },
+          {
+            "text": "            if trace is not None:",
+            "lineNumber": 312
+          },
+          {
+            "text": "                trace.grounding_score = score",
+            "lineNumber": 313
+          },
+          {
+            "text": "                trace.has_evidence_citations = has_citations",
+            "lineNumber": 314
+          },
+          {
+            "text": "                trace.regenerate_count = attempt",
+            "lineNumber": 315
+          },
+          {
+            "text": "            if score &gt;= min_score and has_citations:",
+            "lineNumber": 316
+          },
+          {
+            "text": "                if trace is not None:",
+            "lineNumber": 317
+          },
+          {
+            "text": "                    trace.final_status = \"rag_regenerated\" if attempt &gt; 0 else \"rag_grounded\"",
+            "lineNumber": 318
+          },
+          {
+            "text": "                return answer_text",
+            "lineNumber": 319
+          },
+          {
+            "text": "            citation_note = \"上一版答案缺少证据编号，请在每个关键结论后补充 [证据N]。\" if not has_citations else \"\"",
+            "lineNumber": 320
+          },
+          {
+            "text": "            retry_note = (",
+            "lineNumber": 321
+          },
+          {
+            "text": "                f\"上一版答案与参考内容关联度过低（score={score:.3f} &lt; {min_score:.3f}），\"",
+            "lineNumber": 322
+          },
+          {
+            "text": "                \"请仅保留能直接从参考内容中得到的事实，删除无法从参考内容明确支持的表述后重新回答。\"",
+            "lineNumber": 323
+          },
+          {
+            "text": "                + citation_note",
+            "lineNumber": 324
+          },
+          {
+            "text": "            )",
+            "lineNumber": 325
+          },
+          {
+            "text": "        if trace is not None:",
+            "lineNumber": 326
+          },
+          {
+            "text": "            trace.final_status = \"rag_fallback_unconfirmed\"",
+            "lineNumber": 327
+          },
+          {
+            "text": "            trace.fallback_reason = \"low_grounding_after_regeneration\"",
+            "lineNumber": 328
+          },
+          {
+            "text": "        return (",
+            "lineNumber": 329
+          },
+          {
+            "text": "            \"根据当前检索结果无法确认，建议您补充更具体的问题或转人工客服。",
+            "lineNumber": 330
+          }
+        ]
+      },
+      "score": 0.43581676483154297
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {
+            "line": 62
+          },
+          "endPosition": {
+            "line": 332
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 63,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 64,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class RAGRetriever:",
+            "lineNumber": 63,
+            "isSignature": true
+          },
+          {
+            "text": "def _is_retrieval_acceptable(self, chunks_with_eval: List[ChunkWithEval], min_score: float) -&gt; bool:",
+            "lineNumber": 261
+          },
+          {
+            "lineNumber": 267
+          },
+          {
+            "text": "        return False",
+            "lineNumber": 268
+          },
+          {
+            "lineNumber": 269
+          },
+          {
+            "text": "    def retrieve(",
+            "lineNumber": 270
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 271
+          },
+          {
+            "text": "        query: str,",
+            "lineNumber": 272
+          },
+          {
+            "text": "        top_k: int = 10,",
+            "lineNumber": 273
+          },
+          {
+            "text": "        use_rerank: bool = True,",
+            "lineNumber": 274
+          },
+          {
+            "text": "        rerank_top: int = 5,",
+            "lineNumber": 275
+          },
+          {
+            "text": "    ) -&gt; List[dict]:",
+            "lineNumber": 276
+          },
+          {
+            "text": "        \"\"\"兼容旧接口：混合检索 3:7，重排，返回 dict 列表（无评估与重检）。\"\"\"",
+            "lineNumber": 277
+          },
+          {
+            "text": "        merged = self._merge_3_7(query, top_k, use_rerank, rerank_top)",
+            "lineNumber": 278
+          },
+          {
+            "text": "        return [",
+            "lineNumber": 279
+          },
+          {
+            "text": "            {",
+            "lineNumber": 280
+          },
+          {
+            "text": "                \"content\": c.get(\"content\"),",
+            "lineNumber": 281
+          },
+          {
+            "text": "                \"parent_content\": c.get(\"parent_content\"),",
+            "lineNumber": 282
+          },
+          {
+            "text": "                \"score\": c.get(\"rerank_score\", c.get(\"score\")),",
+            "lineNumber": 283
+          },
+          {
+            "text": "                \"source\": c.get(\"source\"),",
+            "lineNumber": 284
+          },
+          {
+            "text": "            }",
+            "lineNumber": 285
+          },
+          {
+            "text": "            for c in merged",
+            "lineNumber": 286
+          },
+          {
+            "text": "        ]",
+            "lineNumber": 287
+          },
+          {
+            "lineNumber": 288
+          },
+          {
+            "text": "    def retrieve_with_validation(",
+            "lineNumber": 289
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 290
+          },
+          {
+            "text": "        query: str,",
+            "lineNumber": 291
+          },
+          {
+            "text": "        top_k: int = 10,",
+            "lineNumber": 292
+          },
+          {
+            "text": "        use_rerank: bool = True,",
+            "lineNumber": 293
+          },
+          {
+            "text": "        rerank_top: int = 5,",
+            "lineNumber": 294
+          },
+          {
+            "text": "    ) -&gt; RAGRetrieveResult:",
+            "lineNumber": 295
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 296
+          },
+          {
+            "text": "        混合检索（3:7）+ 评估；若最佳匹配度 &lt; 0.3 或过无关则重检，最多 3 次。",
+            "lineNumber": 297
+          },
+          {
+            "text": "        返回通过的切片及评估信息，供生成答案并展示来源。",
+            "lineNumber": 298
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 299
+          },
+          {
+            "text": "        s = _get_settings()",
+            "lineNumber": 300
+          },
+          {
+            "text": "        min_score = s.rag_min_match_score",
+            "lineNumber": 301
+          },
+          {
+            "text": "        max_attempts = s.rag_max_retrieve_attempts",
+            "lineNumber": 302
+          },
+          {
+            "text": "        current_k = top_k",
+            "lineNumber": 303
+          },
+          {
+            "text": "        last_chunks_with_eval: List[ChunkWithEval] = []",
+            "lineNumber": 304
+          },
+          {
+            "text": "        last_evals: List[RetrievalEvalResult] = []",
+            "lineNumber": 305
+          },
+          {
+            "lineNumber": 306
+          },
+          {
+            "text": "        for attempt in range(1, max_attempts + 1):",
+            "lineNumber": 307
+          }
+        ]
+      },
+      "score": 0.43330320715904236
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 198,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 204,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "def _generate_grounded_answer(",
+            "lineNumber": 198
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 199
+          },
+          {
+            "text": "        question: str,",
+            "lineNumber": 200
+          },
+          {
+            "text": "        rag_result: RAGRetrieveResult,",
+            "lineNumber": 201
+          },
+          {
+            "text": "        trace: Optional[KnowledgeQueryTrace] = None,",
+            "lineNumber": 202
+          },
+          {
+            "text": "    ) -&gt; str:",
+            "lineNumber": 203
+          },
+          {
+            "lineNumber": 224
+          },
+          {
+            "text": "        for attempt in range(max_times):",
+            "lineNumber": 225
+          },
+          {
+            "text": "            try:",
+            "lineNumber": 226
+          },
+          {
+            "text": "                resp = self._rag_chain.invoke(",
+            "lineNumber": 227
+          },
+          {
+            "text": "                    {",
+            "lineNumber": 228
+          },
+          {
+            "text": "                        \"context\": context,",
+            "lineNumber": 229
+          },
+          {
+            "text": "                        \"question\": question,",
+            "lineNumber": 230
+          },
+          {
+            "text": "                        \"scenario_guidance\": scenario_guidance,",
+            "lineNumber": 231
+          },
+          {
+            "text": "                        \"retry_note\": retry_note,",
+            "lineNumber": 232
+          },
+          {
+            "text": "                    }",
+            "lineNumber": 233
+          },
+          {
+            "text": "                )",
+            "lineNumber": 234
+          },
+          {
+            "text": "                answer_text = (resp.content or \"\").strip()",
+            "lineNumber": 235
+          },
+          {
+            "text": "            except Exception:",
+            "lineNumber": 236
+          },
+          {
+            "text": "                answer_text = \"\"",
+            "lineNumber": 237
+          },
+          {
+            "text": "            if not answer_text:",
+            "lineNumber": 238
+          },
+          {
+            "text": "                answer_text = \"根据当前检索结果无法确认，建议您补充问题或转人工客服。\"",
+            "lineNumber": 239
+          },
+          {
+            "text": "            score = self._answer_grounding_score(answer_text, rag_result)",
+            "lineNumber": 240
+          },
+          {
+            "text": "            has_citations = self._answer_has_evidence_citations(answer_text)",
+            "lineNumber": 241
+          },
+          {
+            "text": "            last_answer = answer_text",
+            "lineNumber": 242
+          },
+          {
+            "text": "            last_score = score",
+            "lineNumber": 243
+          },
+          {
+            "text": "            if trace is not None:",
+            "lineNumber": 244
+          },
+          {
+            "text": "                trace.grounding_score = score",
+            "lineNumber": 245
+          },
+          {
+            "text": "                trace.has_evidence_citations = has_citations",
+            "lineNumber": 246
+          },
+          {
+            "text": "                trace.regenerate_count = attempt",
+            "lineNumber": 247
+          },
+          {
+            "text": "            if score &gt;= min_score and has_citations:",
+            "lineNumber": 248
+          },
+          {
+            "text": "                if trace is not None:",
+            "lineNumber": 249
+          },
+          {
+            "text": "                    trace.final_status = \"rag_regenerated\" if attempt &gt; 0 else \"rag_grounded\"",
+            "lineNumber": 250
+          },
+          {
+            "text": "                return answer_text",
+            "lineNumber": 251
+          },
+          {
+            "text": "            citation_note = \"上一版答案缺少证据编号，请在每个关键结论后补充 [证据N]。\" if not has_citations else \"\"",
+            "lineNumber": 252
+          },
+          {
+            "text": "            retry_note = (",
+            "lineNumber": 253
+          },
+          {
+            "text": "                f\"上一版答案与参考内容关联度过低（score={score:.3f} &lt; {min_score:.3f}），\"",
+            "lineNumber": 254
+          },
+          {
+            "text": "                \"请仅保留能直接从参考内容中得到的事实，删除无法从参考内容明确支持的表述后重新回答。\"",
+            "lineNumber": 255
+          },
+          {
+            "text": "                + citation_note",
+            "lineNumber": 256
+          },
+          {
+            "text": "            )",
+            "lineNumber": 257
+          },
+          {
+            "text": "        if trace is not None:",
+            "lineNumber": 258
+          },
+          {
+            "text": "            trace.final_status = \"rag_fallback_unconfirmed\"",
+            "lineNumber": 259
+          },
+          {
+            "text": "            trace.fallback_reason = \"low_grounding_after_regeneration\"",
+            "lineNumber": 260
+          },
+          {
+            "text": "        return (",
+            "lineNumber": 261
+          },
+          {
+            "text": "            \"根据当前检索结果无法确认，建议您补充更具体的问题或转人工客服。",
+            "lineNumber": 262
+          }
+        ]
+      },
+      "score": 0.42995136976242065
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 28,
+            "column": 46
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# src/kb/engine.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "知识库统一入口：优先 QA 精准匹配 → Text2SQL → RAG 检索生成；RAG 答案展示依据来源与依赖切片。",
+            "lineNumber": 3
+          },
+          {
+            "text": "大模型仅使用 DeepSeek（src.llm.get_deepseek_llm），不调用 OpenAI。",
+            "lineNumber": 4
+          },
+          {
+            "text": "支持同步 query/query_stream 与异步 aquery_stream，便于高性能并发。",
+            "lineNumber": 5
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 6
+          },
+          {
+            "text": "import asyncio",
+            "lineNumber": 7
+          },
+          {
+            "text": "import re",
+            "lineNumber": 8
+          },
+          {
+            "text": "from copy import deepcopy",
+            "lineNumber": 9
+          },
+          {
+            "text": "from dataclasses import dataclass, field",
+            "lineNumber": 10
+          },
+          {
+            "text": "from typing import Any, AsyncIterator, List, Optional, Tuple",
+            "lineNumber": 11
+          },
+          {
+            "lineNumber": 12
+          },
+          {
+            "text": "from langchain_core.prompts import ChatPromptTemplate",
+            "lineNumber": 13
+          },
+          {
+            "lineNumber": 14
+          },
+          {
+            "text": "from config import get_settings",
+            "lineNumber": 15
+          },
+          {
+            "text": "from src.llm import get_deepseek_llm",
+            "lineNumber": 16
+          },
+          {
+            "text": "from .prompt_templates import render_prompt_template_guidance, select_prompt_templates",
+            "lineNumber": 17
+          },
+          {
+            "text": "from .qa_store import QAStore",
+            "lineNumber": 18
+          },
+          {
+            "text": "from .text2sql import Text2SQL, Text2SQLConfirmRequired",
+            "lineNumber": 19
+          },
+          {
+            "text": "from .rag import get_rag_retriever, RAGRetrieveResult",
+            "lineNumber": 20
+          },
+          {
+            "text": "from .retrieval_eval import evaluate_retrieval",
+            "lineNumber": 21
+          },
+          {
+            "lineNumber": 22
+          },
+          {
+            "lineNumber": 23
+          },
+          {
+            "text": "def _get_llm():",
+            "lineNumber": 24,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"获取 DeepSeek 对话模型（仅此项目允许的大模型，非 OpenAI）。\"\"\"",
+            "lineNumber": 25
+          },
+          {
+            "text": "    return get_deepseek_llm(temperature=0.3)",
+            "lineNumber": 26,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 27
+          },
+          {
+            "lineNumber": 28
+          },
+          {
+            "text": "_RAG_PROMPT = ChatPromptTemplate.from_messages",
+            "lineNumber": 29
+          }
+        ]
+      },
+      "score": 0.4173421859741211
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 198,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 204,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "def query(self, question: str) -&gt; Tuple[str, Optional[str]]:",
+            "lineNumber": 335
+          },
+          {
+            "lineNumber": 367
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 368
+          },
+          {
+            "text": "            trace.top_match_score = max(e.match_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 369
+          },
+          {
+            "text": "            trace.top_normalized_score = max(e.normalized_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 370
+          },
+          {
+            "text": "        if not rag_result.chunks:",
+            "lineNumber": 371
+          },
+          {
+            "text": "            trace.final_status = \"rag_no_hit\"",
+            "lineNumber": 372
+          },
+          {
+            "text": "            trace.fallback_reason = \"no_retrieval_hit\"",
+            "lineNumber": 373
+          },
+          {
+            "text": "            return (\"未找到相关知识，建议您换个问法或转人工客服。\", None)",
+            "lineNumber": 374
+          },
+          {
+            "lineNumber": 375
+          },
+          {
+            "text": "        answer_text = self._generate_grounded_answer(question, rag_result, trace=trace)",
+            "lineNumber": 376
+          },
+          {
+            "lineNumber": 377
+          },
+          {
+            "text": "        # 答案 + 依据来源（依赖的切片全部展示）",
+            "lineNumber": 378
+          },
+          {
+            "text": "        sources_block = _format_sources(rag_result)",
+            "lineNumber": 379
+          },
+          {
+            "text": "        if sources_block:",
+            "lineNumber": 380
+          },
+          {
+            "text": "            return (answer_text + \"\\n\\n\" + sources_block, None)",
+            "lineNumber": 381
+          },
+          {
+            "text": "        return (answer_text, None)",
+            "lineNumber": 382
+          },
+          {
+            "lineNumber": 383
+          },
+          {
+            "text": "    def _yield_text_chunked(self, text: str):",
+            "lineNumber": 384
+          },
+          {
+            "text": "        \"\"\"将整段文本按「首字 + 后续 64 字/块」yield，用于 QA/Text2SQL 结果的流式输出。\"\"\"",
+            "lineNumber": 385
+          },
+          {
+            "text": "        if not text:",
+            "lineNumber": 386
+          },
+          {
+            "text": "            return",
+            "lineNumber": 387
+          },
+          {
+            "text": "        yield text[0:1]",
+            "lineNumber": 388
+          },
+          {
+            "text": "        rest = text[1:]",
+            "lineNumber": 389
+          },
+          {
+            "text": "        chunk_size = 64",
+            "lineNumber": 390
+          },
+          {
+            "text": "        for i in range(0, len(rest), chunk_size):",
+            "lineNumber": 391
+          },
+          {
+            "text": "            yield rest[i : i + chunk_size]",
+            "lineNumber": 392
+          },
+          {
+            "lineNumber": 393
+          },
+          {
+            "text": "    def query_stream(self, question: str):",
+            "lineNumber": 394
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 395
+          }
+        ]
+      },
+      "score": 0.41731274127960205
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {
+            "line": 59,
+            "column": 41
+          },
+          "endPosition": {
+            "line": 332
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "class RAGRetriever:",
+            "lineNumber": 63,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 64
+          },
+          {
+            "text": "    RAG 检索器：全文(BM25)与向量(Milvus/HNSW)按 3:7 合并，BGE 重排，",
+            "lineNumber": 65
+          },
+          {
+            "text": "    对候选做匹配度/无关比例评估，低于阈值则重检（最多 3 次）。",
+            "lineNumber": 66
+          },
+          {
+            "text": "    向量与重排均为本地部署：BGE-M3 / BGE Reranker 在进程内加载，不调用任何远程 embedding/rerank API。",
+            "lineNumber": 67
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 68
+          },
+          {
+            "lineNumber": 69
+          },
+          {
+            "text": "    def __init__(self):",
+            "lineNumber": 70
+          },
+          {
+            "text": "        self._embedding = None  # BGE-M3，本地加载",
+            "lineNumber": 71
+          },
+          {
+            "text": "        self._reranker = None   # BGE Reranker Large，本地加载",
+            "lineNumber": 72
+          },
+          {
+            "text": "        self._milvus_collection = None",
+            "lineNumber": 73
+          },
+          {
+            "text": "        self._bm25_index = None",
+            "lineNumber": 74
+          },
+          {
+            "text": "        self._bm25_corpus: List[str] = []",
+            "lineNumber": 75
+          },
+          {
+            "text": "        self._init_embedding()",
+            "lineNumber": 76
+          },
+          {
+            "text": "        self._init_reranker()",
+            "lineNumber": 77
+          },
+          {
+            "text": "        self._init_milvus()",
+            "lineNumber": 78
+          },
+          {
+            "text": "        self._init_bm25()",
+            "lineNumber": 79
+          },
+          {
+            "lineNumber": 80
+          },
+          {
+            "text": "    def _init_embedding(self) -&gt; None:",
+            "lineNumber": 81
+          },
+          {
+            "text": "        \"\"\"使用单例 BGE-M3，与 MilvusUploader 复用，避免重复加载。\"\"\"",
+            "lineNumber": 82
+          },
+          {
+            "text": "        self._embedding = get_bge_embedding()",
+            "lineNumber": 83
+          },
+          {
+            "lineNumber": 84
+          },
+          {
+            "text": "    def _init_reranker(self) -&gt; None:",
+            "lineNumber": 85
+          },
+          {
+            "text": "        \"\"\"使用单例 BGE Reranker Large。\"\"\"",
+            "lineNumber": 86
+          },
+          {
+            "text": "        self._reranker = get_bge_reranker()",
+            "lineNumber": 87
+          },
+          {
+            "lineNumber": 88
+          },
+          {
+            "text": "    def _init_milvus(self) -&gt; None:",
+            "lineNumber": 89
+          },
+          {
+            "text": "        \"\"\"通过 db_resilience 连接 Milvus（支持重试 + 熔断 + 懒重连）。\"\"\"",
+            "lineNumber": 90
+          },
+          {
+            "text": "        from src.db_resilience import get_milvus_collection",
+            "lineNumber": 91
+          },
+          {
+            "text": "        s = _get_settings()",
+            "lineNumber": 92
+          },
+          {
+            "text": "        self._milvus_collection = get_milvus_collection(",
+            "lineNumber": 93
+          },
+          {
+            "text": "            s.milvus_uri, s.milvus_collection,",
+            "lineNumber": 94
+          },
+          {
+            "text": "        )",
+            "lineNumber": 95
+          },
+          {
+            "lineNumber": 96
+          },
+          {
+            "text": "    def _init_bm25(self) -&gt; None:",
+            "lineNumber": 97
+          },
+          {
+            "text": "        \"\"\"BM25 索引需由 build_bm25_from_docs 在有文档时构建，此处仅置空。\"\"\"",
+            "lineNumber": 98
+          },
+          {
+            "text": "        self._bm25_index = None",
+            "lineNumber": 99
+          },
+          {
+            "text": "        self._bm25_corpus = []",
+            "lineNumber": 100
+          },
+          {
+            "lineNumber": 101
+          },
+          {
+            "text": "    def embed(self, texts: List[str]):",
+            "lineNumber": 102
+          },
+          {
+            "text": "        \"\"\"BGE-M3 编码文本列表，返回向量列表；模型未加载时返回 None。\"\"\"",
+            "lineNumber": 103
+          },
+          {
+            "text": "        if self._embedding is None:",
+            "lineNumber": 104
+          },
+          {
+            "text": "            return None",
+            "lineNumber": 105
+          },
+          {
+            "text": "        return self._embedding.encode(texts).tolist()",
+            "lineNumber": 106
+          },
+          {
+            "lineNumber": 107
+          },
+          {
+            "text": "    def _vector_search(self, query: str, top_k: int) -&gt; List[dict]:",
+            "lineNumber": 108
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 109
+          }
+        ]
+      },
+      "score": 0.3950127363204956
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 198,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 204,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "def _generate_grounded_answer(",
+            "lineNumber": 198
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 199
+          },
+          {
+            "text": "        question: str,",
+            "lineNumber": 200
+          },
+          {
+            "text": "        rag_result: RAGRetrieveResult,",
+            "lineNumber": 201
+          },
+          {
+            "text": "        trace: Optional[KnowledgeQueryTrace] = None,",
+            "lineNumber": 202
+          },
+          {
+            "text": "    ) -&gt; str:",
+            "lineNumber": 203
+          },
+          {
+            "lineNumber": 260
+          },
+          {
+            "text": "        return (",
+            "lineNumber": 261
+          },
+          {
+            "text": "            \"根据当前检索结果无法确认，建议您补充更具体的问题或转人工客服。\"",
+            "lineNumber": 262
+          },
+          {
+            "text": "            if last_score &lt; min_score",
+            "lineNumber": 263
+          },
+          {
+            "text": "            else last_answer",
+            "lineNumber": 264
+          },
+          {
+            "text": "        )",
+            "lineNumber": 265
+          },
+          {
+            "lineNumber": 266
+          },
+          {
+            "text": "    async def _generate_grounded_answer_async(",
+            "lineNumber": 267
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 268
+          },
+          {
+            "text": "        question: str,",
+            "lineNumber": 269
+          },
+          {
+            "text": "        rag_result: RAGRetrieveResult,",
+            "lineNumber": 270
+          },
+          {
+            "text": "        trace: Optional[KnowledgeQueryTrace] = None,",
+            "lineNumber": 271
+          },
+          {
+            "text": "    ) -&gt; str:",
+            "lineNumber": 272
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 273
+          },
+          {
+            "text": "        异步版：用 ainvoke 生成答案，不占线程池，便于高并发。逻辑与 _generate_grounded_answer 一致。",
+            "lineNumber": 274
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 275
+          },
+          {
+            "text": "        context = self._build_rag_context(rag_result)",
+            "lineNumber": 276
+          },
+          {
+            "text": "        if not context.strip():",
+            "lineNumber": 277
+          },
+          {
+            "text": "            if trace is not None:",
+            "lineNumber": 278
+          },
+          {
+            "text": "                trace.final_status = \"rag_no_context\"",
+            "lineNumber": 279
+          },
+          {
+            "text": "                trace.fallback_reason = \"empty_context\"",
+            "lineNumber": 280
+          },
+          {
+            "text": "            return \"未找到相关知识，建议您换个问法或转人工客服。\"",
+            "lineNumber": 281
+          },
+          {
+            "lineNumber": 282
+          },
+          {
+            "text": "        settings = get_settings()",
+            "lineNumber": 283
+          },
+          {
+            "text": "        min_score = float(getattr(settings, \"rag_answer_grounding_min_score\", 0.18))",
+            "lineNumber": 284
+          },
+          {
+            "text": "        max_times = max(1, int(getattr(settings, \"rag_answer_max_regenerate_times\", 3)))",
+            "lineNumber": 285
+          },
+          {
+            "text": "        selected_templates = select_prompt_templates(question)",
+            "lineNumber": 286
+          },
+          {
+            "text": "        scenario_guidance = render_prompt_template_guidance(question)",
+            "lineNumber": 287
+          },
+          {
+            "text": "        if trace is not None:",
+            "lineNumber": 288
+          },
+          {
+            "text": "            trace.scenario_templates = [item.name for item in selected_templates]",
+            "lineNumber": 289
+          },
+          {
+            "text": "        retry_note = \"\"",
+            "lineNumber": 290
+          },
+          {
+            "text": "        last_answer = \"\"",
+            "lineNumber": 291
+          },
+          {
+            "text": "        last_score = 0.0",
+            "lineNumber": 292
+          },
+          {
+            "text": "        for attempt in range(max_times):",
+            "lineNumber": 293
+          },
+          {
+            "text": "            try:",
+            "lineNumber": 294
+          },
+          {
+            "text": "                resp = await",
+            "lineNumber": 295
+          }
+        ]
+      },
+      "score": 0.37897026538848877
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 29,
+            "column": 25
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# src/kb/rag.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "复杂问题 RAG：BM25 + HNSW 混合检索（3:7），检索评估与重检，答案展示依据来源。",
+            "lineNumber": 3
+          },
+          {
+            "text": "模型使用约定（本项目禁止调用 OpenAI）：",
+            "lineNumber": 4
+          },
+          {
+            "text": "  - 向量模型：仅 BGE-M3（BAAI/bge-m3），本地部署/本地加载，不调用远程 embedding API；",
+            "lineNumber": 5
+          },
+          {
+            "text": "  - 重排模型：仅 BGE Reranker Large（BAAI/bge-reranker-large），本地部署/本地加载，不调用远程 API；",
+            "lineNumber": 6
+          },
+          {
+            "text": "  - 大模型不在此模块调用，由 kb.engine 使用 DeepSeek。",
+            "lineNumber": 7
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 8
+          },
+          {
+            "text": "import hashlib",
+            "lineNumber": 9
+          },
+          {
+            "text": "import threading",
+            "lineNumber": 10
+          },
+          {
+            "text": "import time",
+            "lineNumber": 11
+          },
+          {
+            "text": "from collections import OrderedDict",
+            "lineNumber": 12
+          },
+          {
+            "text": "from typing import List, Optional, Tuple",
+            "lineNumber": 13
+          },
+          {
+            "text": "from dataclasses import dataclass",
+            "lineNumber": 14
+          },
+          {
+            "lineNumber": 15
+          },
+          {
+            "text": "from config import get_settings",
+            "lineNumber": 16
+          },
+          {
+            "text": "from .retrieval_eval import evaluate_retrieval, RetrievalEvalResult",
+            "lineNumber": 17
+          },
+          {
+            "text": "from .embedding_loader import get_bge_embedding, get_bge_reranker",
+            "lineNumber": 18
+          },
+          {
+            "lineNumber": 19
+          },
+          {
+            "text": "_rag_cache: Optional[OrderedDict] = None",
+            "lineNumber": 20
+          },
+          {
+            "text": "_rag_cache_lock = threading.Lock()",
+            "lineNumber": 21
+          },
+          {
+            "lineNumber": 22
+          },
+          {
+            "lineNumber": 23
+          },
+          {
+            "text": "def _rag_cache_key(query: str, total_k: int, use_rerank: bool, rerank_top: int) -&gt; str:",
+            "lineNumber": 24,
+            "isSignature": true
+          },
+          {
+            "text": "    h = hashlib.sha256(f\"{query}|{total_k}|{use_rerank}|{rerank_top}\".encode()).hexdigest()[:32]",
+            "lineNumber": 25
+          },
+          {
+            "text": "    return f\"rag:v1:{h}\"",
+            "lineNumber": 26,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 27
+          },
+          {
+            "lineNumber": 28
+          },
+          {
+            "text": "def _get_settings():",
+            "lineNumber": 29,
+            "isSignature": true
+          },
+          {
+            "text": "    return get_settings()",
+            "lineNumber": 30,
+            "isSignature": true
+          }
+        ]
+      },
+      "score": 0.37154603004455566
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {
+            "line": 62
+          },
+          "endPosition": {
+            "line": 332,
+            "column": 34
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 63,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 64,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 289,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 296,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class RAGRetriever:",
+            "lineNumber": 63,
+            "isSignature": true
+          },
+          {
+            "text": "def retrieve_with_validation(",
+            "lineNumber": 289
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 290
+          },
+          {
+            "text": "        query: str,",
+            "lineNumber": 291
+          },
+          {
+            "text": "        top_k: int = 10,",
+            "lineNumber": 292
+          },
+          {
+            "text": "        use_rerank: bool = True,",
+            "lineNumber": 293
+          },
+          {
+            "text": "        rerank_top: int = 5,",
+            "lineNumber": 294
+          },
+          {
+            "text": "    ) -&gt; RAGRetrieveResult:",
+            "lineNumber": 295
+          },
+          {
+            "lineNumber": 305
+          },
+          {
+            "lineNumber": 306
+          },
+          {
+            "text": "        for attempt in range(1, max_attempts + 1):",
+            "lineNumber": 307
+          },
+          {
+            "text": "            merged = self._merge_3_7(query, current_k, use_rerank, rerank_top)",
+            "lineNumber": 308
+          },
+          {
+            "text": "            if not merged:",
+            "lineNumber": 309
+          },
+          {
+            "text": "                return RAGRetrieveResult(chunks=[], evals=[], attempt=attempt)",
+            "lineNumber": 310
+          },
+          {
+            "text": "            chunks_with_eval = self._evaluate_candidates(query, merged)",
+            "lineNumber": 311
+          },
+          {
+            "text": "            evals = [c.eval_result for c in chunks_with_eval if c.eval_result is not None]",
+            "lineNumber": 312
+          },
+          {
+            "text": "            last_chunks_with_eval = chunks_with_eval",
+            "lineNumber": 313
+          },
+          {
+            "text": "            last_evals = evals",
+            "lineNumber": 314
+          },
+          {
+            "text": "            # 至少一条匹配度达标且无关比例不过高则通过，否则扩大 top_k 重检",
+            "lineNumber": 315
+          },
+          {
+            "text": "            if self._is_retrieval_acceptable(chunks_with_eval, min_score):",
+            "lineNumber": 316
+          },
+          {
+            "text": "                return RAGRetrieveResult(chunks=chunks_with_eval, evals=evals, attempt=attempt)",
+            "lineNumber": 317
+          },
+          {
+            "text": "            current_k = int(current_k * 1.5) + 2",
+            "lineNumber": 318
+          },
+          {
+            "lineNumber": 319
+          },
+          {
+            "text": "        # 3 次均未通过：不返回低质量切片，交由上层提示“未找到相关知识”",
+            "lineNumber": 320
+          },
+          {
+            "text": "        return RAGRetrieveResult(chunks=[], evals=last_evals, attempt=max_attempts)",
+            "lineNumber": 321
+          },
+          {
+            "lineNumber": 322
+          },
+          {
+            "text": "    def build_bm25_from_docs(self, docs: List[dict]) -&gt; None:",
+            "lineNumber": 323
+          },
+          {
+            "text": "        \"\"\"用文档列表构建 BM25 索引（content 字段）。\"\"\"",
+            "lineNumber": 324
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 325
+          },
+          {
+            "text": "            from rank_bm25 import BM25Okapi",
+            "lineNumber": 326
+          },
+          {
+            "text": "            corpus = [d.get(\"content\", \"\") for d in docs]",
+            "lineNumber": 327
+          },
+          {
+            "text": "            tokenized = [list(t) for t in corpus]",
+            "lineNumber": 328
+          },
+          {
+            "text": "            self._bm25_index = BM25Okapi(tokenized)",
+            "lineNumber": 329
+          },
+          {
+            "text": "            self._bm25_corpus = corpus",
+            "lineNumber": 330
+          },
+          {
+            "text": "        except Exception:",
+            "lineNumber": 331
+          },
+          {
+            "text": "            self._bm25_index = None",
+            "lineNumber": 332
+          },
+          {
+            "text": "            self._bm25_corpus = []",
+            "lineNumber": 333,
+            "isSignature": true
+          }
+        ]
+      },
+      "score": 0.3674162030220032
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 25,
+            "column": 44
+          },
+          "endPosition": {
+            "line": 69
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "_RAG_PROMPT = ChatPromptTemplate.from_messages([",
+            "lineNumber": 29
+          },
+          {
+            "text": "    (\"system\", \"\"\"你是一名海关政策与业务知识助手。你必须严格根据给定的参考片段回答，禁止使用参考内容之外的常识、猜测、补充知识或臆断。",
+            "lineNumber": 30
+          },
+          {
+            "lineNumber": 31
+          },
+          {
+            "text": "要求：",
+            "lineNumber": 32
+          },
+          {
+            "text": "1. 只能依据参考内容回答；若参考内容不足，请明确说明“根据当前检索结果无法确认”，并建议用户补充问题或转人工。",
+            "lineNumber": 33
+          },
+          {
+            "text": "2. 不得编造数字、时间、政策条款、流程、名单、结论。",
+            "lineNumber": 34
+          },
+          {
+            "text": "3. 回答采用结构化输出：优先使用“结论：”“依据：”“提示：”这样的结构；简单问题可只保留必要部分。",
+            "lineNumber": 35
+          },
+          {
+            "text": "4. 任何事实性结论后都必须附上证据编号，例如 [证据1]、[证据2]；不得写“根据经验”“通常来说”之类无证据表述。",
+            "lineNumber": 36
+          },
+          {
+            "text": "5. 简单问题简短答，复杂问题分阶段答（先结论再分点补充）。",
+            "lineNumber": 37
+          },
+          {
+            "text": "6. 若收到“重试说明”，表示上一版答案与参考内容关联度不足；你必须更加严格贴合参考内容重新生成。\"\"\"),",
+            "lineNumber": 38
+          },
+          {
+            "text": "    (\"human\", \"\"\"参考内容：",
+            "lineNumber": 39
+          },
+          {
+            "text": "{context}",
+            "lineNumber": 40
+          },
+          {
+            "lineNumber": 41
+          },
+          {
+            "text": "用户问题：{question}",
+            "lineNumber": 42
+          },
+          {
+            "lineNumber": 43
+          },
+          {
+            "text": "场景化补充要求：",
+            "lineNumber": 44
+          },
+          {
+            "text": "{scenario_guidance}",
+            "lineNumber": 45
+          },
+          {
+            "lineNumber": 46
+          },
+          {
+            "text": "重试说明：",
+            "lineNumber": 47
+          },
+          {
+            "text": "{retry_note}",
+            "lineNumber": 48
+          },
+          {
+            "lineNumber": 49
+          },
+          {
+            "text": "请基于参考内容回答：\"\"\"),",
+            "lineNumber": 50
+          },
+          {
+            "text": "])",
+            "lineNumber": 51
+          },
+          {
+            "lineNumber": 52
+          },
+          {
+            "lineNumber": 53
+          },
+          {
+            "text": "def _format_sources(rag_result: RAGRetrieveResult) -&gt; str:",
+            "lineNumber": 54,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 55
+          }
+        ]
+      },
+      "score": 0.35870885848999023
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/text2sql.py",
+        "range": {
+          "startPosition": {
+            "line": 482
+          },
+          "endPosition": {
+            "line": 675
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 483,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 484,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 556,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 557,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class Text2SQL:",
+            "lineNumber": 483,
+            "isSignature": true
+          },
+          {
+            "text": "def query(self, question: str) -&gt; Optional[Union[str, Text2SQLConfirmRequired]]:",
+            "lineNumber": 556
+          },
+          {
+            "lineNumber": 576
+          },
+          {
+            "text": "        # 最多 3 次生成：每次校验 SELECT 仅读、语法、多表关联，失败则把错误注入 prompt 重试",
+            "lineNumber": 577
+          },
+          {
+            "text": "        for attempt in range(3):",
+            "lineNumber": 578
+          },
+          {
+            "text": "            try:",
+            "lineNumber": 579
+          },
+          {
+            "text": "                out = self._chain_sql.invoke({\"schema_block\": schema_block, \"question\": question})",
+            "lineNumber": 580
+          },
+          {
+            "text": "                raw = (out.content or \"\").strip()",
+            "lineNumber": 581
+          },
+          {
+            "text": "                if \"CANNOT_ANSWER\" in raw:",
+            "lineNumber": 582
+          },
+          {
+            "text": "                    return None",
+            "lineNumber": 583
+          },
+          {
+            "text": "                sql = _sanitize_and_extract_sql(raw)",
+            "lineNumber": 584
+          },
+          {
+            "text": "                if not sql:",
+            "lineNumber": 585
+          },
+          {
+            "text": "                    continue",
+            "lineNumber": 586
+          },
+          {
+            "text": "                ok, err = _validate_sql_select_only(sql)",
+            "lineNumber": 587
+          },
+          {
+            "text": "                if not ok:",
+            "lineNumber": 588
+          },
+          {
+            "text": "                    last_syntax_error = err",
+            "lineNumber": 589
+          },
+          {
+            "text": "                    schema_block = schema_block + f\"\\n\\n上一轮错误：{err}\\n请只输出一条合法的 SELECT 语句。\"",
+            "lineNumber": 590
+          },
+          {
+            "text": "                    continue",
+            "lineNumber": 591
+          },
+          {
+            "text": "                ok, err = _validate_sql_syntax(sql, uri)",
+            "lineNumber": 592
+          },
+          {
+            "text": "                if not ok:",
+            "lineNumber": 593
+          },
+          {
+            "text": "                    last_syntax_error = err",
+            "lineNumber": 594
+          },
+          {
+            "text": "                    schema_block = schema_block + f\"\\n\\n上一轮 SQL 语法/执行计划错误：{err}\\n请修正后只输出一条 SELECT。\"",
+            "lineNumber": 595
+          },
+          {
+            "text": "                    continue",
+            "lineNumber": 596
+          },
+          {
+            "text": "                # 多表时强制校验：必须使用人工配置的关联条件，保证关联字段正确",
+            "lineNumber": 597
+          },
+          {
+            "text": "                ok, err = _validate_sql_uses_relations(sql, human_relations)",
+            "lineNumber": 598
+          },
+          {
+            "text": "                if not ok:",
+            "lineNumber": 599
+          },
+          {
+            "text": "                    last_syntax_error = err",
+            "lineNumber": 600
+          },
+          {
+            "text": "                    schema_block = schema_block + f\"\\n\\n上一轮错误：{err}\\n请严格使用上述「表间关联」中的条件。\"",
+            "lineNumber": 601
+          },
+          {
+            "text": "                    continue",
+            "lineNumber": 602
+          },
+          {
+            "text": "                break",
+            "lineNumber": 603
+          },
+          {
+            "text": "            except Exception as e:",
+            "lineNumber": 604
+          },
+          {
+            "text": "                last_syntax_error = str(e)",
+            "lineNumber": 605
+          },
+          {
+            "text": "                continue",
+            "lineNumber": 606
+          },
+          {
+            "text": "        else:",
+            "lineNumber": 607
+          },
+          {
+            "text": "            return f\"多次尝试后仍无法生成合法 SQL。最后错误：{last_syntax_error}\"",
+            "lineNumber": 608
+          },
+          {
+            "lineNumber": 609
+          },
+          {
+            "text": "        # LIMIT 保护：无 LIMIT 的 SELECT 自动追加上限，避免大表全表扫",
+            "lineNumber": 610
+          },
+          {
+            "text": "        default_limit = max(0, getattr(self._settings, \"text2sql_default_limit\", 0))",
+            "lineNumber": 611
+          },
+          {
+            "text": "        sql = _ensure_limit(sql, default_limit)",
+            "lineNumber": 612
+          },
+          {
+            "lineNumber": 613
+          },
+          {
+            "text": "        ex = _execute_sql(sql, uri)",
+            "lineNumber": 614
+          },
+          {
+            "text": "        # 执行错误（列名/表名不匹配等）时重试 1 次：把错误注入 prompt 让模型修正",
+            "lineNumber": 615
+          }
+        ]
+      },
+      "score": 0.3435901999473572
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 137
+          },
+          {
+            "lineNumber": 138
+          },
+          {
+            "text": "    def _build_rag_context(self, rag_result: RAGRetrieveResult) -&gt; str:",
+            "lineNumber": 139
+          },
+          {
+            "text": "        \"\"\"将检索到的父/子块拼成带编号的生成上下文，便于模型引用 [证据N]。若配置了 rag_max_context_chars 则从前往后累加，超出则丢弃末尾 chunk。\"\"\"",
+            "lineNumber": 140
+          },
+          {
+            "text": "        from config import get_settings",
+            "lineNumber": 141
+          },
+          {
+            "text": "        max_chars = max(0, getattr(get_settings(), \"rag_max_context_chars\", 0))",
+            "lineNumber": 142
+          },
+          {
+            "text": "        sep = \"\\n\\n---\\n\\n\"",
+            "lineNumber": 143
+          },
+          {
+            "text": "        context_parts = []",
+            "lineNumber": 144
+          },
+          {
+            "text": "        total = 0",
+            "lineNumber": 145
+          },
+          {
+            "text": "        for i, c in enumerate(rag_result.chunks, 1):",
+            "lineNumber": 146
+          },
+          {
+            "text": "            parent = (c.parent_content or \"\").strip()",
+            "lineNumber": 147
+          },
+          {
+            "text": "            content = (c.content or \"\").strip()",
+            "lineNumber": 148
+          },
+          {
+            "text": "            if parent and parent != content:",
+            "lineNumber": 149
+          },
+          {
+            "text": "                part = f\"[证据{i}]\\n[背景]\\n{parent}\\n[片段]\\n{content}\"",
+            "lineNumber": 150
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 151
+          },
+          {
+            "text": "                part = f\"[证据{i}]\\n{content}\"",
+            "lineNumber": 152
+          },
+          {
+            "text": "            add_len = len(part) + (len(sep) if context_parts else 0)",
+            "lineNumber": 153
+          },
+          {
+            "text": "            if max_chars &gt; 0 and total + add_len &gt; max_chars:",
+            "lineNumber": 154
+          },
+          {
+            "text": "                break",
+            "lineNumber": 155
+          },
+          {
+            "text": "            context_parts.append(part)",
+            "lineNumber": 156
+          },
+          {
+            "text": "            total += add_len",
+            "lineNumber": 157
+          },
+          {
+            "text": "        return sep.join(context_parts)",
+            "lineNumber": 158
+          },
+          {
+            "lineNumber": 159
+          },
+          {
+            "text": "    def _normalize_answer_for_eval(self, answer_text: str) -&gt; str:",
+            "lineNumber": 160
+          },
+          {
+            "text": "        \"\"\"去掉结构化标签和证据编号，避免影响答案-文档相关度计算。\"\"\"",
+            "lineNumber": 161
+          },
+          {
+            "text": "        answer = (answer_text or \"\").strip()",
+            "lineNumber": 162
+          },
+          {
+            "text": "        if not answer:",
+            "lineNumber": 163
+          },
+          {
+            "text": "            return \"\"",
+            "lineNumber": 164
+          },
+          {
+            "text": "        answer = re.sub(r\"\\[证据\\d+\\]\", \"\", answer)",
+            "lineNumber": 165
+          },
+          {
+            "text": "        answer = re.sub(r\"(结论|依据|提示)\\s*[:：]\", \"\", answer)",
+            "lineNumber": 166
+          },
+          {
+            "text": "        return answer.strip()",
+            "lineNumber": 167
+          },
+          {
+            "lineNumber": 168
+          },
+          {
+            "text": "    def _answer_has_evidence_citations(self, answer_text: str) -&gt; bool:",
+            "lineNumber": 169
+          },
+          {
+            "text": "        \"\"\"除“无法确认”类兜底文案外，答案必须显式带有证据编号。\"\"\"",
+            "lineNumber": 170
+          },
+          {
+            "text": "        answer = (answer_text or \"\").strip()",
+            "lineNumber": 171
+          },
+          {
+            "text": "        if not answer:",
+            "lineNumber": 172
+          },
+          {
+            "text": "            return False",
+            "lineNumber": 173
+          },
+          {
+            "text": "        if \"无法确认\" in answer:",
+            "lineNumber": 174
+          },
+          {
+            "text": "            return True",
+            "lineNumber": 175
+          },
+          {
+            "text": "        return bool(re.search(r\"\\[证据\\d+\\]\", answer))",
+            "lineNumber": 176
+          },
+          {
+            "lineNumber": 177
+          },
+          {
+            "text": "    def _answer_grounding_score(self, answer_text: str, rag_result: RAGRetrieveResult) -&gt; float:",
+            "lineNumber": 178
+          },
+          {
+            "text": "        ",
+            "lineNumber": 179
+          }
+        ]
+      },
+      "score": 0.33933940529823303
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/text2sql.py",
+        "range": {
+          "startPosition": {
+            "line": 479,
+            "column": 33
+          },
+          "endPosition": {
+            "line": 675
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "\"\"\"",
+            "lineNumber": 480
+          },
+          {
+            "lineNumber": 481
+          },
+          {
+            "lineNumber": 482
+          },
+          {
+            "text": "class Text2SQL:",
+            "lineNumber": 483,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 484
+          },
+          {
+            "text": "    自然语言转 SQL：意图判断 → 取 schema（含人工关联）→ 生成 SELECT/DELETE/UPDATE →",
+            "lineNumber": 485
+          },
+          {
+            "text": "    校验（仅 SELECT 自动执行；多表必须用人工关联；写操作返回待确认）。",
+            "lineNumber": 486
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 487
+          },
+          {
+            "lineNumber": 488
+          },
+          {
+            "text": "    def __init__(",
+            "lineNumber": 489
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 490
+          },
+          {
+            "text": "        table_comments: Optional[dict] = None,",
+            "lineNumber": 491
+          },
+          {
+            "text": "        column_comments: Optional[dict] = None,",
+            "lineNumber": 492
+          },
+          {
+            "text": "        extra_relations: Optional[List[TableRelation]] = None,",
+            "lineNumber": 493
+          },
+          {
+            "text": "    ):",
+            "lineNumber": 494
+          },
+          {
+            "text": "        \"\"\"初始化 schema 缓存、意图库、SELECT/答案/写操作三条 LLM 链（仅 DeepSeek）。\"\"\"",
+            "lineNumber": 495
+          },
+          {
+            "text": "        self._settings = _get_settings()",
+            "lineNumber": 496
+          },
+          {
+            "text": "        self._schema_cache = SchemaCache(",
+            "lineNumber": 497
+          },
+          {
+            "text": "            self._settings.text2sql_schema_refresh_interval_seconds,",
+            "lineNumber": 498
+          },
+          {
+            "text": "            overrides_path=self._settings.text2sql_schema_overrides_path,",
+            "lineNumber": 499
+          },
+          {
+            "text": "        )",
+            "lineNumber": 500
+          },
+          {
+            "text": "        if table_comments:",
+            "lineNumber": 501
+          },
+          {
+            "text": "            self._schema_cache.set_comment_overrides(table_comments, column_comments)",
+            "lineNumber": 502
+          },
+          {
+            "text": "        if extra_relations:",
+            "lineNumber": 503
+          },
+          {
+            "text": "            self._schema_cache.set_extra_relations(extra_relations)",
+            "lineNumber": 504
+          },
+          {
+            "text": "        self._intent_store = IntentStore()",
+            "lineNumber": 505
+          },
+          {
+            "text": "        self._llm = _get_llm()",
+            "lineNumber": 506
+          },
+          {
+            "text": "        self._chain_sql = ChatPromptTemplate.from_messages([",
+            "lineNumber": 507
+          },
+          {
+            "text": "            (\"system\", _TEXT2SQL_SYSTEM),",
+            "lineNumber": 508
+          },
+          {
+            "text": "            (\"human\", _TEXT2SQL_HUMAN),",
+            "lineNumber": 509
+          },
+          {
+            "text": "        ]) | self._llm",
+            "lineNumber": 510
+          },
+          {
+            "text": "        self._chain_answer = ChatPromptTemplate.from_messages([",
+            "lineNumber": 511
+          },
+          {
+            "text": "            (\"system\", _ANSWER_FROM_RESULT_SYSTEM),",
+            "lineNumber": 512
+          },
+          {
+            "text": "            (\"human\", _ANSWER_FROM_RESULT_HUMAN),",
+            "lineNumber": 513
+          },
+          {
+            "text": "        ]) | self._llm",
+            "lineNumber": 514
+          },
+          {
+            "text": "        self._chain_write = ChatPromptTemplate.from_messages([",
+            "lineNumber": 515
+          },
+          {
+            "text": "            (\"system\", _TEXT2SQL_WRITE_SYSTEM),",
+            "lineNumber": 516
+          },
+          {
+            "text": "            (\"human\", _TEXT2SQL_WRITE_HUMAN),",
+            "lineNumber": 517
+          },
+          {
+            "text": "        ]) | self._llm",
+            "lineNumber": 518
+          },
+          {
+            "lineNumber": 519
+          },
+          {
+            "text": "    def _is_sql_question(self, question: str) -&gt; bool:",
+            "lineNumber": 520
+          },
+          {
+            "text": "        \"\"\"启发式：是否像数据查询。\"\"\"",
+            "lineNumber": 521
+          }
+        ]
+      },
+      "score": 0.3293721079826355
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {
+            "line": 62
+          },
+          "endPosition": {
+            "line": 332
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 63,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 64,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class RAGRetriever:",
+            "lineNumber": 63,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 175
+          },
+          {
+            "lineNumber": 176
+          },
+          {
+            "text": "    def _merge_3_7(",
+            "lineNumber": 177
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 178
+          },
+          {
+            "text": "        query: str,",
+            "lineNumber": 179
+          },
+          {
+            "text": "        total_k: int,",
+            "lineNumber": 180
+          },
+          {
+            "text": "        use_rerank: bool = True,",
+            "lineNumber": 181
+          },
+          {
+            "text": "        rerank_top: int = 5,",
+            "lineNumber": 182
+          },
+          {
+            "text": "    ) -&gt; List[dict]:",
+            "lineNumber": 183
+          },
+          {
+            "text": "        \"\"\"按配置比例（默认 3:7）取 BM25 与向量结果，合并后使用 BGE Reranker 重排。支持进程内 LRU 缓存。\"\"\"",
+            "lineNumber": 184
+          },
+          {
+            "text": "        global _rag_cache",
+            "lineNumber": 185
+          },
+          {
+            "text": "        s = _get_settings()",
+            "lineNumber": 186
+          },
+          {
+            "text": "        max_entries = max(0, getattr(s, \"rag_retrieval_cache_max_entries\", 0))",
+            "lineNumber": 187
+          },
+          {
+            "text": "        ttl = max(1, getattr(s, \"rag_retrieval_cache_ttl_seconds\", 300))",
+            "lineNumber": 188
+          },
+          {
+            "text": "        if max_entries &gt; 0:",
+            "lineNumber": 189
+          },
+          {
+            "text": "            key = _rag_cache_key(query, total_k, use_rerank, rerank_top)",
+            "lineNumber": 190
+          },
+          {
+            "text": "            with _rag_cache_lock:",
+            "lineNumber": 191
+          },
+          {
+            "text": "                if _rag_cache is None:",
+            "lineNumber": 192
+          },
+          {
+            "text": "                    _rag_cache = OrderedDict()",
+            "lineNumber": 193
+          },
+          {
+            "text": "                entry = _rag_cache.get(key)",
+            "lineNumber": 194
+          },
+          {
+            "text": "                if entry is not None:",
+            "lineNumber": 195
+          },
+          {
+            "text": "                    cached, expiry = entry",
+            "lineNumber": 196
+          },
+          {
+            "text": "                    if time.time() &lt; expiry:",
+            "lineNumber": 197
+          },
+          {
+            "text": "                        _rag_cache.move_to_end(key)",
+            "lineNumber": 198
+          },
+          {
+            "text": "                        return cached",
+            "lineNumber": 199
+          },
+          {
+            "text": "                    _rag_cache.pop(key, None)",
+            "lineNumber": 200
+          },
+          {
+            "text": "        combined = self._merge_3_7_impl(query, total_k, use_rerank, rerank_top)",
+            "lineNumber": 201
+          },
+          {
+            "text": "        if max_entries &gt; 0 and combined:",
+            "lineNumber": 202
+          },
+          {
+            "text": "            with _rag_cache_lock:",
+            "lineNumber": 203
+          },
+          {
+            "text": "                if _rag_cache is None:",
+            "lineNumber": 204
+          },
+          {
+            "text": "                    _rag_cache = OrderedDict()",
+            "lineNumber": 205
+          },
+          {
+            "text": "                _rag_cache[key] = (combined, time.time() + ttl)",
+            "lineNumber": 206
+          },
+          {
+            "text": "                _rag_cache.move_to_end(key)",
+            "lineNumber": 207
+          },
+          {
+            "text": "                while len(_rag_cache) &gt; max_entries:",
+            "lineNumber": 208
+          },
+          {
+            "text": "                    _rag_cache.popitem(last=False)",
+            "lineNumber": 209
+          },
+          {
+            "text": "        return combined",
+            "lineNumber": 210
+          },
+          {
+            "lineNumber": 211
+          },
+          {
+            "text": "    def _merge_3_7_impl(",
+            "lineNumber": 212
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 213
+          },
+          {
+            "text": "        query: str,",
+            "lineNumber": 214
+          },
+          {
+            "text": "        total_k: int,",
+            "lineNumber": 215
+          },
+          {
+            "text": "        use_rerank: bool = True,",
+            "lineNumber": 216
+          },
+          {
+            "text": "        rerank_top: int = 5,",
+            "lineNumber": 217
+          },
+          {
+            "text": "    ) -&gt; List[dict]:",
+            "lineNumber": 218
+          },
+          {
+            "text": "        ",
+            "lineNumber": 219
+          }
+        ]
+      },
+      "score": 0.3202407956123352
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {
+            "line": 62
+          },
+          "endPosition": {
+            "line": 332
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 63,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 64,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class RAGRetriever:",
+            "lineNumber": 63,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 210
+          },
+          {
+            "lineNumber": 211
+          },
+          {
+            "text": "    def _merge_3_7_impl(",
+            "lineNumber": 212
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 213
+          },
+          {
+            "text": "        query: str,",
+            "lineNumber": 214
+          },
+          {
+            "text": "        total_k: int,",
+            "lineNumber": 215
+          },
+          {
+            "text": "        use_rerank: bool = True,",
+            "lineNumber": 216
+          },
+          {
+            "text": "        rerank_top: int = 5,",
+            "lineNumber": 217
+          },
+          {
+            "text": "    ) -&gt; List[dict]:",
+            "lineNumber": 218
+          },
+          {
+            "text": "        \"\"\"实际检索逻辑（供 _merge_3_7 调用，可被缓存包装）。\"\"\"",
+            "lineNumber": 219
+          },
+          {
+            "text": "        s = _get_settings()",
+            "lineNumber": 220
+          },
+          {
+            "text": "        bm25_k = max(1, int(round(total_k * s.rag_bm25_ratio)))",
+            "lineNumber": 221
+          },
+          {
+            "text": "        vector_k = max(1, int(round(total_k * s.rag_vector_ratio)))",
+            "lineNumber": 222
+          },
+          {
+            "text": "        vector_raw = self._vector_search(query, vector_k + 10)",
+            "lineNumber": 223
+          },
+          {
+            "text": "        bm25_raw = self._bm25_search(query, bm25_k + 5)",
+            "lineNumber": 224
+          },
+          {
+            "text": "        bm25_take = bm25_raw[:bm25_k]",
+            "lineNumber": 225
+          },
+          {
+            "text": "        vector_take = vector_raw[:vector_k]",
+            "lineNumber": 226
+          },
+          {
+            "text": "        combined = bm25_take + vector_take",
+            "lineNumber": 227
+          },
+          {
+            "text": "        if not combined:",
+            "lineNumber": 228
+          },
+          {
+            "text": "            return []",
+            "lineNumber": 229
+          },
+          {
+            "text": "        if use_rerank and self._reranker and len(combined) &gt; rerank_top:",
+            "lineNumber": 230
+          },
+          {
+            "text": "            pairs = [(query, c[\"content\"] or c[\"parent_content\"]) for c in combined]",
+            "lineNumber": 231
+          },
+          {
+            "text": "            rerank_scores = self._reranker.compute_score(pairs)",
+            "lineNumber": 232
+          },
+          {
+            "text": "            if isinstance(rerank_scores, (int, float)):",
+            "lineNumber": 233
+          },
+          {
+            "text": "                rerank_scores = [rerank_scores]",
+            "lineNumber": 234
+          },
+          {
+            "text": "            for i, c in enumerate(combined):",
+            "lineNumber": 235
+          },
+          {
+            "text": "                c[\"rerank_score\"] = rerank_scores[i] if i &lt; len(rerank_scores) else 0.0",
+            "lineNumber": 236
+          },
+          {
+            "text": "            combined.sort(key=lambda x: x.get(\"rerank_score\", 0), reverse=True)",
+            "lineNumber": 237
+          },
+          {
+            "text": "        return combined[:rerank_top if use_rerank else total_k]",
+            "lineNumber": 238
+          },
+          {
+            "lineNumber": 239
+          },
+          {
+            "text": "    def _evaluate_candidates(self, query: str, candidates: List[dict]) -&gt; List[ChunkWithEval]:",
+            "lineNumber": 240
+          },
+          {
+            "text": "        ",
+            "lineNumber": 241
+          }
+        ]
+      },
+      "score": 0.31467631459236145
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/text2sql.py",
+        "range": {
+          "startPosition": {
+            "line": 482
+          },
+          "endPosition": {
+            "line": 675
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 483,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 484,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 556,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 557,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class Text2SQL:",
+            "lineNumber": 483,
+            "isSignature": true
+          },
+          {
+            "text": "def query(self, question: str) -&gt; Optional[Union[str, Text2SQLConfirmRequired]]:",
+            "lineNumber": 556
+          },
+          {
+            "lineNumber": 612
+          },
+          {
+            "lineNumber": 613
+          },
+          {
+            "text": "        ex = _execute_sql(sql, uri)",
+            "lineNumber": 614
+          },
+          {
+            "text": "        # 执行错误（列名/表名不匹配等）时重试 1 次：把错误注入 prompt 让模型修正",
+            "lineNumber": 615
+          },
+          {
+            "text": "        if not ex.ok and ex.error_type == \"field_mismatch\":",
+            "lineNumber": 616
+          },
+          {
+            "text": "            schema_block = schema_block + f\"\\n\\n上一轮执行错误：{ex.error_message}\\n请修正列名或表名后只输出一条 SELECT。\"",
+            "lineNumber": 617
+          },
+          {
+            "text": "            try:",
+            "lineNumber": 618
+          },
+          {
+            "text": "                out = self._chain_sql.invoke({\"schema_block\": schema_block, \"question\": question})",
+            "lineNumber": 619
+          },
+          {
+            "text": "                raw = (out.content or \"\").strip()",
+            "lineNumber": 620
+          },
+          {
+            "text": "                if \"CANNOT_ANSWER\" not in raw:",
+            "lineNumber": 621
+          },
+          {
+            "text": "                    sql_retry = _sanitize_and_extract_sql(raw)",
+            "lineNumber": 622
+          },
+          {
+            "text": "                    if sql_retry:",
+            "lineNumber": 623
+          },
+          {
+            "text": "                        ok1, _ = _validate_sql_select_only(sql_retry)",
+            "lineNumber": 624
+          },
+          {
+            "text": "                        ok2, _ = _validate_sql_syntax(sql_retry, uri)",
+            "lineNumber": 625
+          },
+          {
+            "text": "                        ok3, _ = _validate_sql_uses_relations(sql_retry, human_relations)",
+            "lineNumber": 626
+          },
+          {
+            "text": "                        if ok1 and ok2 and ok3:",
+            "lineNumber": 627
+          },
+          {
+            "text": "                            sql_retry = _ensure_limit(sql_retry, default_limit)",
+            "lineNumber": 628
+          },
+          {
+            "text": "                            ex = _execute_sql(sql_retry, uri)",
+            "lineNumber": 629
+          },
+          {
+            "text": "                            if ex.ok:",
+            "lineNumber": 630
+          },
+          {
+            "text": "                                sql = sql_retry",
+            "lineNumber": 631
+          },
+          {
+            "text": "            except Exception:",
+            "lineNumber": 632
+          },
+          {
+            "text": "                pass",
+            "lineNumber": 633
+          },
+          {
+            "lineNumber": 634
+          },
+          {
+            "text": "        if not ex.ok:",
+            "lineNumber": 635
+          },
+          {
+            "text": "            if ex.error_type == \"field_mismatch\":",
+            "lineNumber": 636
+          },
+          {
+            "text": "                return f\"查询失败（字段或表不匹配）：{ex.error_message}\"",
+            "lineNumber": 637
+          },
+          {
+            "text": "            return f\"查询失败：{ex.error_message}\"",
+            "lineNumber": 638
+          },
+          {
+            "lineNumber": 639
+          },
+          {
+            "text": "        # 无数据",
+            "lineNumber": 640
+          },
+          {
+            "text": "        if ex.rows is None or len(ex.rows) == 0:",
+            "lineNumber": 641
+          },
+          {
+            "text": "            self._intent_store.add(question, _extract_tables_from_sql(sql))",
+            "lineNumber": 642
+          },
+          {
+            "text": "            return \"未查询到符合条件的数据。\"",
+            "lineNumber": 643
+          },
+          {
+            "lineNumber": 644
+          },
+          {
+            "text": "        # 记录意图用于下次建议",
+            "lineNumber": 645
+          },
+          {
+            "text": "        self._intent_store.add(question, _extract_tables_from_sql(sql))",
+            "lineNumber": 646
+          },
+          {
+            "lineNumber": 647
+          },
+          {
+            "text": "        # 将结果交给大模型生成自然语言答案",
+            "lineNumber": 648
+          },
+          {
+            "text": "        result_text = self._format_rows_for_llm(ex.rows)",
+            "lineNumber": 649
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 650
+          },
+          {
+            "text": "            ans = self._chain_answer.invoke",
+            "lineNumber": 651
+          }
+        ]
+      },
+      "score": 0.3085983097553253
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {
+            "line": 62
+          },
+          "endPosition": {
+            "line": 332
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 63,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 64,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class RAGRetriever:",
+            "lineNumber": 63,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 106
+          },
+          {
+            "lineNumber": 107
+          },
+          {
+            "text": "    def _vector_search(self, query: str, top_k: int) -&gt; List[dict]:",
+            "lineNumber": 108
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 109
+          },
+          {
+            "text": "        Milvus HNSW 向量检索，返回含 content、parent_content、score、source=vector 的 dict 列表。",
+            "lineNumber": 110
+          },
+          {
+            "text": "        连接断开时自动重连重试，熔断后降级返回空列表。",
+            "lineNumber": 111
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 112
+          },
+          {
+            "text": "        if not self._embedding:",
+            "lineNumber": 113
+          },
+          {
+            "text": "            return []",
+            "lineNumber": 114
+          },
+          {
+            "text": "        qv = self.embed([query])",
+            "lineNumber": 115
+          },
+          {
+            "text": "        if not qv:",
+            "lineNumber": 116
+          },
+          {
+            "text": "            return []",
+            "lineNumber": 117
+          },
+          {
+            "lineNumber": 118
+          },
+          {
+            "text": "        s = _get_settings()",
+            "lineNumber": 119
+          },
+          {
+            "text": "        search_params = {\"metric_type\": \"IP\", \"params\": {\"nprobe\": 64}}",
+            "lineNumber": 120
+          },
+          {
+            "lineNumber": 121
+          },
+          {
+            "text": "        def _do_search(coll):",
+            "lineNumber": 122
+          },
+          {
+            "text": "            results = coll.search(",
+            "lineNumber": 123
+          },
+          {
+            "text": "                data=qv,",
+            "lineNumber": 124
+          },
+          {
+            "text": "                anns_field=\"embedding\",",
+            "lineNumber": 125
+          },
+          {
+            "text": "                param=search_params,",
+            "lineNumber": 126
+          },
+          {
+            "text": "                limit=top_k,",
+            "lineNumber": 127
+          },
+          {
+            "text": "                output_fields=[\"content\", \"parent_content\", \"doc_id\", \"chunk_id\"],",
+            "lineNumber": 128
+          },
+          {
+            "text": "            )",
+            "lineNumber": 129
+          },
+          {
+            "text": "            out = []",
+            "lineNumber": 130
+          },
+          {
+            "text": "            for hits in results:",
+            "lineNumber": 131
+          },
+          {
+            "text": "                for h in hits:",
+            "lineNumber": 132
+          },
+          {
+            "text": "                    out.append({",
+            "lineNumber": 133
+          },
+          {
+            "text": "                        \"content\": h.entity.get(\"content\") or \"\",",
+            "lineNumber": 134
+          },
+          {
+            "text": "                        \"parent_content\": h.entity.get(\"parent_content\") or \"\",",
+            "lineNumber": 135
+          },
+          {
+            "text": "                        \"score\": float(h.score),",
+            "lineNumber": 136
+          },
+          {
+            "text": "                        \"source\": \"vector\",",
+            "lineNumber": 137
+          },
+          {
+            "text": "                        \"chunk_id\": h.entity.get(\"chunk_id\") or \"\",",
+            "lineNumber": 138
+          },
+          {
+            "text": "                        \"doc_id\": h.entity.get(\"doc_id\") or \"\",",
+            "lineNumber": 139
+          },
+          {
+            "text": "                    })",
+            "lineNumber": 140
+          },
+          {
+            "text": "            return out",
+            "lineNumber": 141
+          },
+          {
+            "lineNumber": 142
+          },
+          {
+            "text": "        from src.db_resilience import milvus_operation_with_retry",
+            "lineNumber": 143
+          },
+          {
+            "text": "        return milvus_operation_with_retry(",
+            "lineNumber": 144
+          },
+          {
+            "text": "            s.milvus_uri, s.milvus_collection,",
+            "lineNumber": 145
+          },
+          {
+            "text": "            _do_search,",
+            "lineNumber": 146
+          },
+          {
+            "text": "            retries=1,",
+            "lineNumber": 147
+          },
+          {
+            "text": "            critical=False,",
+            "lineNumber": 148
+          },
+          {
+            "text": "            default=[],",
+            "lineNumber": 149
+          },
+          {
+            "text": "        )",
+            "lineNumber": 150
+          },
+          {
+            "lineNumber": 151
+          },
+          {
+            "text": "    def _bm25_search(self, query: str, top_k: int) -&gt; List[dict]:",
+            "lineNumber": 152
+          },
+          {
+            "text": "        ",
+            "lineNumber": 153
+          }
+        ]
+      },
+      "score": 0.296146035194397
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have enough context. I'll create a new doc that covers:
+1. High availability: redundancy (multi LLM node), circuit breaker, degradation, health check, DB/Redis/Milvus resilience
+2. Low latency: answer cache, retrieval cache, async pipeline, connection pool, streaming, retrieval tuning (top_k, rerank_top), optional pre-warm
+
+I'll write it in a way that's both general design principles and tied to this project, so it's useful for interview and for the codebase.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/RAG_HA_LOW_LATENCY_DESIGN.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Done. I'll give the user a short summary and suggest they can combine this with the cache/circuit/degradation doc for a complete "RAG 高可用低延迟" answer.
+</details></think>
+
+---
+
+
+已经写好 **`docs/RAG_HA_LOW_LATENCY_DESIGN.md`**，按「高可用」和「低延迟」两条线整理，并和当前项目实现做了对应。
+
+**文档结构概览：**
+
+1. **设计目标**  
+   - 高可用：少雪崩、可恢复、可预期响应  
+   - 低延迟：首包快、端到端时延可控  
+
+2. **高可用设计**  
+   - **依赖隔离与熔断**：DB / Milvus / LLM 分别熔断；关键 vs 非关键路径（critical）  
+   - **降级与可预期响应**：历史/监控写库失败不阻塞；RAG/LLM 失败时返回固定话术或空结果，不直接 500  
+   - **多节点与重试**：LLM 多 endpoint、按健康与负载选择；DB/向量库有限次重试  
+   - **健康检查与可观测**：/health、ready、熔断/降级状态  
+
+3. **低延迟设计**  
+   - **多层缓存**：问答缓存（结果级）+ 检索缓存（中间结果），以及热 key、防击穿  
+   - **异步与连接复用**：全链路 async、连接池、to_thread 使用方式  
+   - **流式输出**：首字/首包优先，边生成边返回  
+   - **检索与上下文控制**：top_k/rerank_top、上下文长度/条数限制、重检策略  
+   - **超时与限流**：单请求超时、全局限流、下游并发上限  
+
+4. **整体链路**  
+   - 用一段「请求 → 缓存 → 路由 → 检索 → 生成 → 持久化」的简要流程图，说明在本项目里高可用和低延迟分别落在哪几步。  
+
+5. **面试话术**  
+   - 文档末尾给了一段可直接用来回答「如何设计高可用、低延迟的 RAG」的简短总结，并提示可以按「缓存 → 熔断/降级 → 多节点/重试 → 异步/流式 → 检索与上下文」展开，并带上「在我们项目里是在 XXX 模块通过 XXX 实现的」。  
+
+面试时可以把这份文档和 **HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md** 一起用：前者讲「高可用 + 低延迟」的整体 RAG 设计，后者讲缓存/熔断/降级的具体实现与高频问答。
+
+---
+
+_**User**_
+
+模型响应慢,如何链路追踪?定位瓶颈?如何做资源池优化?弹性伸缩?成本优化?
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user is asking about:
+1. How to do link/chain tracing when model response is slow
+2. How to locate bottlenecks
+3. How to do resource pool optimization
+4. Elastic scaling
+5. Cost optimization
+
+I need to:
+1. Check what tracing/observability already exists in the project (e.g. observation_id, trace, latency_ms, fallback_reason, etc.)
+2. Write a doc that covers: tracing design, bottleneck localization, resource pool tuning, scaling, cost optimization - both general principles and project-specific implementation.
+
+Let me search the codebase for existing tracing, timing, and observation patterns.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "observation_id|trace|latency|started_at|perf_counter",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "glob": "*.py",
+  "outputMode": "content",
+  "contextBefore": 0,
+  "contextAfter": 0,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "observation_id|trace|latency|started_at|perf_counter",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 5,
+  "totalMatches": 266,
+  "topFiles": [
+    {
+      "uri": "src/agents/state.py",
+      "matchCount": 2
+    },
+    {
+      "uri": "src/qa_monitoring.py",
+      "matchCount": 62
+    },
+    {
+      "uri": "src/kb/engine.py",
+      "matchCount": 100
+    },
+    {
+      "uri": "api/main.py",
+      "matchCount": 100
+    },
+    {
+      "uri": "src/agents/knowledge_agent.py",
+      "matchCount": 2
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="semantic_search_full">
+<details>
+<summary>Tool use: **semantic_search_full**</summary>
+
+
+Parameters:
+
+```json
+{
+  "query": "Where is QA observation or trace saved for monitoring?",
+  "topK": 10,
+  "explanation": ""
+}
+```
+Result:
+
+```json
+{
+  "codeResults": [
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 116,
+            "column": 60
+          },
+          "endPosition": {
+            "line": 213
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "def save_observation(uri: str, observation: dict[str, Any], trace: Optional[dict[str, Any]] = None) -&gt; None:",
+            "lineNumber": 120,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"保存一条问答观测记录，并可选写入对应的 RAG 追踪信息。连接失败时降级跳过。\"\"\"",
+            "lineNumber": 121
+          },
+          {
+            "lineNumber": 122
+          },
+          {
+            "text": "    from sqlalchemy import text",
+            "lineNumber": 123
+          },
+          {
+            "text": "    from src.db_resilience import safe_connection",
+            "lineNumber": 124
+          },
+          {
+            "lineNumber": 125
+          },
+          {
+            "text": "    obs = dict(observation or {})",
+            "lineNumber": 126
+          },
+          {
+            "text": "    observation_id = str(obs.get(\"observation_id\") or \"\").strip()",
+            "lineNumber": 127
+          },
+          {
+            "text": "    if not observation_id:",
+            "lineNumber": 128
+          },
+          {
+            "text": "        return",
+            "lineNumber": 129
+          },
+          {
+            "text": "    try:",
+            "lineNumber": 130
+          },
+          {
+            "text": "        with safe_connection(uri, critical=False) as conn:",
+            "lineNumber": 131
+          },
+          {
+            "text": "            if conn is None:",
+            "lineNumber": 132
+          },
+          {
+            "text": "                logger.warning(\"保存问答观测降级：数据库不可用\")",
+            "lineNumber": 133
+          },
+          {
+            "text": "                return",
+            "lineNumber": 134
+          },
+          {
+            "text": "            conn.execute(",
+            "lineNumber": 135
+          },
+          {
+            "text": "                text(f\"\"\"",
+            "lineNumber": 136
+          },
+          {
+            "text": "                    INSERT INTO {_OBS_TABLE} (",
+            "lineNumber": 137
+          },
+          {
+            "text": "                        observation_id, thread_id, conversation_id, user_id, question, answer,",
+            "lineNumber": 138
+          },
+          {
+            "text": "                        route, response_mode, success, used_cache, pending_sql, latency_ms,",
+            "lineNumber": 139
+          },
+          {
+            "text": "                        quality_label, fallback_reason, llm_model, llm_endpoint_name, created_at",
+            "lineNumber": 140
+          },
+          {
+            "text": "                    )",
+            "lineNumber": 141
+          },
+          {
+            "text": "                    VALUES (",
+            "lineNumber": 142
+          },
+          {
+            "text": "                        :observation_id, :thread_id, :conversation_id, :user_id, :question, :answer,",
+            "lineNumber": 143
+          },
+          {
+            "text": "                        :route, :response_mode, :success, :used_cache, :pending_sql, :latency_ms,",
+            "lineNumber": 144
+          },
+          {
+            "text": "                        :quality_label, :fallback_reason, :llm_model, :llm_endpoint_name, NOW()",
+            "lineNumber": 145
+          },
+          {
+            "text": "                    )",
+            "lineNumber": 146
+          },
+          {
+            "text": "                    ON CONFLICT (observation_id)",
+            "lineNumber": 147
+          },
+          {
+            "text": "                    DO UPDATE SET",
+            "lineNumber": 148
+          },
+          {
+            "text": "                        answer = EXCLUDED.answer,",
+            "lineNumber": 149
+          },
+          {
+            "text": "                        route = EXCLUDED.route,",
+            "lineNumber": 150
+          },
+          {
+            "text": "                        response_mode = EXCLUDED.response_mode,",
+            "lineNumber": 151
+          },
+          {
+            "text": "                        success = EXCLUDED.success,",
+            "lineNumber": 152
+          },
+          {
+            "text": "                        used_cache = EXCLUDED.used_cache,",
+            "lineNumber": 153
+          },
+          {
+            "text": "                        pending_sql = EXCLUDED.pending_sql,",
+            "lineNumber": 154
+          },
+          {
+            "text": "                        latency_ms = EXCLUDED.latency_ms,",
+            "lineNumber": 155
+          },
+          {
+            "text": "                        quality_label = EXCLUDED.quality_label,",
+            "lineNumber": 156
+          },
+          {
+            "text": "                        fallback_reason = EXCLUDED.fallback_reason,",
+            "lineNumber": 157
+          },
+          {
+            "text": "                        llm_model = EXCLUDED.llm_model,",
+            "lineNumber": 158
+          },
+          {
+            "text": "                        llm_endpoint_name = EXCLUDED.llm_endpoint_name",
+            "lineNumber": 159
+          },
+          {
+            "text": "                \"\"\"),",
+            "lineNumber": 160
+          },
+          {
+            "text": "                {",
+            "lineNumber": 161
+          },
+          {
+            "text": "                    \"observation_id\": observation_id[:64]",
+            "lineNumber": 162
+          }
+        ]
+      },
+      "score": 0.6194701194763184
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 119
+          },
+          "endPosition": {
+            "line": 260
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 120,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 121,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "def save_observation(uri: str, observation: dict[str, Any], trace: Optional[dict[str, Any]] = None) -&gt; None:",
+            "lineNumber": 120,
+            "isSignature": true
+          },
+          {
+            "text": "\"\"\"),",
+            "lineNumber": 195
+          },
+          {
+            "text": "                    {",
+            "lineNumber": 196
+          },
+          {
+            "text": "                        \"observation_id\": observation_id[:64],",
+            "lineNumber": 197
+          },
+          {
+            "text": "                        \"final_status\": str(trace.get(\"final_status\") or \"\")[:64],",
+            "lineNumber": 198
+          },
+          {
+            "text": "                        \"retrieve_attempt\": int(trace.get(\"retrieve_attempt\") or 0),",
+            "lineNumber": 199
+          },
+          {
+            "text": "                        \"top_match_score\": float(trace.get(\"top_match_score\") or 0),",
+            "lineNumber": 200
+          },
+          {
+            "text": "                        \"top_normalized_score\": float(trace.get(\"top_normalized_score\") or 0),",
+            "lineNumber": 201
+          },
+          {
+            "text": "                        \"grounding_score\": float(trace.get(\"grounding_score\") or 0),",
+            "lineNumber": 202
+          },
+          {
+            "text": "                        \"regenerate_count\": int(trace.get(\"regenerate_count\") or 0),",
+            "lineNumber": 203
+          },
+          {
+            "text": "                        \"has_evidence_citations\": bool(trace.get(\"has_evidence_citations\", False)),",
+            "lineNumber": 204
+          },
+          {
+            "text": "                        \"source_count\": int(trace.get(\"source_count\") or 0),",
+            "lineNumber": 205
+          },
+          {
+            "text": "                        \"scenario_templates\": json.dumps(trace.get(\"scenario_templates\") or [], ensure_ascii=False),",
+            "lineNumber": 206
+          },
+          {
+            "text": "                        \"retrieved_doc_ids\": json.dumps(trace.get(\"retrieved_doc_ids\") or [], ensure_ascii=False),",
+            "lineNumber": 207
+          },
+          {
+            "text": "                        \"retrieved_chunk_ids\": json.dumps(trace.get(\"retrieved_chunk_ids\") or [], ensure_ascii=False),",
+            "lineNumber": 208
+          },
+          {
+            "text": "                        \"extra\": json.dumps(trace, ensure_ascii=False),",
+            "lineNumber": 209
+          },
+          {
+            "text": "                    },",
+            "lineNumber": 210
+          },
+          {
+            "text": "                )",
+            "lineNumber": 211
+          },
+          {
+            "text": "            conn.commit()",
+            "lineNumber": 212
+          },
+          {
+            "text": "    except Exception as e:",
+            "lineNumber": 213
+          },
+          {
+            "text": "        logger.warning(\"保存问答观测失败: %s\", e)",
+            "lineNumber": 214,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 215
+          },
+          {
+            "lineNumber": 216
+          },
+          {
+            "text": "def list_conversation_observations(uri: str, conversation_id: str, user_id: Optional[str]) -&gt; list[dict[str, Any]]:",
+            "lineNumber": 217,
+            "isSignature": true
+          },
+          {
+            "text": "    ",
+            "lineNumber": 218
+          }
+        ]
+      },
+      "score": 0.5466967225074768
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 119
+          },
+          "endPosition": {
+            "line": 213
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 120,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 121,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "def save_observation(uri: str, observation: dict[str, Any], trace: Optional[dict[str, Any]] = None) -&gt; None:",
+            "lineNumber": 120,
+            "isSignature": true
+          },
+          {
+            "text": "\"\"\"),",
+            "lineNumber": 160
+          },
+          {
+            "text": "                {",
+            "lineNumber": 161
+          },
+          {
+            "text": "                    \"observation_id\": observation_id[:64],",
+            "lineNumber": 162
+          },
+          {
+            "text": "                    \"thread_id\": str(obs.get(\"thread_id\") or \"\")[:512],",
+            "lineNumber": 163
+          },
+          {
+            "text": "                    \"conversation_id\": str(obs.get(\"conversation_id\") or \"\")[:128],",
+            "lineNumber": 164
+          },
+          {
+            "text": "                    \"user_id\": obs.get(\"user_id\"),",
+            "lineNumber": 165
+          },
+          {
+            "text": "                    \"question\": str(obs.get(\"question\") or \"\")[:20000],",
+            "lineNumber": 166
+          },
+          {
+            "text": "                    \"answer\": str(obs.get(\"answer\") or \"\")[:65535],",
+            "lineNumber": 167
+          },
+          {
+            "text": "                    \"route\": str(obs.get(\"route\") or \"unknown\")[:64],",
+            "lineNumber": 168
+          },
+          {
+            "text": "                    \"response_mode\": str(obs.get(\"response_mode\") or \"sync\")[:16],",
+            "lineNumber": 169
+          },
+          {
+            "text": "                    \"success\": bool(obs.get(\"success\", True)),",
+            "lineNumber": 170
+          },
+          {
+            "text": "                    \"used_cache\": bool(obs.get(\"used_cache\", False)),",
+            "lineNumber": 171
+          },
+          {
+            "text": "                    \"pending_sql\": bool(obs.get(\"pending_sql\", False)),",
+            "lineNumber": 172
+          },
+          {
+            "text": "                    \"latency_ms\": int(obs.get(\"latency_ms\") or 0),",
+            "lineNumber": 173
+          },
+          {
+            "text": "                    \"quality_label\": str(obs.get(\"quality_label\") or \"unknown\")[:64],",
+            "lineNumber": 174
+          },
+          {
+            "text": "                    \"fallback_reason\": str(obs.get(\"fallback_reason\") or \"\")[:255] or None,",
+            "lineNumber": 175
+          },
+          {
+            "text": "                    \"llm_model\": str(obs.get(\"llm_model\") or \"\")[:128] or None,",
+            "lineNumber": 176
+          },
+          {
+            "text": "                    \"llm_endpoint_name\": str(obs.get(\"llm_endpoint_name\") or \"\")[:128] or None,",
+            "lineNumber": 177
+          },
+          {
+            "text": "                },",
+            "lineNumber": 178
+          },
+          {
+            "text": "            )",
+            "lineNumber": 179
+          },
+          {
+            "text": "            if trace is not None:",
+            "lineNumber": 180
+          },
+          {
+            "text": "                conn.execute(text(f\"DELETE FROM {_TRACE_TABLE}",
+            "lineNumber": 181
+          }
+        ]
+      },
+      "score": 0.5145812630653381
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 105
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "\"\"\"",
+            "lineNumber": 1
+          },
+          {
+            "text": "问答效果监控与用户反馈分析。",
+            "lineNumber": 2
+          },
+          {
+            "lineNumber": 3
+          },
+          {
+            "text": "功能：",
+            "lineNumber": 4
+          },
+          {
+            "text": "- 记录每次问答的基础观测数据（question/answer/route/耗时/质量标签等）",
+            "lineNumber": 5
+          },
+          {
+            "text": "- 记录 RAG 过程追踪（检索得分、grounding score、重生成次数、命中的文档/切片等）",
+            "lineNumber": 6
+          },
+          {
+            "text": "- 记录用户反馈（点赞/点踩、标签、多行补充说明）",
+            "lineNumber": 7
+          },
+          {
+            "text": "- 提供汇总统计、差评案例与反馈标签分析，供 API / 前端看板展示",
+            "lineNumber": 8
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 9
+          },
+          {
+            "lineNumber": 10
+          },
+          {
+            "text": "from __future__ import annotations",
+            "lineNumber": 11
+          },
+          {
+            "lineNumber": 12
+          },
+          {
+            "text": "import json",
+            "lineNumber": 13
+          },
+          {
+            "text": "import logging",
+            "lineNumber": 14
+          },
+          {
+            "text": "from typing import Any, Optional",
+            "lineNumber": 15
+          },
+          {
+            "lineNumber": 16
+          },
+          {
+            "text": "logger = logging.getLogger(__name__)",
+            "lineNumber": 17
+          },
+          {
+            "lineNumber": 18
+          },
+          {
+            "text": "_OBS_TABLE = \"qa_observation\"",
+            "lineNumber": 19
+          },
+          {
+            "text": "_TRACE_TABLE = \"qa_rag_trace\"",
+            "lineNumber": 20
+          },
+          {
+            "text": "_FEEDBACK_TABLE = \"qa_feedback\"",
+            "lineNumber": 21
+          },
+          {
+            "lineNumber": 22
+          },
+          {
+            "lineNumber": 23
+          },
+          {
+            "text": "def _ensure_table(uri: str) -&gt; None:",
+            "lineNumber": 24,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"创建问答监控与反馈分析所需的 PostgreSQL 表。\"\"\"",
+            "lineNumber": 25
+          },
+          {
+            "lineNumber": 26
+          },
+          {
+            "text": "    from sqlalchemy import text",
+            "lineNumber": 27
+          },
+          {
+            "text": "    from src.db_resilience import safe_connection",
+            "lineNumber": 28
+          },
+          {
+            "lineNumber": 29
+          },
+          {
+            "text": "    with safe_connection(uri, retries=3, retry_delay=1.0, critical=True) as",
+            "lineNumber": 30
+          }
+        ]
+      },
+      "score": 0.5098121762275696
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 119
+          },
+          "endPosition": {
+            "line": 213
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 120,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 121,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "def save_observation(uri: str, observation: dict[str, Any], trace: Optional[dict[str, Any]] = None) -&gt; None:",
+            "lineNumber": 120,
+            "isSignature": true
+          },
+          {
+            "text": ",",
+            "lineNumber": 177
+          },
+          {
+            "text": "                },",
+            "lineNumber": 178
+          },
+          {
+            "text": "            )",
+            "lineNumber": 179
+          },
+          {
+            "text": "            if trace is not None:",
+            "lineNumber": 180
+          },
+          {
+            "text": "                conn.execute(text(f\"DELETE FROM {_TRACE_TABLE} WHERE observation_id = :observation_id\"), {\"observation_id\": observation_id[:64]})",
+            "lineNumber": 181
+          },
+          {
+            "text": "                conn.execute(",
+            "lineNumber": 182
+          },
+          {
+            "text": "                    text(f\"\"\"",
+            "lineNumber": 183
+          },
+          {
+            "text": "                        INSERT INTO {_TRACE_TABLE} (",
+            "lineNumber": 184
+          },
+          {
+            "text": "                            observation_id, final_status, retrieve_attempt, top_match_score, top_normalized_score,",
+            "lineNumber": 185
+          },
+          {
+            "text": "                            grounding_score, regenerate_count, has_evidence_citations, source_count,",
+            "lineNumber": 186
+          },
+          {
+            "text": "                            scenario_templates, retrieved_doc_ids, retrieved_chunk_ids, extra, created_at",
+            "lineNumber": 187
+          },
+          {
+            "text": "                        )",
+            "lineNumber": 188
+          },
+          {
+            "text": "                        VALUES (",
+            "lineNumber": 189
+          },
+          {
+            "text": "                            :observation_id, :final_status, :retrieve_attempt, :top_match_score, :top_normalized_score,",
+            "lineNumber": 190
+          },
+          {
+            "text": "                            :grounding_score, :regenerate_count, :has_evidence_citations, :source_count,",
+            "lineNumber": 191
+          },
+          {
+            "text": "                            CAST(:scenario_templates AS JSONB), CAST(:retrieved_doc_ids AS JSONB),",
+            "lineNumber": 192
+          },
+          {
+            "text": "                            CAST(:retrieved_chunk_ids AS JSONB), CAST(:extra AS JSONB), NOW()",
+            "lineNumber": 193
+          },
+          {
+            "text": "                        )",
+            "lineNumber": 194
+          },
+          {
+            "text": "                    \"\"\"),",
+            "lineNumber": 195
+          },
+          {
+            "text": "                    {",
+            "lineNumber": 196
+          },
+          {
+            "text": "                        \"observation_id\": observation_id[:64]",
+            "lineNumber": 197
+          }
+        ]
+      },
+      "score": 0.5085841417312622
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 94,
+            "column": 5
+          },
+          "endPosition": {
+            "line": 115
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "async def _save_qa_observation_async(observation: dict, trace: Optional[dict] = None) -&gt; None:",
+            "lineNumber": 98,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"异步落库一条问答观测记录；未启用 PostgreSQL 时静默跳过。\"\"\"",
+            "lineNumber": 99
+          },
+          {
+            "text": "    settings = get_settings()",
+            "lineNumber": 100
+          },
+          {
+            "text": "    uri = _qa_monitoring_uri(settings)",
+            "lineNumber": 101
+          },
+          {
+            "text": "    if not uri or \"postgresql\" not in uri.lower():",
+            "lineNumber": 102
+          },
+          {
+            "text": "        return",
+            "lineNumber": 103
+          },
+          {
+            "text": "    await asyncio.to_thread(qa_monitoring_save_observation, uri, observation, trace)",
+            "lineNumber": 104,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 105
+          },
+          {
+            "lineNumber": 106
+          },
+          {
+            "text": "def _postgresql_ping(uri: str) -&gt; None:",
+            "lineNumber": 107,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"同步执行一次 PostgreSQL 探活：连接并执行 SELECT 1。\"\"\"",
+            "lineNumber": 108
+          }
+        ]
+      },
+      "score": 0.5026960968971252
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 930
+          },
+          "endPosition": {
+            "line": 1271
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 931,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 941,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_impl(",
+            "lineNumber": 931,
+            "isSignature": true
+          },
+          {
+            "text": "    request: Request,",
+            "lineNumber": 932,
+            "isSignature": true
+          },
+          {
+            "text": "    req: ChatRequest,",
+            "lineNumber": 933,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 934,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 935,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 936,
+            "isSignature": true
+          },
+          {
+            "text": "    config: dict,",
+            "lineNumber": 937,
+            "isSignature": true
+          },
+          {
+            "text": "    graph,",
+            "lineNumber": 938,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: float,",
+            "lineNumber": 939,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 940,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1224
+          },
+          {
+            "text": "        reply = (last_msg.content if last_msg else \"抱歉，未生成回复。\").strip()",
+            "lineNumber": 1225
+          },
+          {
+            "text": "        observation_id = str(uuid.uuid4())",
+            "lineNumber": 1226
+          },
+          {
+            "text": "        route = (result.get(\"route\") or (\"knowledge\" if result.get(\"qa_trace\") else \"chat\")).strip()",
+            "lineNumber": 1227
+          },
+          {
+            "text": "        qa_trace = result.get(\"qa_trace\") or None",
+            "lineNumber": 1228
+          },
+          {
+            "text": "        if getattr(settings, \"answer_cache_enabled\", True) and reply:",
+            "lineNumber": 1229
+          },
+          {
+            "text": "            try:",
+            "lineNumber": 1230
+          },
+          {
+            "text": "                await set_cached_answer(req.message, reply)",
+            "lineNumber": 1231
+          },
+          {
+            "text": "            except Exception:",
+            "lineNumber": 1232
+          },
+          {
+            "text": "                pass",
+            "lineNumber": 1233
+          },
+          {
+            "text": "        await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)",
+            "lineNumber": 1234
+          },
+          {
+            "text": "        # 长期记忆：本轮 user + assistant 追加写入 PostgreSQL",
+            "lineNumber": 1235
+          },
+          {
+            "text": "        last_two = result.get(\"messages\") or []",
+            "lineNumber": 1236
+          },
+          {
+            "text": "        if len(last_two) &gt;= 2:",
+            "lineNumber": 1237
+          },
+          {
+            "text": "            await _persist_chat_messages( thread_id, last_two[-2:])",
+            "lineNumber": 1238
+          },
+          {
+            "text": "        await _save_qa_observation_async(",
+            "lineNumber": 1239
+          },
+          {
+            "text": "            _build_observation_payload(",
+            "lineNumber": 1240
+          },
+          {
+            "text": "                observation_id=observation_id,",
+            "lineNumber": 1241
+          },
+          {
+            "text": "                thread_id=thread_id,",
+            "lineNumber": 1242
+          },
+          {
+            "text": "                conversation_id=conversation_id,",
+            "lineNumber": 1243
+          },
+          {
+            "text": "                user_id=user_id,",
+            "lineNumber": 1244
+          },
+          {
+            "text": "                question=req.message,",
+            "lineNumber": 1245
+          },
+          {
+            "text": "                answer=reply,",
+            "lineNumber": 1246
+          },
+          {
+            "text": "                route=route,",
+            "lineNumber": 1247
+          },
+          {
+            "text": "                response_mode=\"sync\",",
+            "lineNumber": 1248
+          },
+          {
+            "text": "                success=bool(reply),",
+            "lineNumber": 1249
+          },
+          {
+            "text": "                latency_ms=int((time.perf_counter() - started_at) * 1000),",
+            "lineNumber": 1250
+          },
+          {
+            "text": "                pending_sql=bool(result.get(\"pending_sql\")),",
+            "lineNumber": 1251
+          },
+          {
+            "text": "                trace=qa_trace,",
+            "lineNumber": 1252
+          },
+          {
+            "text": "                fallback_reason=(qa_trace or {}).get(\"fallback_reason\", \"\"),",
+            "lineNumber": 1253
+          },
+          {
+            "text": "            ),",
+            "lineNumber": 1254
+          },
+          {
+            "text": "            trace=qa_trace,",
+            "lineNumber": 1255
+          },
+          {
+            "text": "        )",
+            "lineNumber": 1256
+          },
+          {
+            "text": "        return ChatResponse(reply=reply, conversation_id=conversation_id, observation_id=observation_id)",
+            "lineNumber": 1257,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1258
+          },
+          {
+            "lineNumber": 1259
+          },
+          {
+            "text": "async def _chat_stream_generator(",
+            "lineNumber": 1260,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 1261,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 1262,
+            "isSignature": true
+          },
+          {
+            "text": "    message: str,",
+            "lineNumber": 1263,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str] = None,",
+            "lineNumber": 1264,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: Optional[float] = None,",
+            "lineNumber": 1265,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 1266,
+            "isSignature": true
+          },
+          {
+            "text": "    ",
+            "lineNumber": 1267
+          }
+        ]
+      },
+      "score": 0.47743475437164307
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 802,
+            "column": 20
+          },
+          "endPosition": {
+            "line": 863
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "def _build_observation_payload(",
+            "lineNumber": 806,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 807,
+            "isSignature": true
+          },
+          {
+            "text": "    observation_id: str,",
+            "lineNumber": 808,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 809,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 810,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 811,
+            "isSignature": true
+          },
+          {
+            "text": "    question: str,",
+            "lineNumber": 812,
+            "isSignature": true
+          },
+          {
+            "text": "    answer: str,",
+            "lineNumber": 813,
+            "isSignature": true
+          },
+          {
+            "text": "    route: str,",
+            "lineNumber": 814,
+            "isSignature": true
+          },
+          {
+            "text": "    response_mode: str,",
+            "lineNumber": 815,
+            "isSignature": true
+          },
+          {
+            "text": "    success: bool,",
+            "lineNumber": 816,
+            "isSignature": true
+          },
+          {
+            "text": "    latency_ms: int,",
+            "lineNumber": 817,
+            "isSignature": true
+          },
+          {
+            "text": "    used_cache: bool = False,",
+            "lineNumber": 818,
+            "isSignature": true
+          },
+          {
+            "text": "    pending_sql: bool = False,",
+            "lineNumber": 819,
+            "isSignature": true
+          },
+          {
+            "text": "    trace: Optional[dict] = None,",
+            "lineNumber": 820,
+            "isSignature": true
+          },
+          {
+            "text": "    fallback_reason: str = \"\",",
+            "lineNumber": 821,
+            "isSignature": true
+          },
+          {
+            "text": ") -&gt; dict:",
+            "lineNumber": 822,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"构造统一的问答观测记录。\"\"\"",
+            "lineNumber": 823
+          },
+          {
+            "text": "    settings = get_settings()",
+            "lineNumber": 824
+          },
+          {
+            "text": "    llm_model = getattr(settings, \"llm_model\", \"\")",
+            "lineNumber": 825
+          },
+          {
+            "text": "    endpoint_name = get_last_deepseek_endpoint_name()",
+            "lineNumber": 826
+          },
+          {
+            "text": "    return {",
+            "lineNumber": 827
+          },
+          {
+            "text": "        \"observation_id\": observation_id,",
+            "lineNumber": 828
+          },
+          {
+            "text": "        \"thread_id\": thread_id,",
+            "lineNumber": 829
+          },
+          {
+            "text": "        \"conversation_id\": conversation_id,",
+            "lineNumber": 830
+          },
+          {
+            "text": "        \"user_id\": user_id,",
+            "lineNumber": 831
+          },
+          {
+            "text": "        \"question\": question,",
+            "lineNumber": 832
+          },
+          {
+            "text": "        \"answer\": answer,",
+            "lineNumber": 833
+          },
+          {
+            "text": "        \"route\": route,",
+            "lineNumber": 834
+          },
+          {
+            "text": "        \"response_mode\": response_mode,",
+            "lineNumber": 835
+          },
+          {
+            "text": "        \"success\": success,",
+            "lineNumber": 836
+          },
+          {
+            "text": "        \"used_cache\": used_cache,",
+            "lineNumber": 837
+          },
+          {
+            "text": "        \"pending_sql\": pending_sql or bool((trace or {}).get(\"pending_sql\")),",
+            "lineNumber": 838
+          },
+          {
+            "text": "        \"latency_ms\": max(0, int(latency_ms)),",
+            "lineNumber": 839
+          },
+          {
+            "text": "        \"quality_label\": _quality_label_from_trace(trace, success=success, route=route, fallback_reason=fallback_reason),",
+            "lineNumber": 840
+          },
+          {
+            "text": "        \"fallback_reason\": fallback_reason or (trace or {}).get(\"fallback_reason\") or \"\",",
+            "lineNumber": 841
+          },
+          {
+            "text": "        \"llm_model\": llm_model,",
+            "lineNumber": 842
+          },
+          {
+            "text": "        \"llm_endpoint_name\": endpoint_name,",
+            "lineNumber": 843
+          },
+          {
+            "text": "    }",
+            "lineNumber": 844,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 845
+          },
+          {
+            "lineNumber": 846
+          },
+          {
+            "text": "def _persist_conversation_session_sync(",
+            "lineNumber": 847,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 848,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 849,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 850,
+            "isSignature": true
+          },
+          {
+            "text": "    title: str,",
+            "lineNumber": 851,
+            "isSignature": true
+          },
+          {
+            "text": ") -&gt; None:",
+            "lineNumber": 852,
+            "isSignature": true
+          },
+          {
+            "text": "    ",
+            "lineNumber": 853
+          }
+        ]
+      },
+      "score": 0.4742448329925537
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 23
+          },
+          "endPosition": {
+            "line": 105
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 24,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 25,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "def _ensure_table(uri: str) -&gt; None:",
+            "lineNumber": 24,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 28
+          },
+          {
+            "lineNumber": 29
+          },
+          {
+            "text": "    with safe_connection(uri, retries=3, retry_delay=1.0, critical=True) as conn:",
+            "lineNumber": 30
+          },
+          {
+            "text": "        conn.execute(text(f\"\"\"",
+            "lineNumber": 31
+          },
+          {
+            "text": "            CREATE TABLE IF NOT EXISTS {_OBS_TABLE} (",
+            "lineNumber": 32
+          },
+          {
+            "text": "                observation_id    VARCHAR(64) PRIMARY KEY,",
+            "lineNumber": 33
+          },
+          {
+            "text": "                thread_id         VARCHAR(512) NOT NULL,",
+            "lineNumber": 34
+          },
+          {
+            "text": "                conversation_id   VARCHAR(128) NOT NULL,",
+            "lineNumber": 35
+          },
+          {
+            "text": "                user_id           VARCHAR(255),",
+            "lineNumber": 36
+          },
+          {
+            "text": "                question          TEXT NOT NULL,",
+            "lineNumber": 37
+          },
+          {
+            "text": "                answer            TEXT,",
+            "lineNumber": 38
+          },
+          {
+            "text": "                route             VARCHAR(64) NOT NULL,",
+            "lineNumber": 39
+          },
+          {
+            "text": "                response_mode     VARCHAR(16) NOT NULL DEFAULT 'sync',",
+            "lineNumber": 40
+          },
+          {
+            "text": "                success           BOOLEAN NOT NULL DEFAULT TRUE,",
+            "lineNumber": 41
+          },
+          {
+            "text": "                used_cache        BOOLEAN NOT NULL DEFAULT FALSE,",
+            "lineNumber": 42
+          },
+          {
+            "text": "                pending_sql       BOOLEAN NOT NULL DEFAULT FALSE,",
+            "lineNumber": 43
+          },
+          {
+            "text": "                latency_ms        INTEGER NOT NULL DEFAULT 0,",
+            "lineNumber": 44
+          },
+          {
+            "text": "                quality_label     VARCHAR(64) NOT NULL DEFAULT 'unknown',",
+            "lineNumber": 45
+          },
+          {
+            "text": "                fallback_reason   VARCHAR(255),",
+            "lineNumber": 46
+          },
+          {
+            "text": "                llm_model         VARCHAR(128),",
+            "lineNumber": 47
+          },
+          {
+            "text": "                llm_endpoint_name VARCHAR(128),",
+            "lineNumber": 48
+          },
+          {
+            "text": "                created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "lineNumber": 49
+          },
+          {
+            "text": "            )",
+            "lineNumber": 50
+          },
+          {
+            "text": "        \"\"\"))",
+            "lineNumber": 51
+          },
+          {
+            "text": "        conn.execute(text(f\"\"\"",
+            "lineNumber": 52
+          },
+          {
+            "text": "            CREATE INDEX IF NOT EXISTS idx_{_OBS_TABLE}_conversation_created",
+            "lineNumber": 53
+          },
+          {
+            "text": "            ON {_OBS_TABLE}(conversation_id, created_at DESC)",
+            "lineNumber": 54
+          },
+          {
+            "text": "        \"\"\"))",
+            "lineNumber": 55
+          },
+          {
+            "text": "        conn.execute(text(f\"\"\"",
+            "lineNumber": 56
+          },
+          {
+            "text": "            CREATE INDEX IF NOT EXISTS idx_{_OBS_TABLE}_user_created",
+            "lineNumber": 57
+          },
+          {
+            "text": "            ON {_OBS_TABLE}(user_id, created_at DESC)",
+            "lineNumber": 58
+          },
+          {
+            "text": "        \"\"\"))",
+            "lineNumber": 59
+          },
+          {
+            "text": "        conn.execute(text(f\"\"\"",
+            "lineNumber": 60
+          },
+          {
+            "text": "            CREATE TABLE IF NOT EXISTS {_TRACE_TABLE}",
+            "lineNumber": 61
+          }
+        ]
+      },
+      "score": 0.45898181200027466
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 260,
+            "column": 14
+          },
+          "endPosition": {
+            "line": 321
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "def upsert_feedback(",
+            "lineNumber": 264,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 265,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 266,
+            "isSignature": true
+          },
+          {
+            "text": "    observation_id: str,",
+            "lineNumber": 267,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 268,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 269,
+            "isSignature": true
+          },
+          {
+            "text": "    rating: str,",
+            "lineNumber": 270,
+            "isSignature": true
+          },
+          {
+            "text": "    tags: list[str],",
+            "lineNumber": 271,
+            "isSignature": true
+          },
+          {
+            "text": "    free_text: str,",
+            "lineNumber": 272,
+            "isSignature": true
+          },
+          {
+            "text": ") -&gt; dict[str, Any]:",
+            "lineNumber": 273,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"按 observation_id + actor_key 记录或更新反馈。连接失败时降级返回输入数据。\"\"\"",
+            "lineNumber": 274
+          },
+          {
+            "lineNumber": 275
+          },
+          {
+            "text": "    from sqlalchemy import text",
+            "lineNumber": 276
+          },
+          {
+            "text": "    from src.db_resilience import safe_connection",
+            "lineNumber": 277
+          },
+          {
+            "lineNumber": 278
+          },
+          {
+            "text": "    actor_key = str(user_id or f\"anon:{conversation_id}\")[:512]",
+            "lineNumber": 279
+          },
+          {
+            "text": "    safe_tags = [str(tag).strip()[:64] for tag in (tags or []) if str(tag).strip()]",
+            "lineNumber": 280
+          },
+          {
+            "text": "    try:",
+            "lineNumber": 281
+          },
+          {
+            "text": "        with safe_connection(uri, critical=False) as conn:",
+            "lineNumber": 282
+          },
+          {
+            "text": "            if conn is None:",
+            "lineNumber": 283
+          },
+          {
+            "text": "                logger.warning(\"保存问答反馈降级：数据库不可用\")",
+            "lineNumber": 284
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 285
+          },
+          {
+            "text": "            conn.execute(",
+            "lineNumber": 286
+          },
+          {
+            "text": "                text(f\"\"\"",
+            "lineNumber": 287
+          },
+          {
+            "text": "                    INSERT INTO {_FEEDBACK_TABLE} (",
+            "lineNumber": 288
+          },
+          {
+            "text": "                        observation_id, conversation_id, user_id, actor_key, rating, tags, free_text, created_at, updated_at",
+            "lineNumber": 289
+          },
+          {
+            "text": "                    )",
+            "lineNumber": 290
+          },
+          {
+            "text": "                    VALUES (",
+            "lineNumber": 291
+          },
+          {
+            "text": "                        :observation_id, :conversation_id, :user_id, :actor_key, :rating,",
+            "lineNumber": 292
+          },
+          {
+            "text": "                        CAST(:tags AS JSONB), :free_text, NOW(), NOW()",
+            "lineNumber": 293
+          },
+          {
+            "text": "                    )",
+            "lineNumber": 294
+          },
+          {
+            "text": "                    ON CONFLICT (actor_key, observation_id)",
+            "lineNumber": 295
+          },
+          {
+            "text": "                    DO UPDATE SET",
+            "lineNumber": 296
+          },
+          {
+            "text": "                        rating = EXCLUDED.rating,",
+            "lineNumber": 297
+          },
+          {
+            "text": "                        tags = EXCLUDED.tags,",
+            "lineNumber": 298
+          },
+          {
+            "text": "                        free_text = EXCLUDED.free_text,",
+            "lineNumber": 299
+          },
+          {
+            "text": "                        updated_at = NOW()",
+            "lineNumber": 300
+          },
+          {
+            "text": "                \"\"\"),",
+            "lineNumber": 301
+          },
+          {
+            "text": "                {",
+            "lineNumber": 302
+          },
+          {
+            "text": "                    \"observation_id\": observation_id[:64],",
+            "lineNumber": 303
+          },
+          {
+            "text": "                    \"conversation_id\": conversation_id[:128],",
+            "lineNumber": 304
+          },
+          {
+            "text": "                    \"user_id\": user_id,",
+            "lineNumber": 305
+          },
+          {
+            "text": "                    \"actor_key\": actor_key,",
+            "lineNumber": 306
+          },
+          {
+            "text": "                    \"rating\": rating[:16],",
+            "lineNumber": 307
+          },
+          {
+            "text": "                    \"tags\": json.dumps(safe_tags, ensure_ascii=False),",
+            "lineNumber": 308
+          },
+          {
+            "text": "                    \"free_text\": (free_text or \"\")[:5000],",
+            "lineNumber": 309
+          },
+          {
+            "text": "                },",
+            "lineNumber": 310
+          },
+          {
+            "text": "            )",
+            "lineNumber": 311
+          },
+          {
+            "text": "            conn.commit()",
+            "lineNumber": 312
+          },
+          {
+            "text": "    except Exception as e:",
+            "lineNumber": 313
+          },
+          {
+            "text": "        logger.warning(\"保存问答反馈失败: %s\", e)",
+            "lineNumber": 314
+          }
+        ]
+      },
+      "score": 0.4526251554489136
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 23
+          },
+          "endPosition": {
+            "line": 105
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 24,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 25,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "def _ensure_table(uri: str) -&gt; None:",
+            "lineNumber": 24,
+            "isSignature": true
+          },
+          {
+            "text": "(user_id, created_at DESC)",
+            "lineNumber": 58
+          },
+          {
+            "text": "        \"\"\"))",
+            "lineNumber": 59
+          },
+          {
+            "text": "        conn.execute(text(f\"\"\"",
+            "lineNumber": 60
+          },
+          {
+            "text": "            CREATE TABLE IF NOT EXISTS {_TRACE_TABLE} (",
+            "lineNumber": 61
+          },
+          {
+            "text": "                id                    SERIAL PRIMARY KEY,",
+            "lineNumber": 62
+          },
+          {
+            "text": "                observation_id        VARCHAR(64) NOT NULL,",
+            "lineNumber": 63
+          },
+          {
+            "text": "                final_status          VARCHAR(64) NOT NULL DEFAULT '',",
+            "lineNumber": 64
+          },
+          {
+            "text": "                retrieve_attempt      INTEGER NOT NULL DEFAULT 0,",
+            "lineNumber": 65
+          },
+          {
+            "text": "                top_match_score       DOUBLE PRECISION NOT NULL DEFAULT 0,",
+            "lineNumber": 66
+          },
+          {
+            "text": "                top_normalized_score  DOUBLE PRECISION NOT NULL DEFAULT 0,",
+            "lineNumber": 67
+          },
+          {
+            "text": "                grounding_score       DOUBLE PRECISION NOT NULL DEFAULT 0,",
+            "lineNumber": 68
+          },
+          {
+            "text": "                regenerate_count      INTEGER NOT NULL DEFAULT 0,",
+            "lineNumber": 69
+          },
+          {
+            "text": "                has_evidence_citations BOOLEAN NOT NULL DEFAULT FALSE,",
+            "lineNumber": 70
+          },
+          {
+            "text": "                source_count          INTEGER NOT NULL DEFAULT 0,",
+            "lineNumber": 71
+          },
+          {
+            "text": "                scenario_templates    JSONB NOT NULL DEFAULT '[]'::jsonb,",
+            "lineNumber": 72
+          },
+          {
+            "text": "                retrieved_doc_ids     JSONB NOT NULL DEFAULT '[]'::jsonb,",
+            "lineNumber": 73
+          },
+          {
+            "text": "                retrieved_chunk_ids   JSONB NOT NULL DEFAULT '[]'::jsonb,",
+            "lineNumber": 74
+          },
+          {
+            "text": "                extra                 JSONB NOT NULL DEFAULT '{{}}'::jsonb,",
+            "lineNumber": 75
+          },
+          {
+            "text": "                created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "lineNumber": 76
+          },
+          {
+            "text": "            )",
+            "lineNumber": 77
+          },
+          {
+            "text": "        \"\"\"))",
+            "lineNumber": 78
+          },
+          {
+            "text": "        conn.execute(text(f\"\"\"",
+            "lineNumber": 79
+          },
+          {
+            "text": "            CREATE INDEX IF NOT EXISTS idx_{_TRACE_TABLE}_observation_id",
+            "lineNumber": 80
+          },
+          {
+            "text": "            ON {_TRACE_TABLE}(observation_id)",
+            "lineNumber": 81
+          },
+          {
+            "text": "        \"\"\"))",
+            "lineNumber": 82
+          },
+          {
+            "text": "        conn.execute(text(f\"\"\"",
+            "lineNumber": 83
+          },
+          {
+            "text": "            CREATE TABLE IF NOT EXISTS {_FEEDBACK_TABLE}",
+            "lineNumber": 84
+          }
+        ]
+      },
+      "score": 0.4417298436164856
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 1274
+          },
+          "endPosition": {
+            "line": 1583
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 1275,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 1282,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_stream_generator_impl(",
+            "lineNumber": 1275,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 1276,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 1277,
+            "isSignature": true
+          },
+          {
+            "text": "    message: str,",
+            "lineNumber": 1278,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str] = None,",
+            "lineNumber": 1279,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: Optional[float] = None,",
+            "lineNumber": 1280,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 1281,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1509
+          },
+          {
+            "text": "            if full_reply:",
+            "lineNumber": 1510
+          },
+          {
+            "text": "                if hasattr(graph, \"aupdate_state\"):",
+            "lineNumber": 1511
+          },
+          {
+            "text": "                    await graph.aupdate_state(",
+            "lineNumber": 1512
+          },
+          {
+            "text": "                        config,",
+            "lineNumber": 1513
+          },
+          {
+            "text": "                        {\"messages\": [HumanMessage(content=message), AIMessage(content=full_reply)]},",
+            "lineNumber": 1514
+          },
+          {
+            "text": "                    )",
+            "lineNumber": 1515
+          },
+          {
+            "text": "                else:",
+            "lineNumber": 1516
+          },
+          {
+            "text": "                    await asyncio.to_thread(",
+            "lineNumber": 1517
+          },
+          {
+            "text": "                        graph.update_state,",
+            "lineNumber": 1518
+          },
+          {
+            "text": "                        config,",
+            "lineNumber": 1519
+          },
+          {
+            "text": "                        {\"messages\": [HumanMessage(content=message), AIMessage(content=full_reply)]},",
+            "lineNumber": 1520
+          },
+          {
+            "text": "                    )",
+            "lineNumber": 1521
+          },
+          {
+            "text": "                if getattr(settings_stream, \"answer_cache_enabled\", True):",
+            "lineNumber": 1522
+          },
+          {
+            "text": "                    try:",
+            "lineNumber": 1523
+          },
+          {
+            "text": "                        await set_cached_answer(message, full_reply)",
+            "lineNumber": 1524
+          },
+          {
+            "text": "                    except Exception:",
+            "lineNumber": 1525
+          },
+          {
+            "text": "                        pass",
+            "lineNumber": 1526
+          },
+          {
+            "text": "                await _persist_conversation_session(thread_id, conversation_id, user_id, message)",
+            "lineNumber": 1527
+          },
+          {
+            "text": "                await _persist_chat_messages( thread_id, [HumanMessage(content=message), AIMessage(content=full_reply)])",
+            "lineNumber": 1528
+          },
+          {
+            "text": "            route = \"chat\" if next_action == \"chat\" else \"knowledge\"",
+            "lineNumber": 1529
+          },
+          {
+            "text": "            await _save_qa_observation_async(",
+            "lineNumber": 1530
+          },
+          {
+            "text": "                _build_observation_payload(",
+            "lineNumber": 1531
+          },
+          {
+            "text": "                    observation_id=observation_id,",
+            "lineNumber": 1532
+          },
+          {
+            "text": "                    thread_id=thread_id,",
+            "lineNumber": 1533
+          },
+          {
+            "text": "                    conversation_id=conversation_id,",
+            "lineNumber": 1534
+          },
+          {
+            "text": "                    user_id=user_id,",
+            "lineNumber": 1535
+          },
+          {
+            "text": "                    question=message,",
+            "lineNumber": 1536
+          },
+          {
+            "text": "                    answer=full_reply,",
+            "lineNumber": 1537
+          },
+          {
+            "text": "                    route=route,",
+            "lineNumber": 1538
+          },
+          {
+            "text": "                    response_mode=\"stream\",",
+            "lineNumber": 1539
+          },
+          {
+            "text": "                    success=bool(full_reply),",
+            "lineNumber": 1540
+          },
+          {
+            "text": "                    latency_ms=int((time.perf_counter() - started_at) * 1000),",
+            "lineNumber": 1541
+          },
+          {
+            "text": "                    pending_sql=bool(qa_trace and qa_trace.get(\"pending_sql\")),",
+            "lineNumber": 1542
+          },
+          {
+            "text": "                    trace=qa_trace,",
+            "lineNumber": 1543
+          },
+          {
+            "text": "                    fallback_reason=(qa_trace or {}).get(\"fallback_reason\", \"\"),",
+            "lineNumber": 1544
+          },
+          {
+            "text": "                ),",
+            "lineNumber": 1545
+          },
+          {
+            "text": "                trace=qa_trace,",
+            "lineNumber": 1546
+          },
+          {
+            "text": "            )",
+            "lineNumber": 1547
+          },
+          {
+            "text": "            yield f\"data: {json.dumps({'done': True, 'conversation_id': conversation_id, 'observation_id': observation_id}, ensure_ascii=False)}\\n\\n\"",
+            "lineNumber": 1548
+          },
+          {
+            "text": "        except asyncio.CancelledError:",
+            "lineNumber": 1549
+          }
+        ]
+      },
+      "score": 0.4415312111377716
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/PERFORMANCE_AND_CONVERSATION.md",
+        "range": {
+          "startPosition": {
+            "line": 64
+          },
+          "endPosition": {
+            "line": 90
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "- **返回前复核**：生成完成后，会把“答案文本”再与本次检索到的文档做相关度校验；若低于阈值或缺少证据编号，则认为可能幻觉并重生成，最多 3 次。",
+            "lineNumber": 65
+          },
+          {
+            "lineNumber": 66
+          },
+          {
+            "text": "### 2.7 问答监控与用户反馈分析",
+            "lineNumber": 67
+          },
+          {
+            "lineNumber": 68
+          },
+          {
+            "text": "- **观测落库**：每次问答会记录 &#96;question&#96;、&#96;answer&#96;、&#96;route&#96;、&#96;latency_ms&#96;、&#96;quality_label&#96;、&#96;llm_endpoint_name&#96; 等基础观测信息。",
+            "lineNumber": 69
+          },
+          {
+            "text": "- **RAG 追踪**：知识库问答会额外记录 &#96;retrieve_attempt&#96;、&#96;top_match_score&#96;、&#96;grounding_score&#96;、&#96;regenerate_count&#96;、命中的文档/切片 ID、命中的场景模板。",
+            "lineNumber": 70
+          },
+          {
+            "text": "- **用户反馈**：前端每条 assistant 回答支持 &#96;👍/👎&#96; 反馈；点踩时可补充标签与说明，统一落 PostgreSQL。",
+            "lineNumber": 71
+          },
+          {
+            "text": "- **分析接口**：&#96;GET /qa/analytics&#96; 返回监控总览、差评案例、反馈标签统计与场景模板统计；&#96;POST /qa/feedback&#96; 记录反馈。",
+            "lineNumber": 72
+          },
+          {
+            "text": "- **存储**：默认复用 &#96;chat_history_postgresql_uri&#96;，也可单独配置 &#96;qa_monitoring_postgresql_uri&#96;。",
+            "lineNumber": 73
+          },
+          {
+            "lineNumber": 74
+          },
+          {
+            "text": "---",
+            "lineNumber": 75
+          },
+          {
+            "lineNumber": 76
+          },
+          {
+            "text": "## 三、涉及文件与配置",
+            "lineNumber": 77
+          },
+          {
+            "lineNumber": 78
+          },
+          {
+            "text": "| 位置 | 作用 |",
+            "lineNumber": 79
+          },
+          {
+            "text": "|------|------|",
+            "lineNumber": 80
+          },
+          {
+            "text": "| &#96;config/settings.py&#96; | &#96;max_conversation_turns&#96;、&#96;llm_context_window_turns&#96;、&#96;llm_context_summarize_old&#96;、&#96;chat_history_postgresql_uri&#96; |",
+            "lineNumber": 81
+          },
+          {
+            "text": "| &#96;src/llm.py&#96; | DeepSeek 统一接入、多 endpoint 负载均衡、异常熔断 |",
+            "lineNumber": 82
+          },
+          {
+            "text": "| &#96;api/main.py&#96; | 用 &#96;conversation_id&#96; 作 &#96;thread_id&#96;；15 轮校验；长期记忆加载/落库；异步图调用；返回 &#96;conversation_id&#96; |",
+            "lineNumber": 83
+          },
+          {
+            "text": "| &#96;src/chat_history.py&#96; | 从 PostgreSQL 加载/追加对话历史；建表（通过 &#96;db_resilience&#96; 管理连接韧性） |",
+            "lineNumber": 84
+          },
+          {
+            "text": "| &#96;src/db_resilience.py&#96; | 数据库连接池复用、重试、熔断、降级（详见 [数据库韧性](DB_RESILIENCE.md)） |",
+            "lineNumber": 85
+          },
+          {
+            "text": "| &#96;src/qa_monitoring.py&#96; | 问答观测、RAG 追踪、用户反馈、汇总分析 |",
+            "lineNumber": 86
+          },
+          {
+            "text": "| &#96;src/agents/context_summary.py&#96; | 对窗口外旧消息做 LLM 摘要，供总控/闲聊带入上下文 |",
+            "lineNumber": 87
+          },
+          {
+            "text": "| &#96;src/agents/supervisor.py&#96; | &#96;_messages_for_llm_with_summary&#96;：摘要 + 最近 N 轮再调 LLM |",
+            "lineNumber": 88
+          },
+          {
+            "text": "| &#96;src/agents/chat_agent.py&#96; | 同上，闲聊节点摘要 + 最近 N 轮（含流式） |",
+            "lineNumber": 89
+          },
+          {
+            "text": "| &#96;src/kb/prompt_templates.py&#96; | 海关 40+ 场景化 Prompt 模板与关键词匹配 |",
+            "lineNumber": 90
+          }
+        ]
+      },
+      "score": 0.43957895040512085
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 69,
+            "column": 27
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "@dataclass",
+            "lineNumber": 73
+          },
+          {
+            "text": "class KnowledgeQueryTrace:",
+            "lineNumber": 74,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"记录一次知识库问答的质量追踪信息，供监控与反馈分析使用。\"\"\"",
+            "lineNumber": 75
+          },
+          {
+            "lineNumber": 76
+          },
+          {
+            "text": "    route: str = \"knowledge\"",
+            "lineNumber": 77
+          },
+          {
+            "text": "    final_status: str = \"unknown\"",
+            "lineNumber": 78
+          },
+          {
+            "text": "    retrieve_attempt: int = 0",
+            "lineNumber": 79
+          },
+          {
+            "text": "    top_match_score: float = 0.0",
+            "lineNumber": 80
+          },
+          {
+            "text": "    top_normalized_score: float = 0.0",
+            "lineNumber": 81
+          },
+          {
+            "text": "    grounding_score: float = 0.0",
+            "lineNumber": 82
+          },
+          {
+            "text": "    regenerate_count: int = 0",
+            "lineNumber": 83
+          },
+          {
+            "text": "    has_evidence_citations: bool = False",
+            "lineNumber": 84
+          },
+          {
+            "text": "    source_count: int = 0",
+            "lineNumber": 85
+          },
+          {
+            "text": "    scenario_templates: list[str] = field(default_factory=list)",
+            "lineNumber": 86
+          },
+          {
+            "text": "    retrieved_doc_ids: list[str] = field(default_factory=list)",
+            "lineNumber": 87
+          },
+          {
+            "text": "    retrieved_chunk_ids: list[str] = field(default_factory=list)",
+            "lineNumber": 88
+          },
+          {
+            "text": "    fallback_reason: str = \"\"",
+            "lineNumber": 89
+          },
+          {
+            "text": "    pending_sql: bool = False",
+            "lineNumber": 90
+          },
+          {
+            "lineNumber": 91
+          },
+          {
+            "text": "    def to_dict(self) -&gt; dict[str, Any]:",
+            "lineNumber": 92
+          },
+          {
+            "text": "        \"\"\"转换为可序列化 dict。\"\"\"",
+            "lineNumber": 93
+          },
+          {
+            "lineNumber": 94
+          },
+          {
+            "text": "        return {",
+            "lineNumber": 95
+          },
+          {
+            "text": "            \"route\": self.route,",
+            "lineNumber": 96
+          },
+          {
+            "text": "            \"final_status\": self.final_status,",
+            "lineNumber": 97
+          },
+          {
+            "text": "            \"retrieve_attempt\": self.retrieve_attempt,",
+            "lineNumber": 98
+          },
+          {
+            "text": "            \"top_match_score\": self.top_match_score,",
+            "lineNumber": 99
+          },
+          {
+            "text": "            \"top_normalized_score\": self.top_normalized_score,",
+            "lineNumber": 100
+          },
+          {
+            "text": "            \"grounding_score\": self.grounding_score,",
+            "lineNumber": 101
+          },
+          {
+            "text": "            \"regenerate_count\": self.regenerate_count,",
+            "lineNumber": 102
+          },
+          {
+            "text": "            \"has_evidence_citations\": self.has_evidence_citations,",
+            "lineNumber": 103
+          },
+          {
+            "text": "            \"source_count\": self.source_count,",
+            "lineNumber": 104
+          },
+          {
+            "text": "            \"scenario_templates\": list(self.scenario_templates),",
+            "lineNumber": 105
+          },
+          {
+            "text": "            \"retrieved_doc_ids\": list(self.retrieved_doc_ids),",
+            "lineNumber": 106
+          },
+          {
+            "text": "            \"retrieved_chunk_ids\": list(self.retrieved_chunk_ids),",
+            "lineNumber": 107
+          },
+          {
+            "text": "            \"fallback_reason\": self.fallback_reason,",
+            "lineNumber": 108
+          },
+          {
+            "text": "            \"pending_sql\": self.pending_sql,",
+            "lineNumber": 109
+          },
+          {
+            "text": "        }",
+            "lineNumber": 110,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 111
+          },
+          {
+            "lineNumber": 112
+          },
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 114
+          },
+          {
+            "text": "    知识库问答统一入口：按顺序尝试 QA 精准匹配 → Text2SQL → RAG。",
+            "lineNumber": 115
+          },
+          {
+            "text": "    其中 RAG 生成阶段使用的 LLM 仅限 DeepSeek（_get_llm），不调用 OpenAI。",
+            "lineNumber": 116
+          },
+          {
+            "text": "    ",
+            "lineNumber": 117
+          }
+        ]
+      },
+      "score": 0.4191429615020752
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 213,
+            "column": 57
+          },
+          "endPosition": {
+            "line": 321
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "def list_conversation_observations(uri: str, conversation_id: str, user_id: Optional[str]) -&gt; list[dict[str, Any]]:",
+            "lineNumber": 217,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"按时间顺序列出某会话下的观测记录。连接失败时降级返回空列表。\"\"\"",
+            "lineNumber": 218
+          },
+          {
+            "lineNumber": 219
+          },
+          {
+            "text": "    from sqlalchemy import text",
+            "lineNumber": 220
+          },
+          {
+            "text": "    from src.db_resilience import safe_connection",
+            "lineNumber": 221
+          },
+          {
+            "lineNumber": 222
+          },
+          {
+            "text": "    out: list[dict[str, Any]] = []",
+            "lineNumber": 223
+          },
+          {
+            "text": "    try:",
+            "lineNumber": 224
+          },
+          {
+            "text": "        with safe_connection(uri, critical=False) as conn:",
+            "lineNumber": 225
+          },
+          {
+            "text": "            if conn is None:",
+            "lineNumber": 226
+          },
+          {
+            "text": "                return out",
+            "lineNumber": 227
+          },
+          {
+            "text": "            if user_id is None:",
+            "lineNumber": 228
+          },
+          {
+            "text": "                rows = conn.execute(",
+            "lineNumber": 229
+          },
+          {
+            "text": "                    text(f\"\"\"",
+            "lineNumber": 230
+          },
+          {
+            "text": "                        SELECT observation_id, route, answer, created_at",
+            "lineNumber": 231
+          },
+          {
+            "text": "                        FROM {_OBS_TABLE}",
+            "lineNumber": 232
+          },
+          {
+            "text": "                        WHERE conversation_id = :conversation_id AND user_id IS NULL",
+            "lineNumber": 233
+          },
+          {
+            "text": "                          AND success = TRUE",
+            "lineNumber": 234
+          },
+          {
+            "text": "                          AND COALESCE(answer, '') &lt;&gt; ''",
+            "lineNumber": 235
+          },
+          {
+            "text": "                        ORDER BY created_at ASC",
+            "lineNumber": 236
+          },
+          {
+            "text": "                    \"\"\"),",
+            "lineNumber": 237
+          },
+          {
+            "text": "                    {\"conversation_id\": conversation_id[:128]},",
+            "lineNumber": 238
+          },
+          {
+            "text": "                ).fetchall()",
+            "lineNumber": 239
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 240
+          },
+          {
+            "text": "                rows = conn.execute(",
+            "lineNumber": 241
+          },
+          {
+            "text": "                    text(f\"\"\"",
+            "lineNumber": 242
+          },
+          {
+            "text": "                        SELECT observation_id, route, answer, created_at",
+            "lineNumber": 243
+          },
+          {
+            "text": "                        FROM {_OBS_TABLE}",
+            "lineNumber": 244
+          },
+          {
+            "text": "                        WHERE conversation_id = :conversation_id AND user_id = :user_id",
+            "lineNumber": 245
+          },
+          {
+            "text": "                          AND success = TRUE",
+            "lineNumber": 246
+          },
+          {
+            "text": "                          AND COALESCE(answer, '') &lt;&gt; ''",
+            "lineNumber": 247
+          },
+          {
+            "text": "                        ORDER BY created_at ASC",
+            "lineNumber": 248
+          },
+          {
+            "text": "                    \"\"\"),",
+            "lineNumber": 249
+          },
+          {
+            "text": "                    {\"conversation_id\": conversation_id[:128], \"user_id\": user_id},",
+            "lineNumber": 250
+          },
+          {
+            "text": "                ).fetchall()",
+            "lineNumber": 251
+          },
+          {
+            "text": "        for row in rows:",
+            "lineNumber": 252
+          },
+          {
+            "text": "            out.append({",
+            "lineNumber": 253
+          },
+          {
+            "text": "                \"observation_id\": row[0],",
+            "lineNumber": 254
+          },
+          {
+            "text": "                \"route\": row[1] or \"\",",
+            "lineNumber": 255
+          },
+          {
+            "text": "                \"answer\": row[2] or \"\",",
+            "lineNumber": 256
+          },
+          {
+            "text": "                \"created_at\": row[3].isoformat() if row[3] is not None else \"\",",
+            "lineNumber": 257
+          },
+          {
+            "text": "            })",
+            "lineNumber": 258
+          },
+          {
+            "text": "    except Exception as e:",
+            "lineNumber": 259
+          },
+          {
+            "text": "        logger.warning(\"读取会话观测记录失败: %s\", e)",
+            "lineNumber": 260
+          },
+          {
+            "text": "    return out",
+            "lineNumber": 261,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 262
+          },
+          {
+            "lineNumber": 263
+          },
+          {
+            "text": "def upsert_feedback(",
+            "lineNumber": 264,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 265,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 266,
+            "isSignature": true
+          },
+          {
+            "text": "    observation_id: str,",
+            "lineNumber": 267,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 268,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 269,
+            "isSignature": true
+          },
+          {
+            "text": "    rating: str,",
+            "lineNumber": 270,
+            "isSignature": true
+          },
+          {
+            "text": "    tags: list[str],",
+            "lineNumber": 271,
+            "isSignature": true
+          },
+          {
+            "text": "    free_text: str,",
+            "lineNumber": 272,
+            "isSignature": true
+          },
+          {
+            "text": ") -&gt; dict[str, Any]:",
+            "lineNumber": 273,
+            "isSignature": true
+          },
+          {
+            "text": "    ",
+            "lineNumber": 274
+          }
+        ]
+      },
+      "score": 0.40986910462379456
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 23
+          },
+          "endPosition": {
+            "line": 116
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 24,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 25,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "def _ensure_table(uri: str) -&gt; None:",
+            "lineNumber": 24,
+            "isSignature": true
+          },
+          {
+            "text": "(observation_id)",
+            "lineNumber": 81
+          },
+          {
+            "text": "        \"\"\"))",
+            "lineNumber": 82
+          },
+          {
+            "text": "        conn.execute(text(f\"\"\"",
+            "lineNumber": 83
+          },
+          {
+            "text": "            CREATE TABLE IF NOT EXISTS {_FEEDBACK_TABLE} (",
+            "lineNumber": 84
+          },
+          {
+            "text": "                id              SERIAL PRIMARY KEY,",
+            "lineNumber": 85
+          },
+          {
+            "text": "                observation_id  VARCHAR(64) NOT NULL,",
+            "lineNumber": 86
+          },
+          {
+            "text": "                conversation_id VARCHAR(128) NOT NULL,",
+            "lineNumber": 87
+          },
+          {
+            "text": "                user_id         VARCHAR(255),",
+            "lineNumber": 88
+          },
+          {
+            "text": "                actor_key       VARCHAR(512) NOT NULL,",
+            "lineNumber": 89
+          },
+          {
+            "text": "                rating          VARCHAR(16) NOT NULL,",
+            "lineNumber": 90
+          },
+          {
+            "text": "                tags            JSONB NOT NULL DEFAULT '[]'::jsonb,",
+            "lineNumber": 91
+          },
+          {
+            "text": "                free_text       TEXT NOT NULL DEFAULT '',",
+            "lineNumber": 92
+          },
+          {
+            "text": "                created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),",
+            "lineNumber": 93
+          },
+          {
+            "text": "                updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),",
+            "lineNumber": 94
+          },
+          {
+            "text": "                UNIQUE(actor_key, observation_id)",
+            "lineNumber": 95
+          },
+          {
+            "text": "            )",
+            "lineNumber": 96
+          },
+          {
+            "text": "        \"\"\"))",
+            "lineNumber": 97
+          },
+          {
+            "text": "        conn.execute(text(f\"\"\"",
+            "lineNumber": 98
+          },
+          {
+            "text": "            CREATE INDEX IF NOT EXISTS idx_{_FEEDBACK_TABLE}_conversation_created",
+            "lineNumber": 99
+          },
+          {
+            "text": "            ON {_FEEDBACK_TABLE}(conversation_id, created_at DESC)",
+            "lineNumber": 100
+          },
+          {
+            "text": "        \"\"\"))",
+            "lineNumber": 101
+          },
+          {
+            "text": "        conn.execute(text(f\"\"\"",
+            "lineNumber": 102
+          },
+          {
+            "text": "            CREATE INDEX IF NOT EXISTS idx_{_FEEDBACK_TABLE}_rating_created",
+            "lineNumber": 103
+          },
+          {
+            "text": "            ON {_FEEDBACK_TABLE}(rating, created_at DESC)",
+            "lineNumber": 104
+          },
+          {
+            "text": "        \"\"\"))",
+            "lineNumber": 105
+          },
+          {
+            "text": "        conn.commit()",
+            "lineNumber": 106,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 107
+          },
+          {
+            "lineNumber": 108
+          },
+          {
+            "text": "def ensure_table_if_configured(uri: Optional[str]) -&gt; None:",
+            "lineNumber": 109,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"当配置了 PostgreSQL URI 时创建问答监控相关表。\"\"\"",
+            "lineNumber": 110
+          }
+        ]
+      },
+      "score": 0.3680495023727417
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/agents/state.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 40
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# src/agents/state.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "多智能体图的状态定义。",
+            "lineNumber": 3
+          },
+          {
+            "text": "用于 LangGraph：消息历史由 add_messages 做追加合并，next 由总控写入并驱动条件边。",
+            "lineNumber": 4
+          },
+          {
+            "text": "pending_sql 用于删除/修改类 SQL 人工确认：知识库节点可写入，API 层取出后存到会话待确认表，确认后再执行。",
+            "lineNumber": 5
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 6
+          },
+          {
+            "text": "from typing import Annotated, Literal, NotRequired, Optional, TypedDict",
+            "lineNumber": 7
+          },
+          {
+            "text": "from langgraph.graph.message import add_messages",
+            "lineNumber": 8
+          },
+          {
+            "text": "from langchain_core.messages import BaseMessage",
+            "lineNumber": 9
+          },
+          {
+            "lineNumber": 10
+          },
+          {
+            "lineNumber": 11
+          },
+          {
+            "text": "# 总控/子节点路由下一跳：chat（闲聊）、knowledge（知识库）、human（人工介入）、__end__（结束）",
+            "lineNumber": 12
+          },
+          {
+            "text": "NextAction = Literal[\"chat\", \"knowledge\", \"human\", \"__end__\"]",
+            "lineNumber": 13
+          },
+          {
+            "lineNumber": 14
+          },
+          {
+            "lineNumber": 15
+          },
+          {
+            "text": "class AgentState(TypedDict):",
+            "lineNumber": 16,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 17
+          },
+          {
+            "text": "    图状态：",
+            "lineNumber": 18
+          },
+          {
+            "text": "    - messages: 对话消息列表，使用 add_messages 做增量合并",
+            "lineNumber": 19
+          },
+          {
+            "text": "    - next: 总控/子节点写入的下一节点，供 conditional_edges 路由",
+            "lineNumber": 20
+          },
+          {
+            "text": "    - pending_sql: 待人工确认执行的 SQL（仅当知识库返回删除/修改类 SQL 时写入，确认后由 API 执行并清空）",
+            "lineNumber": 21
+          },
+          {
+            "text": "    - human_message: 转人工时由上游节点写入的提示文案，人工介入节点会将其作为回复发出",
+            "lineNumber": 22
+          },
+          {
+            "text": "    - route: 实际执行的子链路（chat / knowledge / cache / text2sql_confirm 等），供 API 侧监控使用",
+            "lineNumber": 23
+          },
+          {
+            "text": "    - qa_trace: 知识库链路的质量追踪信息，供问答效果监控与用户反馈分析使用",
+            "lineNumber": 24
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 25
+          },
+          {
+            "text": "    messages: Annotated[list[BaseMessage], add_messages]",
+            "lineNumber": 26
+          },
+          {
+            "text": "    next: NextAction",
+            "lineNumber": 27
+          },
+          {
+            "text": "    pending_sql: NotRequired[Optional[str]]",
+            "lineNumber": 28
+          },
+          {
+            "text": "    human_message: NotRequired[Optional[str]]",
+            "lineNumber": 29
+          },
+          {
+            "text": "    route: NotRequired[Optional[str]]",
+            "lineNumber": 30
+          },
+          {
+            "text": "    qa_trace: NotRequired[dict]",
+            "lineNumber": 31,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 32
+          },
+          {
+            "lineNumber": 33
+          },
+          {
+            "text": "def next_action_from_str(s: str) -&gt; NextAction:",
+            "lineNumber": 34,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 35
+          }
+        ]
+      },
+      "score": 0.3620249927043915
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 263
+          },
+          "endPosition": {
+            "line": 362
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 264,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 274,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "def upsert_feedback(",
+            "lineNumber": 264,
+            "isSignature": true
+          },
+          {
+            "text": "    uri: str,",
+            "lineNumber": 265,
+            "isSignature": true
+          },
+          {
+            "text": "    *,",
+            "lineNumber": 266,
+            "isSignature": true
+          },
+          {
+            "text": "    observation_id: str,",
+            "lineNumber": 267,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 268,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 269,
+            "isSignature": true
+          },
+          {
+            "text": "    rating: str,",
+            "lineNumber": 270,
+            "isSignature": true
+          },
+          {
+            "text": "    tags: list[str],",
+            "lineNumber": 271,
+            "isSignature": true
+          },
+          {
+            "text": "    free_text: str,",
+            "lineNumber": 272,
+            "isSignature": true
+          },
+          {
+            "text": ") -&gt; dict[str, Any]:",
+            "lineNumber": 273,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 310
+          },
+          {
+            "text": "            )",
+            "lineNumber": 311
+          },
+          {
+            "text": "            conn.commit()",
+            "lineNumber": 312
+          },
+          {
+            "text": "    except Exception as e:",
+            "lineNumber": 313
+          },
+          {
+            "text": "        logger.warning(\"保存问答反馈失败: %s\", e)",
+            "lineNumber": 314
+          },
+          {
+            "text": "    return {",
+            "lineNumber": 315
+          },
+          {
+            "text": "        \"observation_id\": observation_id[:64],",
+            "lineNumber": 316
+          },
+          {
+            "text": "        \"conversation_id\": conversation_id[:128],",
+            "lineNumber": 317
+          },
+          {
+            "text": "        \"user_id\": user_id,",
+            "lineNumber": 318
+          },
+          {
+            "text": "        \"rating\": rating[:16],",
+            "lineNumber": 319
+          },
+          {
+            "text": "        \"tags\": safe_tags,",
+            "lineNumber": 320
+          },
+          {
+            "text": "        \"free_text\": (free_text or \"\")[:5000],",
+            "lineNumber": 321
+          },
+          {
+            "text": "    }",
+            "lineNumber": 322,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 323
+          },
+          {
+            "lineNumber": 324
+          },
+          {
+            "text": "def get_feedback_map(uri: str, conversation_id: str, user_id: Optional[str]) -&gt; dict[str, dict[str, Any]]:",
+            "lineNumber": 325,
+            "isSignature": true
+          },
+          {
+            "text": "    ",
+            "lineNumber": 326
+          }
+        ]
+      },
+      "score": 0.3588862121105194
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 365
+          },
+          "endPosition": {
+            "line": 438
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 366,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 367,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "def get_summary(uri: str, *, days: int = 7, user_id: Optional[str] = None) -&gt; dict[str, Any]:",
+            "lineNumber": 366,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 392
+          },
+          {
+            "text": "            row = conn.execute(",
+            "lineNumber": 393
+          },
+          {
+            "text": "                text(f\"\"\"",
+            "lineNumber": 394
+          },
+          {
+            "text": "                    SELECT",
+            "lineNumber": 395
+          },
+          {
+            "text": "                        COUNT(*) AS total_questions,",
+            "lineNumber": 396
+          },
+          {
+            "text": "                        COALESCE(SUM(CASE WHEN o.success THEN 1 ELSE 0 END), 0) AS success_count,",
+            "lineNumber": 397
+          },
+          {
+            "text": "                        COALESCE(SUM(CASE WHEN o.used_cache THEN 1 ELSE 0 END), 0) AS cache_hit_count,",
+            "lineNumber": 398
+          },
+          {
+            "text": "                        COALESCE(SUM(CASE WHEN o.route IN ('knowledge', 'qa', 'text2sql', 'rag', 'cache') THEN 1 ELSE 0 END), 0) AS knowledge_count,",
+            "lineNumber": 399
+          },
+          {
+            "text": "                        COALESCE(AVG(o.latency_ms), 0) AS avg_latency_ms,",
+            "lineNumber": 400
+          },
+          {
+            "text": "                        COALESCE(SUM(CASE WHEN t.grounding_score &gt; 0 AND t.grounding_score &lt; 0.18 THEN 1 ELSE 0 END), 0) AS low_grounding_count,",
+            "lineNumber": 401
+          },
+          {
+            "text": "                        COALESCE(SUM(CASE WHEN t.regenerate_count &gt; 0 THEN 1 ELSE 0 END), 0) AS regenerated_count,",
+            "lineNumber": 402
+          },
+          {
+            "text": "                        COALESCE(SUM(CASE WHEN o.quality_label IN ('fallback', 'low_grounding', 'needs_human', 'no_retrieval_hit') THEN 1 ELSE 0 END), 0) AS fallback_count",
+            "lineNumber": 403
+          },
+          {
+            "text": "                    FROM {_OBS_TABLE} o",
+            "lineNumber": 404
+          },
+          {
+            "text": "                    LEFT JOIN {_TRACE_TABLE} t ON o.observation_id = t.observation_id",
+            "lineNumber": 405
+          },
+          {
+            "text": "                    WHERE {user_filter}",
+            "lineNumber": 406
+          },
+          {
+            "text": "                      AND o.created_at &gt;= NOW() - (:days || ' days')::interval",
+            "lineNumber": 407
+          },
+          {
+            "text": "                \"\"\"),",
+            "lineNumber": 408
+          },
+          {
+            "text": "                params,",
+            "lineNumber": 409
+          },
+          {
+            "text": "            ).fetchone()",
+            "lineNumber": 410
+          },
+          {
+            "text": "            if row:",
+            "lineNumber": 411
+          },
+          {
+            "text": "                result.update({",
+            "lineNumber": 412
+          },
+          {
+            "text": "                    \"total_questions\": int(row[0] or 0),",
+            "lineNumber": 413
+          },
+          {
+            "text": "                    \"success_count\": int(row[1] or 0),",
+            "lineNumber": 414
+          },
+          {
+            "text": "                    \"cache_hit_count\": int(row[2] or 0),",
+            "lineNumber": 415
+          },
+          {
+            "text": "                    \"knowledge_count\": int(row[3] or 0),",
+            "lineNumber": 416
+          },
+          {
+            "text": "                    \"avg_latency_ms\": round(float(row[4] or 0), 2),",
+            "lineNumber": 417
+          },
+          {
+            "text": "                    \"low_grounding_count\": int(row[5] or 0),",
+            "lineNumber": 418
+          },
+          {
+            "text": "                    \"regenerated_count\": int(row[6] or 0),",
+            "lineNumber": 419
+          },
+          {
+            "text": "                    \"fallback_count\": int(row[7] or 0),",
+            "lineNumber": 420
+          },
+          {
+            "text": "                })",
+            "lineNumber": 421
+          },
+          {
+            "text": "            fb_filter = \"user_id IS NULL\" if user_id is None else \"user_id = :user_id\"",
+            "lineNumber": 422
+          },
+          {
+            "text": "            fb_row = conn.execute(",
+            "lineNumber": 423
+          },
+          {
+            "text": "                text(f\"\"\"",
+            "lineNumber": 424
+          },
+          {
+            "text": "                    SELECT",
+            "lineNumber": 425
+          },
+          {
+            "text": "                        COALESCE(SUM(CASE WHEN rating = 'down' THEN 1 ELSE 0 END), 0),",
+            "lineNumber": 426
+          },
+          {
+            "text": "                        COALESCE(SUM(CASE WHEN rating = 'up' THEN 1 ELSE 0 END), 0)",
+            "lineNumber": 427
+          },
+          {
+            "text": "                    FROM ",
+            "lineNumber": 428
+          }
+        ]
+      },
+      "score": 0.35608041286468506
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 44,
+            "column": 41
+          },
+          "endPosition": {
+            "line": 79,
+            "column": 37
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "from src.kb.schema_loader import read_db_schema, load_schema_overrides, save_schema_overrides",
+            "lineNumber": 46
+          },
+          {
+            "text": "from src.answer_cache import answer_lock, get_cached_answer, set_cached_answer, close_redis_connection, redis_ping",
+            "lineNumber": 47
+          },
+          {
+            "text": "from src.chat_history import (",
+            "lineNumber": 48
+          },
+          {
+            "text": "    load_messages as chat_history_load,",
+            "lineNumber": 49
+          },
+          {
+            "text": "    append_messages as chat_history_append,",
+            "lineNumber": 50
+          },
+          {
+            "text": "    dispose_engines as chat_history_dispose_engines,",
+            "lineNumber": 51
+          },
+          {
+            "text": "    dispose_async_pools as chat_history_dispose_async_pools,",
+            "lineNumber": 52
+          },
+          {
+            "text": "    ensure_table_if_configured as chat_history_ensure_table,",
+            "lineNumber": 53
+          },
+          {
+            "text": "    load_messages_async as chat_history_load_messages_async,",
+            "lineNumber": 54
+          },
+          {
+            "text": "    append_messages_async as chat_history_append_messages_async,",
+            "lineNumber": 55
+          },
+          {
+            "text": "    load_runtime_state as chat_history_load_runtime_state,",
+            "lineNumber": 56
+          },
+          {
+            "text": "    load_runtime_state_async as chat_history_load_runtime_state_async,",
+            "lineNumber": 57
+          },
+          {
+            "text": "    save_runtime_state as chat_history_save_runtime_state,",
+            "lineNumber": 58
+          },
+          {
+            "text": "    save_runtime_state_async as chat_history_save_runtime_state_async,",
+            "lineNumber": 59
+          },
+          {
+            "text": "    upsert_conversation_session as chat_history_upsert_conversation_session,",
+            "lineNumber": 60
+          },
+          {
+            "text": "    list_conversation_sessions as chat_history_list_conversation_sessions,",
+            "lineNumber": 61
+          },
+          {
+            "text": "    get_conversation_session as chat_history_get_conversation_session,",
+            "lineNumber": 62
+          },
+          {
+            "text": "    rename_conversation_session as chat_history_rename_conversation_session,",
+            "lineNumber": 63
+          },
+          {
+            "text": "    delete_conversation_session as chat_history_delete_conversation_session,",
+            "lineNumber": 64
+          },
+          {
+            "text": ")",
+            "lineNumber": 65
+          },
+          {
+            "text": "from src.qa_monitoring import (",
+            "lineNumber": 66
+          },
+          {
+            "text": "    ensure_table_if_configured as qa_monitoring_ensure_table,",
+            "lineNumber": 67
+          },
+          {
+            "text": "    save_observation as qa_monitoring_save_observation,",
+            "lineNumber": 68
+          },
+          {
+            "text": "    upsert_feedback as qa_monitoring_upsert_feedback,",
+            "lineNumber": 69
+          },
+          {
+            "text": "    get_feedback_map as qa_monitoring_get_feedback_map,",
+            "lineNumber": 70
+          },
+          {
+            "text": "    list_conversation_observations as qa_monitoring_list_conversation_observations,",
+            "lineNumber": 71
+          },
+          {
+            "text": "    get_summary as qa_monitoring_get_summary,",
+            "lineNumber": 72
+          },
+          {
+            "text": "    list_bad_cases as qa_monitoring_list_bad_cases,",
+            "lineNumber": 73
+          },
+          {
+            "text": "    list_feedback_tag_stats as qa_monitoring_list_feedback_tag_stats,",
+            "lineNumber": 74
+          },
+          {
+            "text": "    list_scenario_stats as qa_monitoring_list_scenario_stats,",
+            "lineNumber": 75
+          },
+          {
+            "text": "    delete_conversation_data as qa_monitoring_delete_conversation_data,",
+            "lineNumber": 76
+          },
+          {
+            "text": ")",
+            "lineNumber": 77
+          },
+          {
+            "text": "from langchain_core.messages import HumanMessage, AIMessage",
+            "lineNumber": 78
+          },
+          {
+            "text": "from langgraph.types import Command",
+            "lineNumber": 79
+          },
+          {
+            "text": "from src.llm import get_deepseek_llm,",
+            "lineNumber": 80
+          }
+        ]
+      },
+      "score": 0.35424304008483887
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 1742,
+            "column": 63
+          },
+          "endPosition": {
+            "line": 1801
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "@app.post(\"/qa/feedback\", response_model=dict)",
+            "lineNumber": 1746
+          },
+          {
+            "text": "async def qa_feedback(request: Request, body: QAFeedbackRequest):",
+            "lineNumber": 1747,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"记录或更新用户对某条回答的反馈（点赞/点踩 + 标签 + 补充说明）。\"\"\"",
+            "lineNumber": 1748
+          },
+          {
+            "text": "    rating = (body.rating or \"\").strip().lower()",
+            "lineNumber": 1749
+          },
+          {
+            "text": "    if rating not in (\"up\", \"down\"):",
+            "lineNumber": 1750
+          },
+          {
+            "text": "        raise HTTPException(status_code=400, detail=\"rating 仅支持 up 或 down。\")",
+            "lineNumber": 1751
+          },
+          {
+            "text": "    actual_user_id = _user_id_from_request(request, body.user_id)",
+            "lineNumber": 1752
+          },
+          {
+            "text": "    uri = _qa_monitoring_uri(get_settings())",
+            "lineNumber": 1753
+          },
+          {
+            "text": "    if not uri or \"postgresql\" not in uri.lower():",
+            "lineNumber": 1754
+          },
+          {
+            "text": "        raise HTTPException(status_code=400, detail=\"未启用问答监控 PostgreSQL，暂不支持反馈分析。\")",
+            "lineNumber": 1755
+          },
+          {
+            "text": "    payload = await asyncio.to_thread(",
+            "lineNumber": 1756
+          },
+          {
+            "text": "        qa_monitoring_upsert_feedback,",
+            "lineNumber": 1757
+          },
+          {
+            "text": "        uri,",
+            "lineNumber": 1758
+          },
+          {
+            "text": "        observation_id=body.observation_id,",
+            "lineNumber": 1759
+          },
+          {
+            "text": "        conversation_id=body.conversation_id,",
+            "lineNumber": 1760
+          },
+          {
+            "text": "        user_id=actual_user_id,",
+            "lineNumber": 1761
+          },
+          {
+            "text": "        rating=rating,",
+            "lineNumber": 1762
+          },
+          {
+            "text": "        tags=list(body.tags or []),",
+            "lineNumber": 1763
+          },
+          {
+            "text": "        free_text=(body.free_text or \"\").strip(),",
+            "lineNumber": 1764
+          },
+          {
+            "text": "    )",
+            "lineNumber": 1765
+          },
+          {
+            "text": "    return {\"ok\": True, **payload}",
+            "lineNumber": 1766,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1767
+          },
+          {
+            "lineNumber": 1768
+          },
+          {
+            "text": "@app.get(\"/qa/analytics\", response_model=QAMonitorAnalyticsResponse)",
+            "lineNumber": 1769
+          },
+          {
+            "text": "async def qa_analytics(request: Request, days: int = 7, limit: int = 20, user_id: Optional[str] = None):",
+            "lineNumber": 1770,
+            "isSignature": true
+          },
+          {
+            "text": "    ",
+            "lineNumber": 1771
+          }
+        ]
+      },
+      "score": 0.35059595108032227
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 930
+          },
+          "endPosition": {
+            "line": 1256
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 931,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 941,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_impl(",
+            "lineNumber": 931,
+            "isSignature": true
+          },
+          {
+            "text": "    request: Request,",
+            "lineNumber": 932,
+            "isSignature": true
+          },
+          {
+            "text": "    req: ChatRequest,",
+            "lineNumber": 933,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 934,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 935,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 936,
+            "isSignature": true
+          },
+          {
+            "text": "    config: dict,",
+            "lineNumber": 937,
+            "isSignature": true
+          },
+          {
+            "text": "    graph,",
+            "lineNumber": 938,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: float,",
+            "lineNumber": 939,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 940,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1087
+          },
+          {
+            "text": "            await _persist_chat_messages( thread_id, [HumanMessage(content=req.message), AIMessage(content=reply_exec)])",
+            "lineNumber": 1088
+          },
+          {
+            "text": "            await _save_qa_observation_async(",
+            "lineNumber": 1089
+          },
+          {
+            "text": "                _build_observation_payload(",
+            "lineNumber": 1090
+          },
+          {
+            "text": "                    observation_id=observation_id,",
+            "lineNumber": 1091
+          },
+          {
+            "text": "                    thread_id=thread_id,",
+            "lineNumber": 1092
+          },
+          {
+            "text": "                    conversation_id=conversation_id,",
+            "lineNumber": 1093
+          },
+          {
+            "text": "                    user_id=user_id,",
+            "lineNumber": 1094
+          },
+          {
+            "text": "                    question=req.message,",
+            "lineNumber": 1095
+          },
+          {
+            "text": "                    answer=reply_exec,",
+            "lineNumber": 1096
+          },
+          {
+            "text": "                    route=\"text2sql_confirm\",",
+            "lineNumber": 1097
+          },
+          {
+            "text": "                    response_mode=\"sync\",",
+            "lineNumber": 1098
+          },
+          {
+            "text": "                    success=True,",
+            "lineNumber": 1099
+          },
+          {
+            "text": "                    latency_ms=int((time.perf_counter() - started_at) * 1000),",
+            "lineNumber": 1100
+          },
+          {
+            "text": "                )",
+            "lineNumber": 1101
+          },
+          {
+            "text": "            )",
+            "lineNumber": 1102
+          },
+          {
+            "text": "            return ChatResponse(reply=reply_exec, conversation_id=conversation_id, observation_id=observation_id)",
+            "lineNumber": 1103
+          },
+          {
+            "lineNumber": 1104
+          },
+          {
+            "text": "    # 防击穿：同一问题仅一个协程回源，持锁后再次查缓存再决定是否走图",
+            "lineNumber": 1105
+          }
+        ]
+      },
+      "score": 0.34604668617248535
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 1274
+          },
+          "endPosition": {
+            "line": 1583
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 1275,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 1282,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_stream_generator_impl(",
+            "lineNumber": 1275,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 1276,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 1277,
+            "isSignature": true
+          },
+          {
+            "text": "    message: str,",
+            "lineNumber": 1278,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str] = None,",
+            "lineNumber": 1279,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: Optional[float] = None,",
+            "lineNumber": 1280,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 1281,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 1475
+          },
+          {
+            "lineNumber": 1476
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 1477
+          },
+          {
+            "text": "            snapshot = await graph.aget_state(config) if hasattr(graph, \"aget_state\") else await asyncio.to_thread(graph.get_state, config)",
+            "lineNumber": 1478
+          },
+          {
+            "text": "            current = (snapshot.values or {}).get(\"messages\") or []",
+            "lineNumber": 1479
+          },
+          {
+            "text": "        except Exception:",
+            "lineNumber": 1480
+          },
+          {
+            "text": "            current = []",
+            "lineNumber": 1481
+          },
+          {
+            "text": "        new_messages = list(current) + [HumanMessage(content=message)]",
+            "lineNumber": 1482
+          },
+          {
+            "text": "        new_state = {\"messages\": new_messages}",
+            "lineNumber": 1483
+          },
+          {
+            "lineNumber": 1484
+          },
+          {
+            "text": "        # 总控路由：仅当明确为 knowledge 时走知识库流式，否则走闲聊流式",
+            "lineNumber": 1485
+          },
+          {
+            "text": "        next_action = (await supervisor_node_async(new_state)).get(\"next\", \"chat\")",
+            "lineNumber": 1486
+          },
+          {
+            "text": "        if next_action != \"knowledge\":",
+            "lineNumber": 1487
+          },
+          {
+            "text": "            next_action = \"chat\"",
+            "lineNumber": 1488
+          },
+          {
+            "lineNumber": 1489
+          },
+          {
+            "text": "        full_chunks: list = []",
+            "lineNumber": 1490
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 1491
+          },
+          {
+            "text": "            qa_trace = None",
+            "lineNumber": 1492
+          },
+          {
+            "text": "            if next_action == \"chat\":",
+            "lineNumber": 1493
+          },
+          {
+            "text": "                async for chunk in chat_agent_stream_async(new_state):",
+            "lineNumber": 1494
+          },
+          {
+            "text": "                    full_chunks.append(chunk)",
+            "lineNumber": 1495
+          },
+          {
+            "text": "                    yield f\"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\\n\\n\"",
+            "lineNumber": 1496
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 1497
+          },
+          {
+            "text": "                engine = KnowledgeEngine()",
+            "lineNumber": 1498
+          },
+          {
+            "text": "                pending_holder: list = []",
+            "lineNumber": 1499
+          },
+          {
+            "text": "                async for chunk in engine.aquery_stream(message, pending_sql_out=pending_holder):",
+            "lineNumber": 1500
+          },
+          {
+            "text": "                    full_chunks.append(chunk)",
+            "lineNumber": 1501
+          },
+          {
+            "text": "                    yield f\"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\\n\\n\"",
+            "lineNumber": 1502
+          },
+          {
+            "text": "                qa_trace = engine.get_last_trace()",
+            "lineNumber": 1503
+          },
+          {
+            "text": "                # 知识库若生成了待确认 SQL，通过 pending_holder 带回，写入共享状态供对话内确认",
+            "lineNumber": 1504
+          },
+          {
+            "text": "                if pending_holder:",
+            "lineNumber": 1505
+          },
+          {
+            "text": "                    await shared_state_module.set_pending_sql(thread_id, pending_holder[0])",
+            "lineNumber": 1506
+          },
+          {
+            "text": "                    await _persist_runtime_state(thread_id)",
+            "lineNumber": 1507
+          },
+          {
+            "text": "            full_reply = \"\".join(full_chunks) if full_chunks else \"\"",
+            "lineNumber": 1508
+          },
+          {
+            "text": "            observation_id = str(uuid.uuid4())",
+            "lineNumber": 1509
+          },
+          {
+            "text": "            if full_reply:",
+            "lineNumber": 1510
+          },
+          {
+            "text": "                if hasattr(graph, \"aupdate_state\"):",
+            "lineNumber": 1511
+          }
+        ]
+      },
+      "score": 0.34069129824638367
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/qa_monitoring.py",
+        "range": {
+          "startPosition": {
+            "line": 441
+          },
+          "endPosition": {
+            "line": 502
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 442,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 443,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "def list_bad_cases(uri: str, *, days: int = 7, user_id: Optional[str] = None, limit: int = 20) -&gt; list[dict[str, Any]]:",
+            "lineNumber": 442,
+            "isSignature": true
+          },
+          {
+            "text": "(f\"\"\"",
+            "lineNumber": 460
+          },
+          {
+            "text": "                    SELECT",
+            "lineNumber": 461
+          },
+          {
+            "text": "                        o.observation_id, o.conversation_id, o.question, o.answer, o.route,",
+            "lineNumber": 462
+          },
+          {
+            "text": "                        o.quality_label, o.latency_ms, o.created_at,",
+            "lineNumber": 463
+          },
+          {
+            "text": "                        COALESCE(t.grounding_score, 0) AS grounding_score,",
+            "lineNumber": 464
+          },
+          {
+            "text": "                        COALESCE(t.regenerate_count, 0) AS regenerate_count,",
+            "lineNumber": 465
+          },
+          {
+            "text": "                        COALESCE(f.rating, '') AS rating,",
+            "lineNumber": 466
+          },
+          {
+            "text": "                        COALESCE(f.tags, '[]'::jsonb) AS tags",
+            "lineNumber": 467
+          },
+          {
+            "text": "                    FROM {_OBS_TABLE} o",
+            "lineNumber": 468
+          },
+          {
+            "text": "                    LEFT JOIN {_TRACE_TABLE} t ON o.observation_id = t.observation_id",
+            "lineNumber": 469
+          },
+          {
+            "text": "                    LEFT JOIN {_FEEDBACK_TABLE} f ON o.observation_id = f.observation_id",
+            "lineNumber": 470
+          },
+          {
+            "text": "                    WHERE {user_filter}",
+            "lineNumber": 471
+          },
+          {
+            "text": "                      AND o.created_at &gt;= NOW() - (:days || ' days')::interval",
+            "lineNumber": 472
+          },
+          {
+            "text": "                      AND (",
+            "lineNumber": 473
+          },
+          {
+            "text": "                        COALESCE(f.rating, '') = 'down'",
+            "lineNumber": 474
+          },
+          {
+            "text": "                        OR COALESCE(t.grounding_score, 1) &lt; 0.18",
+            "lineNumber": 475
+          },
+          {
+            "text": "                        OR o.quality_label IN ('fallback', 'low_grounding', 'needs_human', 'no_retrieval_hit')",
+            "lineNumber": 476
+          },
+          {
+            "text": "                      )",
+            "lineNumber": 477
+          },
+          {
+            "text": "                    ORDER BY",
+            "lineNumber": 478
+          },
+          {
+            "text": "                        CASE WHEN COALESCE(f.rating, '') = 'down' THEN 0 ELSE 1 END,",
+            "lineNumber": 479
+          },
+          {
+            "text": "                        COALESCE(t.grounding_score, 1) ASC,",
+            "lineNumber": 480
+          },
+          {
+            "text": "                        o.created_at DESC",
+            "lineNumber": 481
+          },
+          {
+            "text": "                    LIMIT :limit",
+            "lineNumber": 482
+          },
+          {
+            "text": "                \"\"\"),",
+            "lineNumber": 483
+          },
+          {
+            "text": "                params,",
+            "lineNumber": 484
+          },
+          {
+            "text": "            ).fetchall()",
+            "lineNumber": 485
+          },
+          {
+            "text": "        for row in rows:",
+            "lineNumber": 486
+          },
+          {
+            "text": "            out.append",
+            "lineNumber": 487
+          }
+        ]
+      },
+      "score": 0.32836616039276123
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 930
+          },
+          "endPosition": {
+            "line": 1256
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 931,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 941,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "async def _chat_impl(",
+            "lineNumber": 931,
+            "isSignature": true
+          },
+          {
+            "text": "    request: Request,",
+            "lineNumber": 932,
+            "isSignature": true
+          },
+          {
+            "text": "    req: ChatRequest,",
+            "lineNumber": 933,
+            "isSignature": true
+          },
+          {
+            "text": "    thread_id: str,",
+            "lineNumber": 934,
+            "isSignature": true
+          },
+          {
+            "text": "    conversation_id: str,",
+            "lineNumber": 935,
+            "isSignature": true
+          },
+          {
+            "text": "    user_id: Optional[str],",
+            "lineNumber": 936,
+            "isSignature": true
+          },
+          {
+            "text": "    config: dict,",
+            "lineNumber": 937,
+            "isSignature": true
+          },
+          {
+            "text": "    graph,",
+            "lineNumber": 938,
+            "isSignature": true
+          },
+          {
+            "text": "    started_at: float,",
+            "lineNumber": 939,
+            "isSignature": true
+          },
+          {
+            "text": "):",
+            "lineNumber": 940,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 982
+          },
+          {
+            "text": "    except Exception:",
+            "lineNumber": 983
+          },
+          {
+            "text": "        pass",
+            "lineNumber": 984
+          },
+          {
+            "lineNumber": 985
+          },
+          {
+            "text": "    # 问答缓存：若历史问题命中缓存，直接返回并写入本轮对话状态（缓存异常不影响主流程）",
+            "lineNumber": 986
+          },
+          {
+            "text": "    if getattr(settings, \"answer_cache_enabled\", True):",
+            "lineNumber": 987
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 988
+          },
+          {
+            "text": "            cached = await get_cached_answer(req.message)",
+            "lineNumber": 989
+          },
+          {
+            "text": "        except Exception:",
+            "lineNumber": 990
+          },
+          {
+            "text": "            cached = None",
+            "lineNumber": 991
+          },
+          {
+            "text": "        if cached is not None:",
+            "lineNumber": 992
+          },
+          {
+            "text": "            observation_id = str(uuid.uuid4())",
+            "lineNumber": 993
+          },
+          {
+            "text": "            if hasattr(graph, \"aupdate_state\"):",
+            "lineNumber": 994
+          },
+          {
+            "text": "                await graph.aupdate_state(",
+            "lineNumber": 995
+          },
+          {
+            "text": "                    config,",
+            "lineNumber": 996
+          },
+          {
+            "text": "                    {\"messages\": [HumanMessage(content=req.message), AIMessage(content=cached)]},",
+            "lineNumber": 997
+          },
+          {
+            "text": "                )",
+            "lineNumber": 998
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 999
+          },
+          {
+            "text": "                await asyncio.to_thread(",
+            "lineNumber": 1000
+          },
+          {
+            "text": "                    graph.update_state,",
+            "lineNumber": 1001
+          },
+          {
+            "text": "                    config,",
+            "lineNumber": 1002
+          },
+          {
+            "text": "                    {\"messages\": [HumanMessage(content=req.message), AIMessage(content=cached)]},",
+            "lineNumber": 1003
+          },
+          {
+            "text": "                )",
+            "lineNumber": 1004
+          },
+          {
+            "text": "            await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)",
+            "lineNumber": 1005
+          },
+          {
+            "text": "            await _persist_chat_messages( thread_id, [HumanMessage(content=req.message), AIMessage(content=cached)])",
+            "lineNumber": 1006
+          },
+          {
+            "text": "            await _save_qa_observation_async(",
+            "lineNumber": 1007
+          },
+          {
+            "text": "                _build_observation_payload(",
+            "lineNumber": 1008
+          },
+          {
+            "text": "                    observation_id=observation_id,",
+            "lineNumber": 1009
+          },
+          {
+            "text": "                    thread_id=thread_id,",
+            "lineNumber": 1010
+          },
+          {
+            "text": "                    conversation_id=conversation_id,",
+            "lineNumber": 1011
+          },
+          {
+            "text": "                    user_id=user_id,",
+            "lineNumber": 1012
+          },
+          {
+            "text": "                    question=req.message,",
+            "lineNumber": 1013
+          },
+          {
+            "text": "                    answer=cached,",
+            "lineNumber": 1014
+          },
+          {
+            "text": "                    route=\"cache\",",
+            "lineNumber": 1015
+          },
+          {
+            "text": "                    response_mode=\"sync\",",
+            "lineNumber": 1016
+          },
+          {
+            "text": "                    success=True,",
+            "lineNumber": 1017
+          },
+          {
+            "text": "                    latency_ms=int((time.perf_counter() - started_at) * 1000),",
+            "lineNumber": 1018
+          },
+          {
+            "text": "                    used_cache=True,",
+            "lineNumber": 1019
+          },
+          {
+            "text": "                )",
+            "lineNumber": 1020
+          },
+          {
+            "text": "            )",
+            "lineNumber": 1021
+          },
+          {
+            "text": "            return ChatResponse(reply=cached, conversation_id=conversation_id, observation_id=observation_id)",
+            "lineNumber": 1022
+          },
+          {
+            "lineNumber": 1023
+          },
+          {
+            "text": "    # 对话内「确认执行」：从共享状态取出该会话的待执行 SQL 并执行，结果写入图状态后返回",
+            "lineNumber": 1024
+          }
+        ]
+      },
+      "score": 0.3244062066078186
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have a good picture. The project has:
+- observation_id per request
+- latency_ms (end-to-end)
+- route (chat/qa/text2sql/rag/cache etc.)
+- qa_rag_trace with final_status, retrieve_attempt, top_match_score, grounding_score, regenerate_count, source_count, etc.
+- quality_label, fallback_reason, llm_endpoint_name
+
+What's missing for "link tracing" and "bottleneck localization":
+- No per-stage timing (e.g. cache_lookup_ms, supervisor_ms, retrieval_ms, llm_ms) - only total latency_ms
+- No distributed trace ID / span ID (e.g. OpenTelemetry)
+- No explicit "which stage took longest" breakdown
+
+I'll write a doc that:
+1. Link tracing: design (trace_id, span, stages), what the project has (observation_id, route, latency_ms, trace table), what could be added (per-stage timing, OpenTelemetry)
+2. Bottleneck localization: how to use existing data (route + latency, trace fields), how to add stage timings, where bottlenecks typically are (LLM, retrieval, DB)
+3. Resource pool optimization: connection pool (DB, Redis), thread pool, LLM endpoint pool, semaphore limits - and config knobs
+4. Elastic scaling: horizontal (multi worker, load balancer, session affinity), vertical (thread pool, connection pool size), when to scale
+5. Cost optimization: cache to reduce LLM/retrieval, model choice, context length, retrieval cache, rate limit, spot/preemptible for non-critical
+
+I'll create a new doc that covers all five and references the project.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/qa_monitoring.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "pool_size|max_overflow|thread_pool|Semaphore|connection",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/config/settings.py",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "pool_size|max_overflow|thread_pool|Semaphore|connection",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/config/settings.py",
+  "outputMode": "content",
+  "totalFiles": 1,
+  "totalMatches": 4,
+  "topFiles": [
+    {
+      "uri": "config/settings.py",
+      "matchCount": 4
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I see there's a typo in qa_monitoring.py line 174: `observation_id[:64]` is missing a comma before `"thread_id"`. Let me not change that unless the user asks - the user asked for the doc. I'll write the doc now.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/TRACING_BOTTLENECK_RESOURCE_COST.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Done. I'll give the user a short summary and suggest linking from RAG_HA_LOW_LATENCY_DESIGN.md or the main cache doc if they want.
+</details></think>
+
+---
+
+
+已经写好 **`docs/TRACING_BOTTLENECK_RESOURCE_COST.md`**，按你提的五个问题拆开写，并和当前项目实现做了对应。
+
+**文档结构概览：**
+
+1. **链路追踪**
+   - 现有：`observation_id`、`latency_ms`、`route`、`qa_rag_trace`（检索/生成质量）、`llm_endpoint_name`，存 PostgreSQL。
+   - 可扩展：各阶段分段耗时（cache / 总控 / 检索 / LLM / 持久化）写入 `extra` 或单独字段；统一 `trace_id` 或接 OpenTelemetry。
+
+2. **瓶颈定位**
+   - 用 `latency_ms` + `route` + trace 字段做粗定位（谁慢、是否重检多、是否某 LLM 节点慢）。
+   - 典型瓶颈表：LLM / 检索 / DB / Redis / 线程池，各给一两条优化方向。
+   - 说明：在现有观测上如何做「慢请求分析」和报表。
+
+3. **资源池优化**
+   - 连接池：PostgreSQL（pool_size、max_overflow、pool_timeout）、Redis（max_connections）、Milvus 复用与熔断。
+   - 线程池：`asyncio_thread_pool_workers`。
+   - 并发控制：`api_max_concurrent_requests`、`mineru_concurrency_limit`，以及 LLM 多节点选节点策略。
+   - 给出「先看监控再调池和限流」的实操顺序。
+
+4. **弹性伸缩**
+   - 水平：多 Uvicorn worker、会话保持、`shared_state_redis_url` 共享状态。
+   - 垂直/逻辑：单进程内调大池和限流、LLM 多 endpoint 分摊流量。
+   - 何时扩缩：看延迟、排队、CPU/连接数；说明当前无内置自动扩缩，可交给 K8s/告警。
+
+5. **成本优化**
+   - 减调用与 token：问答缓存、检索缓存、上下文/检索量控制、路由短路（QA/Text2SQL）。
+   - 限流与熔断、模型与部署策略（小模型/便宜节点、异步批量）。
+   - 用观测做「按 route/用户」的耗时与调用量分析，形成优化闭环。
+
+文末有一小段**小结 + 面试可答要点**，可以按「观测 → 定位瓶颈 → 调池与限流 → 伸缩与成本」这条线在面试里讲，并带一句「我们项目用 observation + qa_rag_trace 落库，后续可加分段耗时和 OpenTelemetry」。
+
+若你愿意，我可以在 **RAG_HA_LOW_LATENCY_DESIGN.md** 里加一句「链路追踪与瓶颈定位见 [TRACING_BOTTLENECK_RESOURCE_COST.md](TRACING_BOTTLENECK_RESOURCE_COST.md)」的引用。需要的话说一声我帮你改。
+
+---
+
+_**User**_
+
+如何设计prompt?prompt里面包含了哪些信息?如何测试prompt?结合本项目回答,还有这个项目的prompt设计能不能进一步优化?
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user is asking about:
+1. How to design prompts
+2. What information is included in prompts
+3. How to test prompts
+4. Answer in the context of this project
+5. Whether the project's prompt design can be further optimized
+
+I need to search the codebase for:
+- Where prompts are defined (templates, system prompts, etc.)
+- What variables/context are injected into prompts
+- Any existing prompt testing or evaluation
+- RAG prompts, supervisor prompts, chat prompts, etc.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "prompt|PromptTemplate|ChatPromptTemplate|system|instruction",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src",
+  "glob": "*.py",
+  "outputMode": "content",
+  "contextBefore": 0,
+  "contextAfter": 0,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "prompt|PromptTemplate|ChatPromptTemplate|system|instruction",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src",
+  "outputMode": "content",
+  "totalFiles": 7,
+  "totalMatches": 34,
+  "topFiles": [
+    {
+      "uri": "src/agents/chat_agent.py",
+      "matchCount": 3
+    },
+    {
+      "uri": "src/agents/supervisor.py",
+      "matchCount": 3
+    },
+    {
+      "uri": "src/kb/schema_loader.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "src/kb/engine.py",
+      "matchCount": 8
+    },
+    {
+      "uri": "src/agents/context_summary.py",
+      "matchCount": 3
+    },
+    {
+      "uri": "src/kb/prompt_templates.py",
+      "matchCount": 3
+    },
+    {
+      "uri": "src/kb/text2sql.py",
+      "matchCount": 13
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="generic" data-tool-name="glob_file_search">
+<details>
+<summary>Tool use: **glob_file_search** • Searched codebase "undefined" • **1** result in **1** directory</summary>
+
+Directory: **/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai** (1 file)
+
+| File |
+|------|
+| `src/kb/prompt_templates.py` |
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I need to read the actual prompt content and structure from:
+1. src/agents/chat_agent.py - _CHAT_PROMPT
+2. src/agents/supervisor.py - _SUPERVISOR_PROMPT
+3. src/kb/engine.py - _RAG_PROMPT and how context/templates are injected
+4. src/kb/prompt_templates.py - select_prompt_templates, render_prompt_template_guidance
+5. src/kb/text2sql.py - _TEXT2SQL_SYSTEM, _ANSWER_FROM_RESULT_SYSTEM, _TEXT2SQL_WRITE_SYSTEM, and how schema/time/error are injected
+6. src/agents/context_summary.py - _SUMMARY_PROMPT
+
+Also check for any tests related to prompts.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/agents/chat_agent.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/agents/supervisor.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/prompt_templates.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now I need to read:
+1. Text2SQL prompts - _TEXT2SQL_SYSTEM, _ANSWER_FROM_RESULT_SYSTEM, _TEXT2SQL_WRITE_SYSTEM and how schema/time/error are injected
+2. context_summary.py - _SUMMARY_PROMPT
+3. How RAG invokes the chain (context, scenario_guidance, retry_note)
+4. Any existing tests for prompts
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/text2sql.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/agents/context_summary.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I need to get the Text2SQL system prompts - _TEXT2SQL_SYSTEM, _ANSWER_FROM_RESULT_SYSTEM, _TEXT2SQL_WRITE_SYSTEM. They are used in ChatPromptTemplate.from_messages. Let me search for them.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "_TEXT2SQL_SYSTEM|_ANSWER_FROM_RESULT|_TEXT2SQL_WRITE|schema_block|time_range",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/text2sql.py",
+  "contextBefore": 0,
+  "contextAfter": 2,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "_TEXT2SQL_SYSTEM|_ANSWER_FROM_RESULT|_TEXT2SQL_WRITE|schema_block|time_range",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/text2sql.py",
+  "outputMode": "content",
+  "totalFiles": 1,
+  "totalMatches": 29,
+  "topFiles": [
+    {
+      "uri": "src/kb/text2sql.py",
+      "matchCount": 74
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/text2sql.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "test.*prompt|prompt.*test",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "glob": "*.py",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "test.*prompt|prompt.*test",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 0,
+  "totalMatches": 0,
+  "topFiles": []
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+There are no explicit "prompt tests" in the project. I have enough to write the doc. Let me also check how _build_rag_context formats the context (for the RAG prompt).
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "pytest|unittest|test_",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "glob": "*.py",
+  "outputMode": "files_with_matches",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "pytest|unittest|test_",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "files_with_matches",
+  "totalFiles": 0,
+  "totalMatches": 0,
+  "topFiles": []
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+No pytest/unittest in the project. I'll write the doc covering:
+1. How to design prompts (general + project)
+2. What information is in each prompt (by module)
+3. How to test prompts (general best practices + what the project could add)
+4. Optimization suggestions for this project's prompts
+</details></think>
+
+---
+
+
+正在撰写 Prompt 设计、内容、测试与优化文档。
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/PROMPT_DESIGN_AND_TESTING.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Done. I'll give the user a short summary.
+</details></think>
+
+---
+
+
+已经写好 **`docs/PROMPT_DESIGN_AND_TESTING.md`**，并按你的问题分块回答、结合了本项目实现。
+
+**文档结构概览：**
+
+1. **如何设计 Prompt**  
+   - 通用思路：角色与任务、约束与边界、上下文注入、少样本/链式、可维护性。  
+   - 本项目：按场景分链（闲聊/总控/RAG/Text2SQL/摘要）、System/Human 分离、动态注入、RAG 用 40+ 海关场景模板做 `scenario_guidance` 补充。
+
+2. **Prompt 里包含哪些信息**  
+   - 逐模块列出：  
+     - **闲聊**：system 角色与风格，human 为 `messages`（最近 N 轮或摘要+最近 N 轮）。  
+     - **总控**：system 路由规则与输出格式，human 为 `messages`；并说明规则预判（关键词/短语）。  
+     - **RAG**：system 约束与证据要求，human 为 `context`、`question`、`scenario_guidance`、`retry_note`，并写清来源（`_build_rag_context`、`prompt_templates`、重生成循环）。  
+     - **场景模板**：结构、如何选取、如何渲染进 `scenario_guidance`。  
+     - **Text2SQL**：三条链（SELECT / 写操作 / 结果转答案）的 system 与 human，以及 `schema_block` 的组成（表结构、建议表、时间范围、上一轮错误）。  
+     - **对话摘要**：system 任务与格式，human 为 `dialog_text` 及长度限制。
+
+3. **如何测试 Prompt**  
+   - 现状：没有专门 prompt 单测，依赖端到端和观测数据。  
+   - 建议：回归用例集（路由/证据/格式）、采样人工评审、A/B、边界与安全（空上下文、注入、敏感词）、可自动化程度（总控/RAG/Text2SQL 的断言）；并说明可先用 pytest/脚本在 CI 跑回归。
+
+4. **本项目 Prompt 可优化点**  
+   - **结构与维护**：模板集中到 YAML/目录、带版本与观测关联。  
+   - **效果**：RAG 加 few-shot/负面示例、scenario 用 embedding 或分类选模板；总控规则可配置化、加置信度；闲聊可加话术库。  
+   - **Text2SQL**：时间与空结果话术写得更明确。  
+   - **性能与成本**：控制上下文长度、总控多走规则少调 LLM。  
+   - **安全与鲁棒**：输入长度与敏感字符、总控/Text2SQL 输出格式做后处理校验。
+
+文末有一小段**小结**，适合面试时概括「设计思路、包含信息、测试方法、优化方向」。若你希望，我也可以按该文档再整理一页「Prompt 面试高频问答」放进同一份或另一份文档。
+
+---
+
+_**User**_
+
+解释一下rag的切片策略,版本管理,灰度,回流
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user is asking about RAG's:
+1. 切片策略 (chunking/slicing strategy)
+2. 版本管理 (version management)
+3. 灰度 (gradual rollout / canary)
+4. 回流 (reflow / re-ingestion / data flow back)
+
+I need to search the codebase for how chunks are created, how documents are parsed and split, whether there's versioning of documents or chunks, and any rollout or reflow logic.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="semantic_search_full">
+<details>
+<summary>Tool use: **semantic_search_full**</summary>
+
+
+Parameters:
+
+```json
+{
+  "query": "How are documents split into chunks for RAG?",
+  "topK": 10,
+  "explanation": ""
+}
+```
+Result:
+
+```json
+{
+  "codeResults": [
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/doc/mineru_client.py",
+        "range": {
+          "startPosition": {
+            "line": 85
+          },
+          "endPosition": {
+            "line": 492
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 86,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 87,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class MinerUClient:",
+            "lineNumber": 86,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 152
+          },
+          {
+            "lineNumber": 153
+          },
+          {
+            "text": "    def _chunk_with_strategy(self, task_id: str, full_text: str, doc_name: str = \"\") -&gt; List[ChunkItem]:",
+            "lineNumber": 154
+          },
+          {
+            "text": "        \"\"\"使用配置的切块大小与父块重叠（约 150）做父子切片，生成结构化 chunk_id。\"\"\"",
+            "lineNumber": 155
+          },
+          {
+            "text": "        doc_name = doc_name or _safe_doc_name(\"\")",
+            "lineNumber": 156
+          },
+          {
+            "text": "        pages = _detect_pages(full_text)",
+            "lineNumber": 157
+          },
+          {
+            "lineNumber": 158
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 159
+          },
+          {
+            "text": "            from src.kb.chunking import chunk_text",
+            "lineNumber": 160
+          },
+          {
+            "text": "            chunk_size = getattr(self.settings, \"rag_default_chunk_size\", 512)",
+            "lineNumber": 161
+          },
+          {
+            "text": "            parent_overlap = getattr(self.settings, \"rag_parent_overlap\", 150)",
+            "lineNumber": 162
+          },
+          {
+            "text": "            parent_ctx = min(chunk_size * 2, 768)",
+            "lineNumber": 163
+          },
+          {
+            "text": "            with_parent = chunk_text(",
+            "lineNumber": 164
+          },
+          {
+            "text": "                full_text,",
+            "lineNumber": 165
+          },
+          {
+            "text": "                child_chunk_size=chunk_size,",
+            "lineNumber": 166
+          },
+          {
+            "text": "                parent_overlap=parent_overlap,",
+            "lineNumber": 167
+          },
+          {
+            "text": "                parent_ctx_len=parent_ctx,",
+            "lineNumber": 168
+          },
+          {
+            "text": "                doc_id=task_id,",
+            "lineNumber": 169
+          },
+          {
+            "text": "            )",
+            "lineNumber": 170
+          },
+          {
+            "text": "            return self._assign_structured_ids(with_parent, full_text, doc_name, pages)",
+            "lineNumber": 171
+          },
+          {
+            "text": "        except Exception:",
+            "lineNumber": 172
+          },
+          {
+            "text": "            pass",
+            "lineNumber": 173
+          },
+          {
+            "text": "        raw_lines = full_text.splitlines()",
+            "lineNumber": 174
+          },
+          {
+            "text": "        chunks: List[ChunkItem] = []",
+            "lineNumber": 175
+          },
+          {
+            "text": "        current: List[str] = []",
+            "lineNumber": 176
+          },
+          {
+            "text": "        offset = 0",
+            "lineNumber": 177
+          },
+          {
+            "text": "        for line in raw_lines:",
+            "lineNumber": 178
+          },
+          {
+            "text": "            current.append(line)",
+            "lineNumber": 179
+          },
+          {
+            "text": "            if line.strip() == \"\" or len(\"\".join(current)) &gt; 500:",
+            "lineNumber": 180
+          },
+          {
+            "text": "                block = \"\\n\".join(current).strip()",
+            "lineNumber": 181
+          },
+          {
+            "text": "                if block:",
+            "lineNumber": 182
+          },
+          {
+            "text": "                    page = self._page_for_offset(offset, pages)",
+            "lineNumber": 183
+          },
+          {
+            "text": "                    parent_block = len(chunks)",
+            "lineNumber": 184
+          },
+          {
+            "text": "                    cid = _build_structured_chunk_id(doc_name, page, parent_block, 0)",
+            "lineNumber": 185
+          },
+          {
+            "text": "                    chunks.append(ChunkItem(",
+            "lineNumber": 186
+          },
+          {
+            "text": "                        content=block,",
+            "lineNumber": 187
+          },
+          {
+            "text": "                        parent_content=None,",
+            "lineNumber": 188
+          },
+          {
+            "text": "                        chunk_id=cid,",
+            "lineNumber": 189
+          },
+          {
+            "text": "                        doc_name=doc_name,",
+            "lineNumber": 190
+          },
+          {
+            "text": "                        page=page,",
+            "lineNumber": 191
+          },
+          {
+            "text": "                        parent_block=parent_block,",
+            "lineNumber": 192
+          },
+          {
+            "text": "                        child_block=0,",
+            "lineNumber": 193
+          },
+          {
+            "text": "                    ))",
+            "lineNumber": 194
+          },
+          {
+            "text": "                offset += sum(len(l) + 1 for l in current)",
+            "lineNumber": 195
+          },
+          {
+            "text": "                current = []",
+            "lineNumber": 196
+          },
+          {
+            "text": "        if current:",
+            "lineNumber": 197
+          },
+          {
+            "text": "            block = \"\\n\".join(current).strip()",
+            "lineNumber": 198
+          }
+        ]
+      },
+      "score": 0.49615156650543213
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/chunking.py",
+        "range": {
+          "startPosition": {
+            "line": 35,
+            "column": 16
+          },
+          "endPosition": {
+            "line": 100
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "def chunk_text(",
+            "lineNumber": 39,
+            "isSignature": true
+          },
+          {
+            "text": "    full_text: str,",
+            "lineNumber": 40,
+            "isSignature": true
+          },
+          {
+            "text": "    child_chunk_size: int = 256,",
+            "lineNumber": 41,
+            "isSignature": true
+          },
+          {
+            "text": "    parent_overlap: int = 150,",
+            "lineNumber": 42,
+            "isSignature": true
+          },
+          {
+            "text": "    parent_ctx_len: int = 1024,",
+            "lineNumber": 43,
+            "isSignature": true
+          },
+          {
+            "text": "    doc_id: str = \"\",",
+            "lineNumber": 44,
+            "isSignature": true
+          },
+          {
+            "text": ") -&gt; List[ChunkWithParent]:",
+            "lineNumber": 45,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 46
+          },
+          {
+            "text": "    对全文做父子切片：子块固定长度；父块为子块上下文，相邻父块重叠约 parent_overlap 字。",
+            "lineNumber": 47
+          },
+          {
+            "lineNumber": 48
+          },
+          {
+            "text": "    - child_chunk_size: 子块长度（字符）",
+            "lineNumber": 49
+          },
+          {
+            "text": "    - parent_overlap: 父块之间重叠长度（约 150）",
+            "lineNumber": 50
+          },
+          {
+            "text": "    - parent_ctx_len: 每个子块对应的父块长度（用于提供上下文）",
+            "lineNumber": 51
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 52
+          },
+          {
+            "text": "    text = full_text.strip()",
+            "lineNumber": 53
+          },
+          {
+            "text": "    if not text:",
+            "lineNumber": 54
+          },
+          {
+            "text": "        return []",
+            "lineNumber": 55
+          },
+          {
+            "lineNumber": 56
+          },
+          {
+            "text": "    # 子块：按 child_chunk_size 切，无重叠（或可设子块重叠，这里先不设）",
+            "lineNumber": 57
+          },
+          {
+            "text": "    child_spans = _slide_windows(text, child_chunk_size, 0)",
+            "lineNumber": 58
+          },
+          {
+            "text": "    if not child_spans:",
+            "lineNumber": 59
+          },
+          {
+            "text": "        return [ChunkWithParent(content=text, parent_content=\"\", chunk_id=f\"{doc_id}_0\")]",
+            "lineNumber": 60
+          },
+          {
+            "lineNumber": 61
+          },
+          {
+            "text": "    step = max(1, parent_ctx_len - parent_overlap)",
+            "lineNumber": 62
+          },
+          {
+            "text": "    result: List[ChunkWithParent] = []",
+            "lineNumber": 63
+          },
+          {
+            "text": "    for i, (cs, ce) in enumerate(child_spans):",
+            "lineNumber": 64
+          },
+          {
+            "text": "        child_content = text[cs:ce]",
+            "lineNumber": 65
+          },
+          {
+            "text": "        # 父块：以当前子块为中心，向前取 parent_ctx_len，与前一父块重叠 parent_overlap",
+            "lineNumber": 66
+          },
+          {
+            "text": "        parent_start = max(0, cs - (parent_ctx_len - parent_overlap))",
+            "lineNumber": 67
+          },
+          {
+            "text": "        parent_end = min(len(text), parent_start + parent_ctx_len)",
+            "lineNumber": 68
+          },
+          {
+            "text": "        parent_content = text[parent_start:parent_end]",
+            "lineNumber": 69
+          },
+          {
+            "text": "        result.append(",
+            "lineNumber": 70
+          },
+          {
+            "text": "            ChunkWithParent(",
+            "lineNumber": 71
+          },
+          {
+            "text": "                content=child_content,",
+            "lineNumber": 72
+          },
+          {
+            "text": "                parent_content=parent_content,",
+            "lineNumber": 73
+          },
+          {
+            "text": "                chunk_id=f\"{doc_id}_{i}\" if doc_id else str(i),",
+            "lineNumber": 74
+          },
+          {
+            "text": "            )",
+            "lineNumber": 75
+          },
+          {
+            "text": "        )",
+            "lineNumber": 76
+          },
+          {
+            "text": "    return result",
+            "lineNumber": 77,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 78
+          },
+          {
+            "lineNumber": 79
+          },
+          {
+            "text": "def chunk_text_multi_size(",
+            "lineNumber": 80,
+            "isSignature": true
+          },
+          {
+            "text": "    full_text: str,",
+            "lineNumber": 81,
+            "isSignature": true
+          },
+          {
+            "text": "    chunk_sizes: Tuple[int, ...] = DEFAULT_CHUNK_SIZES,",
+            "lineNumber": 82,
+            "isSignature": true
+          },
+          {
+            "text": "    parent_overlap: int = DEFAULT_PARENT_OVERLAP,",
+            "lineNumber": 83,
+            "isSignature": true
+          },
+          {
+            "text": "    parent_ctx_len: Optional[int] = None,",
+            "lineNumber": 84,
+            "isSignature": true
+          },
+          {
+            "text": "    doc_id: str = \"\",",
+            "lineNumber": 85,
+            "isSignature": true
+          },
+          {
+            "text": ") -&gt; dict[int, List[ChunkWithParent]]:",
+            "lineNumber": 86,
+            "isSignature": true
+          },
+          {
+            "text": "    ",
+            "lineNumber": 87
+          }
+        ]
+      },
+      "score": 0.47960323095321655
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/DOC_PARSING_AND_VALIDATION.md",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 62
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# 文档解析、校验与结构化入库",
+            "lineNumber": 1
+          },
+          {
+            "lineNumber": 2
+          },
+          {
+            "text": "## 一、概述",
+            "lineNumber": 3
+          },
+          {
+            "lineNumber": 4
+          },
+          {
+            "text": "文档上传后经历「解析 → 校验 → 确认 → 入库」四步流程。校验在解析后和入库前各执行一次，确保入库数据质量。",
+            "lineNumber": 5
+          },
+          {
+            "lineNumber": 6
+          },
+          {
+            "text": "支持的文档格式：",
+            "lineNumber": 7
+          },
+          {
+            "text": "- **Markdown**（.md）：原生支持，直接切片。",
+            "lineNumber": 8
+          },
+          {
+            "text": "- **PDF**（.pdf）：通过 MinerU 解析为文本/Markdown 后切片。",
+            "lineNumber": 9
+          },
+          {
+            "text": "- **Word**（.docx/.doc）：通过 MinerU 解析为文本/Markdown 后切片。",
+            "lineNumber": 10
+          },
+          {
+            "lineNumber": 11
+          },
+          {
+            "text": "---",
+            "lineNumber": 12
+          },
+          {
+            "lineNumber": 13
+          },
+          {
+            "text": "## 二、流程",
+            "lineNumber": 14
+          },
+          {
+            "lineNumber": 15
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 16
+          },
+          {
+            "text": "POST /doc/upload",
+            "lineNumber": 17
+          },
+          {
+            "text": "  → MinerUClient.parse_file_async()",
+            "lineNumber": 18
+          },
+          {
+            "text": "    → MinerU API（若配置）或占位解析",
+            "lineNumber": 19
+          },
+          {
+            "text": "    → 页码检测 + 结构化 chunk_id 生成",
+            "lineNumber": 20
+          },
+          {
+            "text": "  → validate_parse_result()  ← 第一次校验",
+            "lineNumber": 21
+          },
+          {
+            "text": "  → 返回 ParseResult + ValidationReport",
+            "lineNumber": 22
+          },
+          {
+            "lineNumber": 23
+          },
+          {
+            "text": "POST /doc/confirm_upload",
+            "lineNumber": 24
+          },
+          {
+            "text": "  → validate_parse_result()  ← 第二次校验（阻止 error 级别入库）",
+            "lineNumber": 25
+          },
+          {
+            "text": "  → MilvusUploader.upload_parse_result()",
+            "lineNumber": 26
+          },
+          {
+            "text": "  → 写入 Milvus（含结构化元数据）",
+            "lineNumber": 27
+          },
+          {
+            "text": "&#96;&#96;&#96;",
+            "lineNumber": 28
+          },
+          {
+            "lineNumber": 29
+          },
+          {
+            "text": "---",
+            "lineNumber": 30
+          },
+          {
+            "lineNumber": 31
+          },
+          {
+            "text": "## 三、结构化 chunk 存储格式",
+            "lineNumber": 32
+          },
+          {
+            "lineNumber": 33
+          },
+          {
+            "text": "每个 chunk 携带以下元数据：",
+            "lineNumber": 34
+          },
+          {
+            "lineNumber": 35
+          },
+          {
+            "text": "| 字段 | 类型 | 含义 | 示例 |",
+            "lineNumber": 36
+          },
+          {
+            "text": "|------|------|------|------|",
+            "lineNumber": 37
+          },
+          {
+            "text": "| &#96;doc_name&#96; | str | 文档名（去后缀、安全化） | &#96;海关政策文档&#96; |",
+            "lineNumber": 38
+          },
+          {
+            "text": "| &#96;page&#96; | int | 所在页码 | &#96;2&#96; |",
+            "lineNumber": 39
+          },
+          {
+            "text": "| &#96;parent_block&#96; | int | 父块编号（同一页内递增） | &#96;1&#96; |",
+            "lineNumber": 40
+          },
+          {
+            "text": "| &#96;child_block&#96; | int | 子块编号（同一父块内递增） | &#96;3&#96; |",
+            "lineNumber": 41
+          },
+          {
+            "text": "| &#96;chunk_id&#96; | str | 结构化编号 | &#96;海关政策文档-p2-b1-c3&#96; |",
+            "lineNumber": 42
+          },
+          {
+            "lineNumber": 43
+          },
+          {
+            "text": "chunk_id 格式：&#96;{doc_name}-p{page}-b{parent_block}-c{child_block}&#96;",
+            "lineNumber": 44
+          },
+          {
+            "lineNumber": 45
+          },
+          {
+            "text": "页码检测支持：&#96;第N页&#96;、&#96;Page N&#96;、&#96;p.N&#96;、&#96;-N-&#96; 等格式。",
+            "lineNumber": 46
+          },
+          {
+            "lineNumber": 47
+          },
+          {
+            "text": "Milvus collection 中对应新增 &#96;doc_name&#96;（VARCHAR）、&#96;page&#96;（INT64）、&#96;parent_block&#96;（INT64）、&#96;child_block&#96;（INT64）四个字段。",
+            "lineNumber": 48
+          },
+          {
+            "lineNumber": 49
+          },
+          {
+            "text": "---",
+            "lineNumber": 50
+          },
+          {
+            "lineNumber": 51
+          },
+          {
+            "text": "## 四、校验维度",
+            "lineNumber": 52
+          },
+          {
+            "lineNumber": 53
+          },
+          {
+            "text": "### 4.1 基础完整性",
+            "lineNumber": 54
+          },
+          {
+            "lineNumber": 55
+          },
+          {
+            "text": "| 检查项 | 级别 | 说明 |",
+            "lineNumber": 56
+          },
+          {
+            "text": "|--------|------|------|",
+            "lineNumber": 57
+          },
+          {
+            "text": "| 全文为空 | error | 阻止入库 |",
+            "lineNumber": 58
+          },
+          {
+            "text": "| chunks 列表为空 | error | 阻止入库 |",
+            "lineNumber": 59
+          },
+          {
+            "text": "| 单个 chunk 内容为空 | error | 阻止入库 |",
+            "lineNumber": 60
+          },
+          {
+            "text": "| 超过 30% chunk 不足 10 字符 | warning | 可能切片过细 |",
+            "lineNumber": 61
+          }
+        ]
+      },
+      "score": 0.4141966998577118
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/chunking.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 18,
+            "column": 42
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# src/kb/chunking.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "切片策略：支持多种切块大小验证、父块约 150 字重叠。",
+            "lineNumber": 3
+          },
+          {
+            "text": "用于上传解析与 RAG 索引时的父子分段，不涉及任何模型调用。",
+            "lineNumber": 4
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 5
+          },
+          {
+            "text": "from typing import List, Tuple, Optional",
+            "lineNumber": 6
+          },
+          {
+            "text": "from dataclasses import dataclass",
+            "lineNumber": 7
+          },
+          {
+            "lineNumber": 8
+          },
+          {
+            "lineNumber": 9
+          },
+          {
+            "text": "@dataclass",
+            "lineNumber": 10
+          },
+          {
+            "text": "class ChunkWithParent:",
+            "lineNumber": 11,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"单个子块及其对应的父块内容（父块用于提供上下文，相邻父块重叠约 150 字）。\"\"\"",
+            "lineNumber": 12
+          },
+          {
+            "text": "    content: str",
+            "lineNumber": 13
+          },
+          {
+            "text": "    parent_content: str",
+            "lineNumber": 14
+          },
+          {
+            "text": "    chunk_id: str = \"\"",
+            "lineNumber": 15,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 16
+          },
+          {
+            "lineNumber": 17
+          },
+          {
+            "text": "# 可验证的切块大小（字符数），便于对比不同策略效果",
+            "lineNumber": 18
+          },
+          {
+            "text": "DEFAULT_CHUNK_SIZES = (256, 384, 512, 768)",
+            "lineNumber": 19
+          }
+        ]
+      },
+      "score": 0.4024702310562134
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {
+            "line": 62
+          },
+          "endPosition": {
+            "line": 332,
+            "column": 34
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 63,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 64,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 289,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 296,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class RAGRetriever:",
+            "lineNumber": 63,
+            "isSignature": true
+          },
+          {
+            "text": "def retrieve_with_validation(",
+            "lineNumber": 289
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 290
+          },
+          {
+            "text": "        query: str,",
+            "lineNumber": 291
+          },
+          {
+            "text": "        top_k: int = 10,",
+            "lineNumber": 292
+          },
+          {
+            "text": "        use_rerank: bool = True,",
+            "lineNumber": 293
+          },
+          {
+            "text": "        rerank_top: int = 5,",
+            "lineNumber": 294
+          },
+          {
+            "text": "    ) -&gt; RAGRetrieveResult:",
+            "lineNumber": 295
+          },
+          {
+            "lineNumber": 305
+          },
+          {
+            "lineNumber": 306
+          },
+          {
+            "text": "        for attempt in range(1, max_attempts + 1):",
+            "lineNumber": 307
+          },
+          {
+            "text": "            merged = self._merge_3_7(query, current_k, use_rerank, rerank_top)",
+            "lineNumber": 308
+          },
+          {
+            "text": "            if not merged:",
+            "lineNumber": 309
+          },
+          {
+            "text": "                return RAGRetrieveResult(chunks=[], evals=[], attempt=attempt)",
+            "lineNumber": 310
+          },
+          {
+            "text": "            chunks_with_eval = self._evaluate_candidates(query, merged)",
+            "lineNumber": 311
+          },
+          {
+            "text": "            evals = [c.eval_result for c in chunks_with_eval if c.eval_result is not None]",
+            "lineNumber": 312
+          },
+          {
+            "text": "            last_chunks_with_eval = chunks_with_eval",
+            "lineNumber": 313
+          },
+          {
+            "text": "            last_evals = evals",
+            "lineNumber": 314
+          },
+          {
+            "text": "            # 至少一条匹配度达标且无关比例不过高则通过，否则扩大 top_k 重检",
+            "lineNumber": 315
+          },
+          {
+            "text": "            if self._is_retrieval_acceptable(chunks_with_eval, min_score):",
+            "lineNumber": 316
+          },
+          {
+            "text": "                return RAGRetrieveResult(chunks=chunks_with_eval, evals=evals, attempt=attempt)",
+            "lineNumber": 317
+          },
+          {
+            "text": "            current_k = int(current_k * 1.5) + 2",
+            "lineNumber": 318
+          },
+          {
+            "lineNumber": 319
+          },
+          {
+            "text": "        # 3 次均未通过：不返回低质量切片，交由上层提示“未找到相关知识”",
+            "lineNumber": 320
+          },
+          {
+            "text": "        return RAGRetrieveResult(chunks=[], evals=last_evals, attempt=max_attempts)",
+            "lineNumber": 321
+          },
+          {
+            "lineNumber": 322
+          },
+          {
+            "text": "    def build_bm25_from_docs(self, docs: List[dict]) -&gt; None:",
+            "lineNumber": 323
+          },
+          {
+            "text": "        \"\"\"用文档列表构建 BM25 索引（content 字段）。\"\"\"",
+            "lineNumber": 324
+          },
+          {
+            "text": "        try:",
+            "lineNumber": 325
+          },
+          {
+            "text": "            from rank_bm25 import BM25Okapi",
+            "lineNumber": 326
+          },
+          {
+            "text": "            corpus = [d.get(\"content\", \"\") for d in docs]",
+            "lineNumber": 327
+          },
+          {
+            "text": "            tokenized = [list(t) for t in corpus]",
+            "lineNumber": 328
+          },
+          {
+            "text": "            self._bm25_index = BM25Okapi(tokenized)",
+            "lineNumber": 329
+          },
+          {
+            "text": "            self._bm25_corpus = corpus",
+            "lineNumber": 330
+          },
+          {
+            "text": "        except Exception:",
+            "lineNumber": 331
+          },
+          {
+            "text": "            self._bm25_index = None",
+            "lineNumber": 332
+          },
+          {
+            "text": "            self._bm25_corpus = []",
+            "lineNumber": 333,
+            "isSignature": true
+          }
+        ]
+      },
+      "score": 0.38684433698654175
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {
+            "line": 59,
+            "column": 41
+          },
+          "endPosition": {
+            "line": 332
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "class RAGRetriever:",
+            "lineNumber": 63,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 64
+          },
+          {
+            "text": "    RAG 检索器：全文(BM25)与向量(Milvus/HNSW)按 3:7 合并，BGE 重排，",
+            "lineNumber": 65
+          },
+          {
+            "text": "    对候选做匹配度/无关比例评估，低于阈值则重检（最多 3 次）。",
+            "lineNumber": 66
+          },
+          {
+            "text": "    向量与重排均为本地部署：BGE-M3 / BGE Reranker 在进程内加载，不调用任何远程 embedding/rerank API。",
+            "lineNumber": 67
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 68
+          },
+          {
+            "lineNumber": 69
+          },
+          {
+            "text": "    def __init__(self):",
+            "lineNumber": 70
+          },
+          {
+            "text": "        self._embedding = None  # BGE-M3，本地加载",
+            "lineNumber": 71
+          },
+          {
+            "text": "        self._reranker = None   # BGE Reranker Large，本地加载",
+            "lineNumber": 72
+          },
+          {
+            "text": "        self._milvus_collection = None",
+            "lineNumber": 73
+          },
+          {
+            "text": "        self._bm25_index = None",
+            "lineNumber": 74
+          },
+          {
+            "text": "        self._bm25_corpus: List[str] = []",
+            "lineNumber": 75
+          },
+          {
+            "text": "        self._init_embedding()",
+            "lineNumber": 76
+          },
+          {
+            "text": "        self._init_reranker()",
+            "lineNumber": 77
+          },
+          {
+            "text": "        self._init_milvus()",
+            "lineNumber": 78
+          },
+          {
+            "text": "        self._init_bm25()",
+            "lineNumber": 79
+          },
+          {
+            "lineNumber": 80
+          },
+          {
+            "text": "    def _init_embedding(self) -&gt; None:",
+            "lineNumber": 81
+          },
+          {
+            "text": "        \"\"\"使用单例 BGE-M3，与 MilvusUploader 复用，避免重复加载。\"\"\"",
+            "lineNumber": 82
+          },
+          {
+            "text": "        self._embedding = get_bge_embedding()",
+            "lineNumber": 83
+          },
+          {
+            "lineNumber": 84
+          },
+          {
+            "text": "    def _init_reranker(self) -&gt; None:",
+            "lineNumber": 85
+          },
+          {
+            "text": "        \"\"\"使用单例 BGE Reranker Large。\"\"\"",
+            "lineNumber": 86
+          },
+          {
+            "text": "        self._reranker = get_bge_reranker()",
+            "lineNumber": 87
+          },
+          {
+            "lineNumber": 88
+          },
+          {
+            "text": "    def _init_milvus(self) -&gt; None:",
+            "lineNumber": 89
+          },
+          {
+            "text": "        \"\"\"通过 db_resilience 连接 Milvus（支持重试 + 熔断 + 懒重连）。\"\"\"",
+            "lineNumber": 90
+          },
+          {
+            "text": "        from src.db_resilience import get_milvus_collection",
+            "lineNumber": 91
+          },
+          {
+            "text": "        s = _get_settings()",
+            "lineNumber": 92
+          },
+          {
+            "text": "        self._milvus_collection = get_milvus_collection(",
+            "lineNumber": 93
+          },
+          {
+            "text": "            s.milvus_uri, s.milvus_collection,",
+            "lineNumber": 94
+          },
+          {
+            "text": "        )",
+            "lineNumber": 95
+          },
+          {
+            "lineNumber": 96
+          },
+          {
+            "text": "    def _init_bm25(self) -&gt; None:",
+            "lineNumber": 97
+          },
+          {
+            "text": "        \"\"\"BM25 索引需由 build_bm25_from_docs 在有文档时构建，此处仅置空。\"\"\"",
+            "lineNumber": 98
+          },
+          {
+            "text": "        self._bm25_index = None",
+            "lineNumber": 99
+          },
+          {
+            "text": "        self._bm25_corpus = []",
+            "lineNumber": 100
+          },
+          {
+            "lineNumber": 101
+          },
+          {
+            "text": "    def embed(self, texts: List[str]):",
+            "lineNumber": 102
+          },
+          {
+            "text": "        \"\"\"BGE-M3 编码文本列表，返回向量列表；模型未加载时返回 None。\"\"\"",
+            "lineNumber": 103
+          },
+          {
+            "text": "        if self._embedding is None:",
+            "lineNumber": 104
+          },
+          {
+            "text": "            return None",
+            "lineNumber": 105
+          },
+          {
+            "text": "        return self._embedding.encode(texts).tolist()",
+            "lineNumber": 106
+          },
+          {
+            "lineNumber": 107
+          },
+          {
+            "text": "    def _vector_search(self, query: str, top_k: int) -&gt; List[dict]:",
+            "lineNumber": 108
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 109
+          }
+        ]
+      },
+      "score": 0.3774653673171997
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./config/settings.py",
+        "range": {
+          "startPosition": {
+            "line": 22
+          },
+          "endPosition": {
+            "line": 212
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 23,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 24,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class Settings(BaseSettings):",
+            "lineNumber": 23,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 43
+          },
+          {
+            "text": "    bge_embedding_model: str = \"BAAI/bge-m3\"",
+            "lineNumber": 44
+          },
+          {
+            "text": "    embedding_device: str = \"cpu\"",
+            "lineNumber": 45
+          },
+          {
+            "lineNumber": 46
+          },
+          {
+            "text": "    # ---------- 重排模型（仅 BGE Reranker Large，本地部署/本地加载） ----------",
+            "lineNumber": 47
+          },
+          {
+            "text": "    # 可为 HuggingFace 模型名或本地路径，本地加载不调用远程 API",
+            "lineNumber": 48
+          },
+          {
+            "text": "    bge_reranker_model: str = \"BAAI/bge-reranker-large\"",
+            "lineNumber": 49
+          },
+          {
+            "lineNumber": 50
+          },
+          {
+            "text": "    # ---------- Milvus 向量库 ----------",
+            "lineNumber": 51
+          },
+          {
+            "text": "    milvus_uri: str = \"http://localhost:19530\"",
+            "lineNumber": 52
+          },
+          {
+            "text": "    milvus_collection: str = \"kb_chunks\"",
+            "lineNumber": 53
+          },
+          {
+            "text": "    milvus_dim: int = 1024  # BGE-M3 向量维度",
+            "lineNumber": 54
+          },
+          {
+            "lineNumber": 55
+          },
+          {
+            "text": "    # ---------- RAG 切片与检索 ----------",
+            "lineNumber": 56
+          },
+          {
+            "text": "    rag_chunk_sizes: List[int] = [256, 384, 512, 768]",
+            "lineNumber": 57
+          },
+          {
+            "text": "    rag_parent_overlap: int = 150",
+            "lineNumber": 58
+          },
+          {
+            "text": "    rag_bm25_ratio: float = 0.3",
+            "lineNumber": 59
+          },
+          {
+            "text": "    rag_vector_ratio: float = 0.7",
+            "lineNumber": 60
+          },
+          {
+            "text": "    rag_min_match_score: float = 0.3",
+            "lineNumber": 61
+          },
+          {
+            "text": "    rag_max_retrieve_attempts: int = 3",
+            "lineNumber": 62
+          },
+          {
+            "text": "    rag_default_chunk_size: int = 512",
+            "lineNumber": 63
+          },
+          {
+            "text": "    rag_answer_grounding_min_score: float = 0.18  # 最终答案与检索文档的最低关联度，低于该值视为可能幻觉",
+            "lineNumber": 64
+          },
+          {
+            "text": "    rag_answer_max_regenerate_times: int = 3  # 最终答案与文档关联度低时，最多重生成 3 次",
+            "lineNumber": 65
+          },
+          {
+            "text": "    # 注入生成阶段的检索上下文总字符数上限，0 表示不限制；超出则从末尾丢弃 chunk，控制 token",
+            "lineNumber": 66
+          },
+          {
+            "text": "    rag_max_context_chars: int = 0",
+            "lineNumber": 67
+          },
+          {
+            "text": "    # RAG 检索结果缓存：进程内 LRU 条数，0 表示关闭；相同 query 命中则跳过 Milvus+BM25",
+            "lineNumber": 68
+          },
+          {
+            "text": "    rag_retrieval_cache_max_entries: int = 0",
+            "lineNumber": 69
+          },
+          {
+            "text": "    rag_retrieval_cache_ttl_seconds: int = 300  # 仅当 max_entries&gt;0 时有效",
+            "lineNumber": 70
+          },
+          {
+            "lineNumber": 71
+          },
+          {
+            "text": "    # ---------- Text2SQL ----------",
+            "lineNumber": 72
+          },
+          {
+            "text": "    text2sql_database_uri: str = \"sqlite:///./data/kb.db\"",
+            "lineNumber": 73
+          },
+          {
+            "text": "    text2sql_schema_refresh_interval_seconds: int = 3600  # 1 小时检测 schema 是否变更并重新扫描",
+            "lineNumber": 74
+          },
+          {
+            "text": "    text2sql_schema_overrides_path: str = \"./data/text2sql_schema_overrides.json\"  # 人工审核的表/列含义及表间关联",
+            "lineNumber": 75
+          },
+          {
+            "text": "    text2sql_default_limit: int = 500  # SELECT 无 LIMIT 时自动追加的上限，避免大表全表扫；0 表示不自动加",
+            "lineNumber": 76
+          },
+          {
+            "lineNumber": 77
+          },
+          {
+            "text": "    # ---------- MinerU 文档解析（本地部署版） ----------",
+            "lineNumber": 78
+          },
+          {
+            "text": "    # MinerU 本地部署时填写本地服务地址，如 http://127.0.0.1:8001；为空则使用占位解析（仅文本+切块）",
+            "lineNumber": 79
+          },
+          {
+            "text": "    mineru_api_url: str = \"\"",
+            "lineNumber": 80
+          },
+          {
+            "text": "    # 本地部署时通常不需要 token，留空即可；若服务端要求鉴权再填写",
+            "lineNumber": 81
+          },
+          {
+            "text": "    mineru_api_token: str = \"\"",
+            "lineNumber": 82
+          },
+          {
+            "text": "    # True：使用本地 MinerU 时配置 mineru_api_url 即可；url 为空则使用占位解析",
+            "lineNumber": 83
+          }
+        ]
+      },
+      "score": 0.3758305311203003
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/chunking.py",
+        "range": {
+          "startPosition": {
+            "line": 76,
+            "column": 17
+          },
+          "endPosition": {
+            "line": 100,
+            "column": 14
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "def chunk_text_multi_size(",
+            "lineNumber": 80,
+            "isSignature": true
+          },
+          {
+            "text": "    full_text: str,",
+            "lineNumber": 81,
+            "isSignature": true
+          },
+          {
+            "text": "    chunk_sizes: Tuple[int, ...] = DEFAULT_CHUNK_SIZES,",
+            "lineNumber": 82,
+            "isSignature": true
+          },
+          {
+            "text": "    parent_overlap: int = DEFAULT_PARENT_OVERLAP,",
+            "lineNumber": 83,
+            "isSignature": true
+          },
+          {
+            "text": "    parent_ctx_len: Optional[int] = None,",
+            "lineNumber": 84,
+            "isSignature": true
+          },
+          {
+            "text": "    doc_id: str = \"\",",
+            "lineNumber": 85,
+            "isSignature": true
+          },
+          {
+            "text": ") -&gt; dict[int, List[ChunkWithParent]]:",
+            "lineNumber": 86,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 87
+          },
+          {
+            "text": "    用多种切块大小分别切片，便于验证不同 size 的效果。",
+            "lineNumber": 88
+          },
+          {
+            "text": "    返回: { chunk_size -&gt; [ChunkWithParent, ...] }",
+            "lineNumber": 89
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 90
+          },
+          {
+            "text": "    out: dict[int, List[ChunkWithParent]] = {}",
+            "lineNumber": 91
+          },
+          {
+            "text": "    for size in chunk_sizes:",
+            "lineNumber": 92
+          },
+          {
+            "text": "        parent_len = parent_ctx_len or min(size * 2, 768)",
+            "lineNumber": 93
+          },
+          {
+            "text": "        out[size] = chunk_text(",
+            "lineNumber": 94
+          },
+          {
+            "text": "            full_text,",
+            "lineNumber": 95
+          },
+          {
+            "text": "            child_chunk_size=size,",
+            "lineNumber": 96
+          },
+          {
+            "text": "            parent_overlap=parent_overlap,",
+            "lineNumber": 97
+          },
+          {
+            "text": "            parent_ctx_len=parent_len,",
+            "lineNumber": 98
+          },
+          {
+            "text": "            doc_id=f\"{doc_id}_s{size}\" if doc_id else f\"s{size}\",",
+            "lineNumber": 99
+          },
+          {
+            "text": "        )",
+            "lineNumber": 100
+          },
+          {
+            "text": "    return out",
+            "lineNumber": 101,
+            "isSignature": true
+          }
+        ]
+      },
+      "score": 0.37218546867370605
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./api/main.py",
+        "range": {
+          "startPosition": {
+            "line": 587,
+            "column": 43
+          },
+          "endPosition": {
+            "line": 679
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "@app.post(\"/doc/upload\", response_model=dict)",
+            "lineNumber": 591
+          },
+          {
+            "text": "async def doc_upload(request: Request, file: UploadFile = File(...)):",
+            "lineNumber": 592,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 593
+          },
+          {
+            "text": "    上传文档并解析（MinerU 或本地占位）。",
+            "lineNumber": 594
+          },
+          {
+            "text": "    将文件写入 upload_dir，调用解析器得到全文与 chunks，存入 _parse_cache（key 含 user_id）。",
+            "lineNumber": 595
+          },
+          {
+            "text": "    返回 task_id、原文摘要、chunks 等供前端对比；确认后由 /doc/confirm_upload 写入 Milvus。",
+            "lineNumber": 596
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 597
+          },
+          {
+            "text": "    user_id = _user_id_from_request(request, None)",
+            "lineNumber": 598
+          },
+          {
+            "text": "    settings = get_settings()",
+            "lineNumber": 599
+          },
+          {
+            "text": "    os.makedirs(settings.upload_dir, exist_ok=True)",
+            "lineNumber": 600
+          },
+          {
+            "text": "    path = os.path.join(settings.upload_dir, file.filename or \"upload\")",
+            "lineNumber": 601
+          },
+          {
+            "text": "    content = await file.read()",
+            "lineNumber": 602
+          },
+          {
+            "text": "    def _write(path: str, data: bytes) -&gt; None:",
+            "lineNumber": 603
+          },
+          {
+            "text": "        with open(path, \"wb\") as f:",
+            "lineNumber": 604
+          },
+          {
+            "text": "            f.write(data)",
+            "lineNumber": 605
+          },
+          {
+            "text": "    await asyncio.to_thread(_write, path, content)",
+            "lineNumber": 606
+          },
+          {
+            "text": "    client = MinerUClient()",
+            "lineNumber": 607
+          },
+          {
+            "text": "    result = await client.parse_file_async(file.filename or path, content)",
+            "lineNumber": 608
+          },
+          {
+            "text": "    report = await asyncio.to_thread(",
+            "lineNumber": 609
+          },
+          {
+            "text": "        validate_parse_result, result.full_text, result.chunks,",
+            "lineNumber": 610
+          },
+          {
+            "text": "        file_path=result.original_path,",
+            "lineNumber": 611
+          },
+          {
+            "text": "    )",
+            "lineNumber": 612
+          },
+          {
+            "text": "    cache_key = _parse_cache_key(user_id, result.task_id)",
+            "lineNumber": 613
+          },
+          {
+            "text": "    await shared_state_module.set_parse_result(cache_key, result)",
+            "lineNumber": 614
+          },
+          {
+            "text": "    return {",
+            "lineNumber": 615
+          },
+          {
+            "text": "        \"task_id\": result.task_id,",
+            "lineNumber": 616
+          },
+          {
+            "text": "        \"original_path\": result.original_path,",
+            "lineNumber": 617
+          },
+          {
+            "text": "        \"doc_name\": result.doc_name,",
+            "lineNumber": 618
+          },
+          {
+            "text": "        \"full_text\": result.full_text[:5000],",
+            "lineNumber": 619
+          },
+          {
+            "text": "        \"chunks\": [c.model_dump() for c in result.chunks],",
+            "lineNumber": 620
+          },
+          {
+            "text": "        \"raw_markdown\": (result.raw_markdown or \"\")[:5000],",
+            "lineNumber": 621
+          },
+          {
+            "text": "        \"validation\": {",
+            "lineNumber": 622
+          },
+          {
+            "text": "            \"passed\": report.passed,",
+            "lineNumber": 623
+          },
+          {
+            "text": "            \"summary\": report.summary(),",
+            "lineNumber": 624
+          },
+          {
+            "text": "            \"errors\": [{\"category\": i.category, \"message\": i.message, \"chunk_index\": i.chunk_index} for i in report.errors],",
+            "lineNumber": 625
+          },
+          {
+            "text": "            \"warnings\": [{\"category\": i.category, \"message\": i.message, \"chunk_index\": i.chunk_index} for i in report.warnings],",
+            "lineNumber": 626
+          },
+          {
+            "text": "        },",
+            "lineNumber": 627
+          },
+          {
+            "text": "    }",
+            "lineNumber": 628,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 629
+          },
+          {
+            "lineNumber": 630
+          },
+          {
+            "text": "@app.post(\"/doc/confirm_upload\")",
+            "lineNumber": 631
+          },
+          {
+            "text": "async def confirm_upload(request: Request, body: ConfirmUploadRequest):",
+            "lineNumber": 632,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 633
+          }
+        ]
+      },
+      "score": 0.3606725335121155
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/__init__.py",
+        "range": {
+          "startPosition": {
+            "column": 96
+          },
+          "endPosition": {
+            "line": 50,
+            "column": 1
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "from .engine import KnowledgeEngine",
+            "lineNumber": 2
+          },
+          {
+            "text": "from .qa_store import QAStore",
+            "lineNumber": 3
+          },
+          {
+            "text": "from .text2sql import Text2SQL",
+            "lineNumber": 4
+          },
+          {
+            "text": "from .schema_loader import (",
+            "lineNumber": 5
+          },
+          {
+            "text": "    SchemaCache,",
+            "lineNumber": 6
+          },
+          {
+            "text": "    read_db_schema,",
+            "lineNumber": 7
+          },
+          {
+            "text": "    get_table_relations,",
+            "lineNumber": 8
+          },
+          {
+            "text": "    get_schema_with_relations,",
+            "lineNumber": 9
+          },
+          {
+            "text": "    TableRelation,",
+            "lineNumber": 10
+          },
+          {
+            "text": "    TableInfo,",
+            "lineNumber": 11
+          },
+          {
+            "text": "    ColumnInfo,",
+            "lineNumber": 12
+          },
+          {
+            "text": ")",
+            "lineNumber": 13
+          },
+          {
+            "text": "from .rag import RAGRetriever, get_rag_retriever, RAGRetrieveResult, ChunkWithEval",
+            "lineNumber": 14
+          },
+          {
+            "text": "from .chunking import chunk_text, chunk_text_multi_size, ChunkWithParent, DEFAULT_CHUNK_SIZES, DEFAULT_PARENT_OVERLAP",
+            "lineNumber": 15
+          },
+          {
+            "text": "from .retrieval_eval import (",
+            "lineNumber": 16
+          },
+          {
+            "text": "    evaluate_retrieval,",
+            "lineNumber": 17
+          },
+          {
+            "text": "    RetrievalEvalResult,",
+            "lineNumber": 18
+          },
+          {
+            "text": "    compute_match_score,",
+            "lineNumber": 19
+          },
+          {
+            "text": "    compute_match_positions,",
+            "lineNumber": 20
+          },
+          {
+            "text": "    compute_irrelevant_ratio,",
+            "lineNumber": 21
+          },
+          {
+            "text": "    compute_query_coverage,",
+            "lineNumber": 22
+          },
+          {
+            "text": ")",
+            "lineNumber": 23
+          },
+          {
+            "lineNumber": 24
+          },
+          {
+            "text": "__all__ = [",
+            "lineNumber": 25
+          },
+          {
+            "text": "    \"KnowledgeEngine\",",
+            "lineNumber": 26
+          },
+          {
+            "text": "    \"QAStore\",",
+            "lineNumber": 27
+          },
+          {
+            "text": "    \"Text2SQL\",",
+            "lineNumber": 28
+          },
+          {
+            "text": "    \"SchemaCache\",",
+            "lineNumber": 29
+          },
+          {
+            "text": "    \"read_db_schema\",",
+            "lineNumber": 30
+          },
+          {
+            "text": "    \"get_table_relations\",",
+            "lineNumber": 31
+          },
+          {
+            "text": "    \"get_schema_with_relations\",",
+            "lineNumber": 32
+          },
+          {
+            "text": "    \"TableRelation\",",
+            "lineNumber": 33
+          },
+          {
+            "text": "    \"TableInfo\",",
+            "lineNumber": 34
+          },
+          {
+            "text": "    \"ColumnInfo\",",
+            "lineNumber": 35
+          },
+          {
+            "text": "    \"RAGRetriever\",",
+            "lineNumber": 36
+          },
+          {
+            "text": "    \"get_rag_retriever\",",
+            "lineNumber": 37
+          },
+          {
+            "text": "    \"RAGRetrieveResult\",",
+            "lineNumber": 38
+          },
+          {
+            "text": "    \"ChunkWithEval\",",
+            "lineNumber": 39
+          },
+          {
+            "text": "    \"chunk_text\",",
+            "lineNumber": 40
+          },
+          {
+            "text": "    \"chunk_text_multi_size\",",
+            "lineNumber": 41
+          },
+          {
+            "text": "    \"ChunkWithParent\",",
+            "lineNumber": 42
+          },
+          {
+            "text": "    \"DEFAULT_CHUNK_SIZES\",",
+            "lineNumber": 43
+          },
+          {
+            "text": "    \"DEFAULT_PARENT_OVERLAP\",",
+            "lineNumber": 44
+          },
+          {
+            "text": "    \"evaluate_retrieval\",",
+            "lineNumber": 45
+          },
+          {
+            "text": "    \"RetrievalEvalResult\",",
+            "lineNumber": 46
+          },
+          {
+            "text": "    \"compute_match_score\",",
+            "lineNumber": 47
+          },
+          {
+            "text": "    \"compute_match_positions\",",
+            "lineNumber": 48
+          },
+          {
+            "text": "    \"compute_irrelevant_ratio\",",
+            "lineNumber": 49
+          },
+          {
+            "text": "    \"compute_query_coverage\",",
+            "lineNumber": 50
+          },
+          {
+            "text": "]",
+            "lineNumber": 51
+          }
+        ]
+      },
+      "score": 0.35654398798942566
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 137
+          },
+          {
+            "lineNumber": 138
+          },
+          {
+            "text": "    def _build_rag_context(self, rag_result: RAGRetrieveResult) -&gt; str:",
+            "lineNumber": 139
+          },
+          {
+            "text": "        \"\"\"将检索到的父/子块拼成带编号的生成上下文，便于模型引用 [证据N]。若配置了 rag_max_context_chars 则从前往后累加，超出则丢弃末尾 chunk。\"\"\"",
+            "lineNumber": 140
+          },
+          {
+            "text": "        from config import get_settings",
+            "lineNumber": 141
+          },
+          {
+            "text": "        max_chars = max(0, getattr(get_settings(), \"rag_max_context_chars\", 0))",
+            "lineNumber": 142
+          },
+          {
+            "text": "        sep = \"\\n\\n---\\n\\n\"",
+            "lineNumber": 143
+          },
+          {
+            "text": "        context_parts = []",
+            "lineNumber": 144
+          },
+          {
+            "text": "        total = 0",
+            "lineNumber": 145
+          },
+          {
+            "text": "        for i, c in enumerate(rag_result.chunks, 1):",
+            "lineNumber": 146
+          },
+          {
+            "text": "            parent = (c.parent_content or \"\").strip()",
+            "lineNumber": 147
+          },
+          {
+            "text": "            content = (c.content or \"\").strip()",
+            "lineNumber": 148
+          },
+          {
+            "text": "            if parent and parent != content:",
+            "lineNumber": 149
+          },
+          {
+            "text": "                part = f\"[证据{i}]\\n[背景]\\n{parent}\\n[片段]\\n{content}\"",
+            "lineNumber": 150
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 151
+          },
+          {
+            "text": "                part = f\"[证据{i}]\\n{content}\"",
+            "lineNumber": 152
+          },
+          {
+            "text": "            add_len = len(part) + (len(sep) if context_parts else 0)",
+            "lineNumber": 153
+          },
+          {
+            "text": "            if max_chars &gt; 0 and total + add_len &gt; max_chars:",
+            "lineNumber": 154
+          },
+          {
+            "text": "                break",
+            "lineNumber": 155
+          },
+          {
+            "text": "            context_parts.append(part)",
+            "lineNumber": 156
+          },
+          {
+            "text": "            total += add_len",
+            "lineNumber": 157
+          },
+          {
+            "text": "        return sep.join(context_parts)",
+            "lineNumber": 158
+          },
+          {
+            "lineNumber": 159
+          },
+          {
+            "text": "    def _normalize_answer_for_eval(self, answer_text: str) -&gt; str:",
+            "lineNumber": 160
+          },
+          {
+            "text": "        \"\"\"去掉结构化标签和证据编号，避免影响答案-文档相关度计算。\"\"\"",
+            "lineNumber": 161
+          },
+          {
+            "text": "        answer = (answer_text or \"\").strip()",
+            "lineNumber": 162
+          },
+          {
+            "text": "        if not answer:",
+            "lineNumber": 163
+          },
+          {
+            "text": "            return \"\"",
+            "lineNumber": 164
+          },
+          {
+            "text": "        answer = re.sub(r\"\\[证据\\d+\\]\", \"\", answer)",
+            "lineNumber": 165
+          },
+          {
+            "text": "        answer = re.sub(r\"(结论|依据|提示)\\s*[:：]\", \"\", answer)",
+            "lineNumber": 166
+          },
+          {
+            "text": "        return answer.strip()",
+            "lineNumber": 167
+          },
+          {
+            "lineNumber": 168
+          },
+          {
+            "text": "    def _answer_has_evidence_citations(self, answer_text: str) -&gt; bool:",
+            "lineNumber": 169
+          },
+          {
+            "text": "        \"\"\"除“无法确认”类兜底文案外，答案必须显式带有证据编号。\"\"\"",
+            "lineNumber": 170
+          },
+          {
+            "text": "        answer = (answer_text or \"\").strip()",
+            "lineNumber": 171
+          },
+          {
+            "text": "        if not answer:",
+            "lineNumber": 172
+          },
+          {
+            "text": "            return False",
+            "lineNumber": 173
+          },
+          {
+            "text": "        if \"无法确认\" in answer:",
+            "lineNumber": 174
+          },
+          {
+            "text": "            return True",
+            "lineNumber": 175
+          },
+          {
+            "text": "        return bool(re.search(r\"\\[证据\\d+\\]\", answer))",
+            "lineNumber": 176
+          },
+          {
+            "lineNumber": 177
+          },
+          {
+            "text": "    def _answer_grounding_score(self, answer_text: str, rag_result: RAGRetrieveResult) -&gt; float:",
+            "lineNumber": 178
+          },
+          {
+            "text": "        ",
+            "lineNumber": 179
+          }
+        ]
+      },
+      "score": 0.35442256927490234
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/chunking.py",
+        "range": {
+          "startPosition": {
+            "line": 14,
+            "column": 22
+          },
+          "endPosition": {
+            "line": 76
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# 可验证的切块大小（字符数），便于对比不同策略效果",
+            "lineNumber": 18
+          },
+          {
+            "text": "DEFAULT_CHUNK_SIZES = (256, 384, 512, 768)",
+            "lineNumber": 19
+          },
+          {
+            "text": "DEFAULT_PARENT_OVERLAP = 150",
+            "lineNumber": 20
+          },
+          {
+            "lineNumber": 21
+          },
+          {
+            "lineNumber": 22
+          },
+          {
+            "text": "def _slide_windows(text: str, size: int, overlap: int) -&gt; List[Tuple[int, int]]:",
+            "lineNumber": 23,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"滑动窗口 (start, end) 字符区间，overlap 为重叠长度。\"\"\"",
+            "lineNumber": 24
+          },
+          {
+            "text": "    if not text or size &lt;= 0:",
+            "lineNumber": 25
+          },
+          {
+            "text": "        return []",
+            "lineNumber": 26
+          },
+          {
+            "text": "    step = max(1, size - overlap)",
+            "lineNumber": 27
+          },
+          {
+            "text": "    spans: List[Tuple[int, int]] = []",
+            "lineNumber": 28
+          },
+          {
+            "text": "    start = 0",
+            "lineNumber": 29
+          },
+          {
+            "text": "    while start &lt; len(text):",
+            "lineNumber": 30
+          },
+          {
+            "text": "        end = min(start + size, len(text))",
+            "lineNumber": 31
+          },
+          {
+            "text": "        spans.append((start, end))",
+            "lineNumber": 32
+          },
+          {
+            "text": "        if end &gt;= len(text):",
+            "lineNumber": 33
+          },
+          {
+            "text": "            break",
+            "lineNumber": 34
+          },
+          {
+            "text": "        start = end - overlap",
+            "lineNumber": 35
+          },
+          {
+            "text": "    return spans",
+            "lineNumber": 36,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 37
+          },
+          {
+            "lineNumber": 38
+          },
+          {
+            "text": "def chunk_text(",
+            "lineNumber": 39,
+            "isSignature": true
+          },
+          {
+            "text": "    full_text: str,",
+            "lineNumber": 40,
+            "isSignature": true
+          },
+          {
+            "text": "    child_chunk_size: int = 256,",
+            "lineNumber": 41,
+            "isSignature": true
+          },
+          {
+            "text": "    parent_overlap: int = 150,",
+            "lineNumber": 42,
+            "isSignature": true
+          },
+          {
+            "text": "    parent_ctx_len: int = 1024,",
+            "lineNumber": 43,
+            "isSignature": true
+          },
+          {
+            "text": "    doc_id: str = \"\",",
+            "lineNumber": 44,
+            "isSignature": true
+          },
+          {
+            "text": ") -&gt; List[ChunkWithParent]:",
+            "lineNumber": 45,
+            "isSignature": true
+          },
+          {
+            "text": "    ",
+            "lineNumber": 46
+          }
+        ]
+      },
+      "score": 0.3493882417678833
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/DOC_PARSING_AND_VALIDATION.md",
+        "range": {
+          "startPosition": {
+            "line": 60
+          },
+          "endPosition": {
+            "line": 111
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "| 超过 30% chunk 不足 10 字符 | warning | 可能切片过细 |",
+            "lineNumber": 61
+          },
+          {
+            "lineNumber": 62
+          },
+          {
+            "text": "### 4.2 表格格式校验",
+            "lineNumber": 63
+          },
+          {
+            "lineNumber": 64
+          },
+          {
+            "text": "根据文档来源自动选择检测策略：",
+            "lineNumber": 65
+          },
+          {
+            "lineNumber": 66
+          },
+          {
+            "text": "| 表格类型 | 适用格式 | 检测方式 |",
+            "lineNumber": 67
+          },
+          {
+            "text": "|----------|----------|----------|",
+            "lineNumber": 68
+          },
+          {
+            "text": "| Markdown 管道表 | Markdown、MinerU 输出 | &#96;\\|...\\|&#96; 行 + 分隔行 + 列数对齐 |",
+            "lineNumber": 69
+          },
+          {
+            "text": "| 制表符对齐表 | PDF/Word 解析文本 | &#96;\\t&#96; 分隔的连续多行 + 列数一致性 |",
+            "lineNumber": 70
+          },
+          {
+            "text": "| 空格对齐表 | PDF 解析文本 | 2+ 空格分隔的连续 3+ 行 |",
+            "lineNumber": 71
+          },
+          {
+            "text": "| HTML 表格 | MinerU 输出 | &#96;&lt;table&gt;&#96; 标签 + &#96;&lt;tr&gt;/&lt;td&gt;&#96; 行列一致性 |",
+            "lineNumber": 72
+          },
+          {
+            "lineNumber": 73
+          },
+          {
+            "text": "PDF/Word 来源时，若全文含表格关键词（表、Table、序号、合计）但未检测到任何结构化表格，会额外告警。",
+            "lineNumber": 74
+          },
+          {
+            "lineNumber": 75
+          },
+          {
+            "text": "### 4.3 文档结构化信息校验",
+            "lineNumber": 76
+          },
+          {
+            "lineNumber": 77
+          },
+          {
+            "text": "| 检查项 | 适用格式 | 说明 |",
+            "lineNumber": 78
+          },
+          {
+            "text": "|--------|----------|------|",
+            "lineNumber": 79
+          },
+          {
+            "text": "| Markdown 标题 | 全部 | &#96;#&#96; / &#96;##&#96; / &#96;###&#96; |",
+            "lineNumber": 80
+          },
+          {
+            "text": "| 编号标题 | PDF/Word | &#96;一、&#96;、&#96;1.1&#96;、&#96;第X章&#96;、&#96;第X节&#96; |",
+            "lineNumber": 81
+          },
+          {
+            "text": "| 标题层级跳跃 | Markdown | H1 直接跳到 H3 |",
+            "lineNumber": 82
+          },
+          {
+            "text": "| 页码标记 | 全部 | &#96;第N页&#96;、&#96;Page N&#96;、&#96;p.N&#96;、&#96;-N-&#96; |",
+            "lineNumber": 83
+          },
+          {
+            "text": "| 分节符 | Word | &#96;---&#96;、&#96;***&#96;、&#96;===&#96; |",
+            "lineNumber": 84
+          },
+          {
+            "text": "| 内容重复 | 全部 | 超过 10% chunk 完全重复 |",
+            "lineNumber": 85
+          },
+          {
+            "text": "| 乱码检测 | PDF/Word | U+FFFD 替换符超过 5% |",
+            "lineNumber": 86
+          },
+          {
+            "lineNumber": 87
+          },
+          {
+            "text": "### 4.4 chunk_id 格式校验",
+            "lineNumber": 88
+          },
+          {
+            "lineNumber": 89
+          },
+          {
+            "text": "| 检查项 | 级别 | 说明 |",
+            "lineNumber": 90
+          },
+          {
+            "text": "|--------|------|------|",
+            "lineNumber": 91
+          },
+          {
+            "text": "| chunk_id 缺失 | error | 阻止入库 |",
+            "lineNumber": 92
+          },
+          {
+            "text": "| 全部旧格式（uuid_N） | warning | 建议升级 |",
+            "lineNumber": 93
+          },
+          {
+            "text": "| 新旧格式混合 | warning | 不一致 |",
+            "lineNumber": 94
+          },
+          {
+            "lineNumber": 95
+          },
+          {
+            "text": "---",
+            "lineNumber": 96
+          },
+          {
+            "lineNumber": 97
+          },
+          {
+            "text": "## 五、涉及文件",
+            "lineNumber": 98
+          },
+          {
+            "lineNumber": 99
+          },
+          {
+            "text": "| 文件 | 作用 |",
+            "lineNumber": 100
+          },
+          {
+            "text": "|------|------|",
+            "lineNumber": 101
+          },
+          {
+            "text": "| &#96;src/doc/validation.py&#96; | 校验模块：基础、表格、结构、chunk_id 四维校验 |",
+            "lineNumber": 102
+          },
+          {
+            "text": "| &#96;src/doc/mineru_client.py&#96; | 文档解析：MinerU 对接、占位解析、页码检测、结构化 chunk_id 生成 |",
+            "lineNumber": 103
+          },
+          {
+            "text": "| &#96;src/doc/milvus_upload.py&#96; | Milvus 写入：含结构化元数据字段 |",
+            "lineNumber": 104
+          },
+          {
+            "text": "| &#96;src/doc/__init__.py&#96; | 模块导出 |",
+            "lineNumber": 105
+          },
+          {
+            "text": "| &#96;api/main.py&#96; | API 集成：upload 和 confirm_upload 中调用校验 |",
+            "lineNumber": 106
+          },
+          {
+            "text": "| &#96;src/kb/chunking.py&#96; | 父子切片策略 |",
+            "lineNumber": 107
+          },
+          {
+            "text": "| &#96;config/settings.py&#96; | MinerU、RAG 切片、Milvus 等配置 |",
+            "lineNumber": 108
+          },
+          {
+            "lineNumber": 109
+          },
+          {
+            "text": "---",
+            "lineNumber": 110
+          }
+        ]
+      },
+      "score": 0.3474678099155426
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/doc/mineru_client.py",
+        "range": {
+          "startPosition": {
+            "line": 85
+          },
+          "endPosition": {
+            "line": 492
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 86,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 87,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class MinerUClient:",
+            "lineNumber": 86,
+            "isSignature": true
+          },
+          {
+            "text": "async def parse_file_async(",
+            "lineNumber": 106
+          },
+          {
+            "text": "        self, file_path: str, file_bytes: Optional[bytes] = None",
+            "lineNumber": 107
+          },
+          {
+            "text": "    ) -&gt; ParseResult:",
+            "lineNumber": 108
+          },
+          {
+            "lineNumber": 125
+          },
+          {
+            "text": "            )",
+            "lineNumber": 126
+          },
+          {
+            "lineNumber": 127
+          },
+          {
+            "text": "    def _parse_placeholder(",
+            "lineNumber": 128
+          },
+          {
+            "text": "        self, task_id: str, original_path: str, file_bytes: Optional[bytes]",
+            "lineNumber": 129
+          },
+          {
+            "text": "    ) -&gt; ParseResult:",
+            "lineNumber": 130
+          },
+          {
+            "text": "        \"\"\"占位实现：优先使用父子切片（可配置大小、父块重叠约 150），否则按行/段切。\"\"\"",
+            "lineNumber": 131
+          },
+          {
+            "text": "        if file_bytes:",
+            "lineNumber": 132
+          },
+          {
+            "text": "            try:",
+            "lineNumber": 133
+          },
+          {
+            "text": "                full_text = file_bytes.decode(\"utf-8\", errors=\"replace\")",
+            "lineNumber": 134
+          },
+          {
+            "text": "            except Exception:",
+            "lineNumber": 135
+          },
+          {
+            "text": "                full_text = file_bytes.decode(\"latin-1\", errors=\"replace\")",
+            "lineNumber": 136
+          },
+          {
+            "text": "        else:",
+            "lineNumber": 137
+          },
+          {
+            "text": "            p = Path(original_path)",
+            "lineNumber": 138
+          },
+          {
+            "text": "            if p.exists():",
+            "lineNumber": 139
+          },
+          {
+            "text": "                full_text = p.read_text(encoding=\"utf-8\", errors=\"replace\")",
+            "lineNumber": 140
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 141
+          },
+          {
+            "text": "                full_text = f\"[占位] 未读取到文件内容: {original_path}\\n请配置 MinerU 或上传文件内容。\"",
+            "lineNumber": 142
+          },
+          {
+            "text": "        doc_name = _safe_doc_name(original_path)",
+            "lineNumber": 143
+          },
+          {
+            "text": "        chunks = self._chunk_with_strategy(task_id, full_text, doc_name)",
+            "lineNumber": 144
+          },
+          {
+            "text": "        return ParseResult(",
+            "lineNumber": 145
+          },
+          {
+            "text": "            task_id=task_id,",
+            "lineNumber": 146
+          },
+          {
+            "text": "            original_path=original_path,",
+            "lineNumber": 147
+          },
+          {
+            "text": "            full_text=full_text,",
+            "lineNumber": 148
+          },
+          {
+            "text": "            chunks=chunks,",
+            "lineNumber": 149
+          },
+          {
+            "text": "            raw_markdown=full_text,",
+            "lineNumber": 150
+          },
+          {
+            "text": "            doc_name=doc_name,",
+            "lineNumber": 151
+          },
+          {
+            "text": "        )",
+            "lineNumber": 152
+          },
+          {
+            "lineNumber": 153
+          },
+          {
+            "text": "    def _chunk_with_strategy(self, task_id: str, full_text: str, doc_name: str = \"\") -&gt; List[ChunkItem]:",
+            "lineNumber": 154
+          },
+          {
+            "text": "        ",
+            "lineNumber": 155
+          }
+        ]
+      },
+      "score": 0.3429180383682251
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./README.md",
+        "range": {
+          "startPosition": {
+            "line": 58
+          },
+          "endPosition": {
+            "line": 73
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "- **Text2SQL**：默认 SQLite。表结构由 &#96;src/kb/schema_loader.py&#96; 从数据库读取；**人工审核**：前端「Text2SQL 表结构审核」可展示库表与字段并修改表含义、字段含义，**表间关联由人工整理后提交**（配置见 &#96;data/text2sql_schema_overrides.json&#96;）。定时（1 小时）检测 schema 变更并重新扫描。支持意图学习、仅允许 SELECT、删除需人工确认、SQL 校验重试最多 3 次、多表按关联 JOIN；**LIMIT 保护**（无 LIMIT 的 SELECT 自动追加上限，见 &#96;text2sql_default_limit&#96;）、**执行错误重试**（列名/表不匹配时再生成 1 次）、**时间范围解析**（问句中「去年」「最近三个月」等自动解析为具体日期区间并注入 prompt）。更多优化方向见 [Text2SQL 优化](docs/TEXT2SQL_OPTIMIZATION.md)。",
+            "lineNumber": 59
+          },
+          {
+            "text": "- **MinerU**：基础版使用占位解析；接入真实 MinerU 时配置 &#96;MINERU_API_URL&#96;、&#96;MINERU_API_TOKEN&#96; 或本地 MinerU 调用。",
+            "lineNumber": 60
+          },
+          {
+            "lineNumber": 61
+          },
+          {
+            "text": "## RAG 配置与评估",
+            "lineNumber": 62
+          },
+          {
+            "lineNumber": 63
+          },
+          {
+            "text": "- &#96;config/settings.py&#96;：&#96;rag_chunk_sizes&#96;（可验证的切块大小）、&#96;rag_parent_overlap&#96;（默认 150）、&#96;rag_bm25_ratio&#96; / &#96;rag_vector_ratio&#96;（0.3 : 0.7）、&#96;rag_min_match_score&#96;（默认 0.3）、&#96;rag_max_retrieve_attempts&#96;（默认 3）。",
+            "lineNumber": 64
+          },
+          {
+            "text": "- 评估指标（&#96;src/kb/retrieval_eval.py&#96;）：&#96;compute_match_score&#96;、&#96;compute_match_positions&#96;、&#96;compute_irrelevant_ratio&#96;、&#96;compute_query_coverage&#96;。",
+            "lineNumber": 65
+          },
+          {
+            "text": "- 切片验证：&#96;src/kb/chunking.py&#96; 提供 &#96;chunk_text&#96;、&#96;chunk_text_multi_size&#96;，可对同一文档用不同 size 切片并对比效果。",
+            "lineNumber": 66
+          },
+          {
+            "lineNumber": 67
+          },
+          {
+            "text": "## 扩展",
+            "lineNumber": 68
+          },
+          {
+            "lineNumber": 69
+          },
+          {
+            "text": "- 高频 QA：编辑 &#96;data/high_freq_qa.json&#96; 或修改 &#96;qa_data_path&#96;。",
+            "lineNumber": 70
+          },
+          {
+            "text": "- RAG：扩展 BM25 语料、Milvus 与 &#96;retrieve_with_validation&#96; 逻辑。",
+            "lineNumber": 71
+          },
+          {
+            "text": "- **意图路由**：规则词在 &#96;src/agents/supervisor.py&#96; 的 &#96;KNOWLEDGE_KEYWORDS&#96;、&#96;CHAT_PHRASES&#96;；总控/闲聊/知识库提示词在 &#96;src/agents/&#96; 下修改。",
+            "lineNumber": 72
+          },
+          {
+            "text": "- **Redis 缓存**：问答缓存使用连接池、超时、健康检查与断线重连；单条价值可限制长度；详见 [Redis 缓存](docs/REDIS_CACHE.md)。",
+            "lineNumber": 73
+          }
+        ]
+      },
+      "score": 0.3374936580657959
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/doc/mineru_client.py",
+        "range": {
+          "startPosition": {
+            "line": 85
+          },
+          "endPosition": {
+            "line": 492
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 86,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 87,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 285,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 288,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class MinerUClient:",
+            "lineNumber": 86,
+            "isSignature": true
+          },
+          {
+            "text": "def _parse_via_api(",
+            "lineNumber": 285
+          },
+          {
+            "text": "        self, task_id: str, original_path: str, file_bytes: Optional[bytes]",
+            "lineNumber": 286
+          },
+          {
+            "text": "    ) -&gt; ParseResult:",
+            "lineNumber": 287
+          },
+          {
+            "lineNumber": 322
+          },
+          {
+            "text": "        chunks = self._build_chunks_from_api_data(data, task_id, doc_name, full_text)",
+            "lineNumber": 323
+          },
+          {
+            "text": "        return ParseResult(",
+            "lineNumber": 324
+          },
+          {
+            "text": "            task_id=task_id,",
+            "lineNumber": 325
+          },
+          {
+            "text": "            original_path=original_path,",
+            "lineNumber": 326
+          },
+          {
+            "text": "            full_text=full_text,",
+            "lineNumber": 327
+          },
+          {
+            "text": "            chunks=chunks,",
+            "lineNumber": 328
+          },
+          {
+            "text": "            raw_markdown=full_text,",
+            "lineNumber": 329
+          },
+          {
+            "text": "            doc_name=doc_name,",
+            "lineNumber": 330
+          },
+          {
+            "text": "        )",
+            "lineNumber": 331
+          },
+          {
+            "lineNumber": 332
+          },
+          {
+            "text": "    def _build_chunks_from_api_data(",
+            "lineNumber": 333
+          },
+          {
+            "text": "        self, data: dict, task_id: str, doc_name: str, full_text: str",
+            "lineNumber": 334
+          },
+          {
+            "text": "    ) -&gt; List[ChunkItem]:",
+            "lineNumber": 335
+          },
+          {
+            "text": "        \"\"\"从 MinerU API 响应构建带结构化编号的 ChunkItem 列表。\"\"\"",
+            "lineNumber": 336
+          },
+          {
+            "text": "        pages = _detect_pages(full_text)",
+            "lineNumber": 337
+          },
+          {
+            "text": "        raw_chunks = data.get(\"chunks\", []) or [full_text]",
+            "lineNumber": 338
+          },
+          {
+            "text": "        chunks: List[ChunkItem] = []",
+            "lineNumber": 339
+          },
+          {
+            "text": "        parent_block_per_page: dict = {}",
+            "lineNumber": 340
+          },
+          {
+            "text": "        child_per_parent: dict = {}",
+            "lineNumber": 341
+          },
+          {
+            "text": "        offset = 0",
+            "lineNumber": 342
+          },
+          {
+            "text": "        for seg in raw_chunks:",
+            "lineNumber": 343
+          },
+          {
+            "text": "            if isinstance(seg, dict):",
+            "lineNumber": 344
+          },
+          {
+            "text": "                content = seg.get(\"content\") or seg.get(\"text\") or \"\"",
+            "lineNumber": 345
+          }
+        ]
+      },
+      "score": 0.3353109359741211
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 392
+          },
+          {
+            "lineNumber": 393
+          },
+          {
+            "text": "    def query_stream(self, question: str):",
+            "lineNumber": 394
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 395
+          },
+          {
+            "text": "        知识库流式回答：先出首字再逐 chunk。依次尝试 QA → Text2SQL → RAG，首个有结果即流式输出。",
+            "lineNumber": 396
+          },
+          {
+            "text": "        Yields: 文本片段（str）。",
+            "lineNumber": 397
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 398
+          },
+          {
+            "text": "        trace = self._reset_trace()",
+            "lineNumber": 399
+          },
+          {
+            "text": "        # 1) QA 精准匹配",
+            "lineNumber": 400
+          },
+          {
+            "text": "        answer = self.qa.find(question)",
+            "lineNumber": 401
+          },
+          {
+            "text": "        if answer:",
+            "lineNumber": 402
+          },
+          {
+            "text": "            trace.route = \"qa\"",
+            "lineNumber": 403
+          },
+          {
+            "text": "            trace.final_status = \"qa_hit\"",
+            "lineNumber": 404
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(answer):",
+            "lineNumber": 405
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 406
+          },
+          {
+            "text": "            return",
+            "lineNumber": 407
+          },
+          {
+            "lineNumber": 408
+          },
+          {
+            "text": "        # 2) Text2SQL（可能为待确认 SQL，统一按文案流式输出）",
+            "lineNumber": 409
+          },
+          {
+            "text": "        result = self.text2sql.query(question)",
+            "lineNumber": 410
+          },
+          {
+            "text": "        if result is not None:",
+            "lineNumber": 411
+          },
+          {
+            "text": "            trace.route = \"text2sql\"",
+            "lineNumber": 412
+          },
+          {
+            "text": "            trace.final_status = \"text2sql_pending\" if isinstance(result, Text2SQLConfirmRequired) else \"text2sql_answer\"",
+            "lineNumber": 413
+          },
+          {
+            "text": "            trace.pending_sql = isinstance(result, Text2SQLConfirmRequired)",
+            "lineNumber": 414
+          },
+          {
+            "text": "            msg = result.message if isinstance(result, Text2SQLConfirmRequired) else result",
+            "lineNumber": 415
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(msg):",
+            "lineNumber": 416
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 417
+          },
+          {
+            "text": "            return",
+            "lineNumber": 418
+          },
+          {
+            "lineNumber": 419
+          },
+          {
+            "text": "        # 3) RAG：检索后流式生成",
+            "lineNumber": 420
+          },
+          {
+            "text": "        trace.route = \"rag\"",
+            "lineNumber": 421
+          },
+          {
+            "text": "        rag_result = self.rag.retrieve_with_validation(",
+            "lineNumber": 422
+          },
+          {
+            "text": "            question, top_k=10, use_rerank=True, rerank_top=5",
+            "lineNumber": 423
+          },
+          {
+            "text": "        )",
+            "lineNumber": 424
+          },
+          {
+            "text": "        trace.retrieve_attempt = rag_result.attempt",
+            "lineNumber": 425
+          },
+          {
+            "text": "        trace.source_count = len(rag_result.chunks)",
+            "lineNumber": 426
+          },
+          {
+            "text": "        trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))",
+            "lineNumber": 427
+          },
+          {
+            "text": "        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))",
+            "lineNumber": 428
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 429
+          },
+          {
+            "text": "            trace.top_match_score = max(e.match_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 430
+          },
+          {
+            "text": "            trace.top_normalized_score = max(e.normalized_score for e in rag_result.evals if e is not None)",
+            "lineNumber": 431
+          },
+          {
+            "text": "        if not rag_result.chunks:",
+            "lineNumber": 432
+          },
+          {
+            "text": "            trace.final_status = \"rag_no_hit\"",
+            "lineNumber": 433
+          }
+        ]
+      },
+      "score": 0.3349513113498688
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/doc/mineru_client.py",
+        "range": {
+          "startPosition": {
+            "line": 85
+          },
+          "endPosition": {
+            "line": 492
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 86,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 87,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 285,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 288,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class MinerUClient:",
+            "lineNumber": 86,
+            "isSignature": true
+          },
+          {
+            "text": "def _build_chunks_from_api_data(",
+            "lineNumber": 333
+          },
+          {
+            "text": "        self, data: dict, task_id: str, doc_name: str, full_text: str",
+            "lineNumber": 334
+          },
+          {
+            "text": "    ) -&gt; List[ChunkItem]:",
+            "lineNumber": 335
+          },
+          {
+            "lineNumber": 342
+          },
+          {
+            "text": "        for seg in raw_chunks:",
+            "lineNumber": 343
+          },
+          {
+            "text": "            if isinstance(seg, dict):",
+            "lineNumber": 344
+          },
+          {
+            "text": "                content = seg.get(\"content\") or seg.get(\"text\") or \"\"",
+            "lineNumber": 345
+          },
+          {
+            "text": "                parent = seg.get(\"parent_content\")",
+            "lineNumber": 346
+          },
+          {
+            "text": "                seg_page = seg.get(\"page\")",
+            "lineNumber": 347
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 348
+          },
+          {
+            "text": "                content = str(seg)",
+            "lineNumber": 349
+          },
+          {
+            "text": "                parent = None",
+            "lineNumber": 350
+          },
+          {
+            "text": "                seg_page = None",
+            "lineNumber": 351
+          },
+          {
+            "text": "            if seg_page is not None:",
+            "lineNumber": 352
+          },
+          {
+            "text": "                page = int(seg_page)",
+            "lineNumber": 353
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 354
+          },
+          {
+            "text": "                start = full_text.find(content, offset) if content else offset",
+            "lineNumber": 355
+          },
+          {
+            "text": "                if start &lt; 0:",
+            "lineNumber": 356
+          },
+          {
+            "text": "                    start = offset",
+            "lineNumber": 357
+          },
+          {
+            "text": "                page = self._page_for_offset(start, pages)",
+            "lineNumber": 358
+          },
+          {
+            "text": "                offset = start + len(content)",
+            "lineNumber": 359
+          },
+          {
+            "lineNumber": 360
+          },
+          {
+            "text": "            pk = page",
+            "lineNumber": 361
+          },
+          {
+            "text": "            if pk not in parent_block_per_page:",
+            "lineNumber": 362
+          },
+          {
+            "text": "                parent_block_per_page[pk] = 0",
+            "lineNumber": 363
+          },
+          {
+            "text": "                child_per_parent[pk] = {}",
+            "lineNumber": 364
+          },
+          {
+            "text": "            parent_key = (parent or \"\").strip()",
+            "lineNumber": 365
+          },
+          {
+            "text": "            if parent_key not in child_per_parent[pk]:",
+            "lineNumber": 366
+          },
+          {
+            "text": "                child_per_parent[pk][parent_key] = 0",
+            "lineNumber": 367
+          },
+          {
+            "text": "                pb = parent_block_per_page[pk]",
+            "lineNumber": 368
+          },
+          {
+            "text": "                parent_block_per_page[pk] = pb + 1",
+            "lineNumber": 369
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 370
+          },
+          {
+            "text": "                pb = list(child_per_parent[pk].keys()).index(parent_key)",
+            "lineNumber": 371
+          },
+          {
+            "text": "            cb = child_per_parent[pk][parent_key]",
+            "lineNumber": 372
+          },
+          {
+            "text": "            child_per_parent[pk][parent_key] = cb + 1",
+            "lineNumber": 373
+          },
+          {
+            "lineNumber": 374
+          },
+          {
+            "text": "            cid = _build_structured_chunk_id(doc_name, page, pb, cb)",
+            "lineNumber": 375
+          },
+          {
+            "text": "            chunks.append(ChunkItem(",
+            "lineNumber": 376
+          },
+          {
+            "text": "                content=content,",
+            "lineNumber": 377
+          },
+          {
+            "text": "                parent_content=parent,",
+            "lineNumber": 378
+          },
+          {
+            "text": "                chunk_id=cid,",
+            "lineNumber": 379
+          },
+          {
+            "text": "                doc_name=doc_name,",
+            "lineNumber": 380
+          },
+          {
+            "text": "                page=page,",
+            "lineNumber": 381
+          },
+          {
+            "text": "                parent_block=pb,",
+            "lineNumber": 382
+          },
+          {
+            "text": "                child_block=cb,",
+            "lineNumber": 383
+          },
+          {
+            "text": "            ))",
+            "lineNumber": 384
+          },
+          {
+            "text": "        if not chunks and full_text:",
+            "lineNumber": 385
+          },
+          {
+            "text": "            cid = _build_structured_chunk_id(doc_name, 1, 0, 0)",
+            "lineNumber": 386
+          },
+          {
+            "text": "            chunks = [ChunkItem(",
+            "lineNumber": 387
+          },
+          {
+            "text": "                content=full_text[:2000], chunk_id=cid,",
+            "lineNumber": 388
+          },
+          {
+            "text": "                doc_name=doc_name, page=1, parent_block=0, child_block=0,",
+            "lineNumber": 389
+          },
+          {
+            "text": "            )]",
+            "lineNumber": 390
+          },
+          {
+            "text": "        return chunks",
+            "lineNumber": 391
+          },
+          {
+            "lineNumber": 392
+          },
+          {
+            "text": "    def _is_mineru_retryable(self, exc: Exception, status_code: int) -&gt; bool:",
+            "lineNumber": 393
+          },
+          {
+            "text": "        ",
+            "lineNumber": 394
+          }
+        ]
+      },
+      "score": 0.3338986039161682
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/doc/milvus_upload.py",
+        "range": {
+          "startPosition": {
+            "line": 47
+          },
+          "endPosition": {
+            "line": 130
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 48,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 49,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class MilvusUploader:",
+            "lineNumber": 48,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 66
+          },
+          {
+            "lineNumber": 67
+          },
+          {
+            "text": "    def upload_parse_result(",
+            "lineNumber": 68
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 69
+          },
+          {
+            "text": "        parse_result: ParseResult,",
+            "lineNumber": 70
+          },
+          {
+            "text": "        doc_id: Optional[str] = None,",
+            "lineNumber": 71
+          },
+          {
+            "text": "    ) -&gt; int:",
+            "lineNumber": 72
+          },
+          {
+            "text": "        \"\"\"将解析结果中的 chunks 向量化并写入 Milvus。返回写入条数。Milvus 不可用时返回 0。\"\"\"",
+            "lineNumber": 73
+          },
+          {
+            "text": "        if self._embed is None:",
+            "lineNumber": 74
+          },
+          {
+            "text": "            logger.warning(\"BGE-M3 未加载，无法写入 Milvus\")",
+            "lineNumber": 75
+          },
+          {
+            "text": "            return 0",
+            "lineNumber": 76
+          },
+          {
+            "text": "        doc_id = doc_id or parse_result.task_id",
+            "lineNumber": 77
+          },
+          {
+            "text": "        doc_name_default = getattr(parse_result, \"doc_name\", \"\") or \"\"",
+            "lineNumber": 78
+          },
+          {
+            "text": "        ids: List[str] = []",
+            "lineNumber": 79
+          },
+          {
+            "text": "        doc_ids: List[str] = []",
+            "lineNumber": 80
+          },
+          {
+            "text": "        chunk_ids: List[str] = []",
+            "lineNumber": 81
+          },
+          {
+            "text": "        doc_names: List[str] = []",
+            "lineNumber": 82
+          },
+          {
+            "text": "        pages: List[int] = []",
+            "lineNumber": 83
+          },
+          {
+            "text": "        parent_blocks: List[int] = []",
+            "lineNumber": 84
+          },
+          {
+            "text": "        child_blocks: List[int] = []",
+            "lineNumber": 85
+          },
+          {
+            "text": "        contents: List[str] = []",
+            "lineNumber": 86
+          },
+          {
+            "text": "        parent_contents: List[str] = []",
+            "lineNumber": 87
+          },
+          {
+            "text": "        texts_to_embed: List[str] = []",
+            "lineNumber": 88
+          },
+          {
+            "text": "        for c in parse_result.chunks:",
+            "lineNumber": 89
+          },
+          {
+            "text": "            chunk_id = c.chunk_id or f\"{doc_id}_{len(ids)}\"",
+            "lineNumber": 90
+          },
+          {
+            "text": "            ids.append(chunk_id)",
+            "lineNumber": 91
+          },
+          {
+            "text": "            doc_ids.append(doc_id)",
+            "lineNumber": 92
+          },
+          {
+            "text": "            chunk_ids.append(chunk_id)",
+            "lineNumber": 93
+          },
+          {
+            "text": "            doc_names.append(getattr(c, \"doc_name\", \"\") or doc_name_default)",
+            "lineNumber": 94
+          },
+          {
+            "text": "            pages.append(getattr(c, \"page\", 0) or 0)",
+            "lineNumber": 95
+          },
+          {
+            "text": "            parent_blocks.append(getattr(c, \"parent_block\", 0) or 0)",
+            "lineNumber": 96
+          },
+          {
+            "text": "            child_blocks.append(getattr(c, \"child_block\", 0) or 0)",
+            "lineNumber": 97
+          },
+          {
+            "text": "            contents.append((c.content or \"\")[:65530])",
+            "lineNumber": 98
+          },
+          {
+            "text": "            parent_contents.append((c.parent_content or \"\")[:65530])",
+            "lineNumber": 99
+          },
+          {
+            "text": "            texts_to_embed.append(",
+            "lineNumber": 100
+          },
+          {
+            "text": "                (c.parent_content or \"\") + \"\\n\" + (c.content or \"\")",
+            "lineNumber": 101
+          },
+          {
+            "text": "                if c.parent_content else (c.content or \"\")",
+            "lineNumber": 102
+          },
+          {
+            "text": "            )",
+            "lineNumber": 103
+          },
+          {
+            "text": "        if not texts_to_embed:",
+            "lineNumber": 104
+          },
+          {
+            "text": "            return 0",
+            "lineNumber": 105
+          },
+          {
+            "text": "        embeddings = self._embed.encode(texts_to_embed).tolist()",
+            "lineNumber": 106
+          },
+          {
+            "text": "        entities = [",
+            "lineNumber": 107
+          },
+          {
+            "text": "            ids, doc_ids, chunk_ids, doc_names,",
+            "lineNumber": 108
+          },
+          {
+            "text": "            pages, parent_blocks, child_blocks,",
+            "lineNumber": 109
+          },
+          {
+            "text": "            contents, parent_contents, embeddings,",
+            "lineNumber": 110
+          },
+          {
+            "text": "        ]",
+            "lineNumber": 111
+          },
+          {
+            "lineNumber": 112
+          },
+          {
+            "text": "        def _do_insert(coll):",
+            "lineNumber": 113
+          },
+          {
+            "text": "            coll.insert(entities)",
+            "lineNumber": 114
+          }
+        ]
+      },
+      "score": 0.32783234119415283
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/doc/validation.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 60
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# src/doc/validation.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "文档解析结果校验：在入库前对 ParseResult 做格式与质量检查。",
+            "lineNumber": 3
+          },
+          {
+            "lineNumber": 4
+          },
+          {
+            "text": "支持的文档来源格式：",
+            "lineNumber": 5
+          },
+          {
+            "text": "- Markdown（.md）：原生 Markdown 表格、标题层级。",
+            "lineNumber": 6
+          },
+          {
+            "text": "- PDF（经 MinerU 或其他工具解析后的文本）：纯文本表格、页码标记、段落结构。",
+            "lineNumber": 7
+          },
+          {
+            "text": "- Word（.docx 经解析后的文本）：制表符/空格对齐表格、编号标题、分节符。",
+            "lineNumber": 8
+          },
+          {
+            "lineNumber": 9
+          },
+          {
+            "text": "校验维度：",
+            "lineNumber": 10
+          },
+          {
+            "text": "1. 基础完整性：全文非空、chunks 非空、chunk 内容非空。",
+            "lineNumber": 11
+          },
+          {
+            "text": "2. 表格格式校验：Markdown 管道表、制表符对齐表、空格对齐表、HTML 表格。",
+            "lineNumber": 12
+          },
+          {
+            "text": "3. 文档结构化信息校验：多格式标题检测、页码标记、段落连续性。",
+            "lineNumber": 13
+          },
+          {
+            "text": "4. chunk_id 格式校验：确保符合「文档名-页码-父块编号-子块编号」的结构化编号规范。",
+            "lineNumber": 14
+          },
+          {
+            "lineNumber": 15
+          },
+          {
+            "text": "校验结果为 ValidationReport，包含 passed/warnings/errors，",
+            "lineNumber": 16
+          },
+          {
+            "text": "调用方可据此决定是否允许入库、是否需要人工复核。",
+            "lineNumber": 17
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 18
+          },
+          {
+            "text": "import re",
+            "lineNumber": 19
+          },
+          {
+            "text": "import logging",
+            "lineNumber": 20
+          },
+          {
+            "text": "from dataclasses import dataclass, field",
+            "lineNumber": 21
+          },
+          {
+            "text": "from typing import List, Optional",
+            "lineNumber": 22
+          },
+          {
+            "lineNumber": 23
+          },
+          {
+            "text": "logger = logging.getLogger(__name__)",
+            "lineNumber": 24
+          },
+          {
+            "lineNumber": 25
+          },
+          {
+            "lineNumber": 26
+          },
+          {
+            "text": "@dataclass",
+            "lineNumber": 27
+          },
+          {
+            "text": "class ValidationIssue:",
+            "lineNumber": 28,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"单条校验问题。\"\"\"",
+            "lineNumber": 29
+          },
+          {
+            "text": "    level: str  # \"error\" | \"warning\"",
+            "lineNumber": 30
+          },
+          {
+            "text": "    category: str  # \"basic\" | \"table\" | \"structure\" | \"chunk_id\"",
+            "lineNumber": 31
+          },
+          {
+            "text": "    message: str",
+            "lineNumber": 32
+          },
+          {
+            "text": "    chunk_index: Optional[int] = None",
+            "lineNumber": 33,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 34
+          },
+          {
+            "lineNumber": 35
+          },
+          {
+            "text": "@dataclass",
+            "lineNumber": 36
+          },
+          {
+            "text": "class ValidationReport:",
+            "lineNumber": 37,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 38
+          }
+        ]
+      },
+      "score": 0.32692456245422363
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./docs/SECOND_ROUND_INTERVIEW_QA.md",
+        "range": {
+          "startPosition": {
+            "line": 68
+          },
+          "endPosition": {
+            "line": 95
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "**参考答案：**",
+            "lineNumber": 69
+          },
+          {
+            "lineNumber": 70
+          },
+          {
+            "text": "我们做的是一个以单轮检索为主的业务型 RAG，重点不是把链路做得特别复杂，而是把检索质量和回答可靠性做稳。文档侧先做解析和父子切片，子块负责检索精度，父块负责补语义背景；检索侧用混合召回，向量检索为主，全文检索做补充，再用 reranker 做二次排序；生成时把命中的证据组织成结构化上下文给模型；生成后再做 grounding 校验，如果答案和证据相关度不够，就重生成或者保守拒答。",
+            "lineNumber": 71
+          },
+          {
+            "lineNumber": 72
+          },
+          {
+            "text": "### 12. 为什么要用父子切片？",
+            "lineNumber": 73
+          },
+          {
+            "text": "**参考答案：**",
+            "lineNumber": 74
+          },
+          {
+            "lineNumber": 75
+          },
+          {
+            "text": "因为海关文档很多是条款、流程、条件、附注这类强结构化内容，如果只用固定长度切片，容易命中局部信息但缺少约束上下文。父子切片的作用是，子块提高命中精度，父块补足语义背景。这样在检索和生成之间做了一次平衡，既不让块太大影响召回，又尽量避免断章取义。",
+            "lineNumber": 76
+          },
+          {
+            "lineNumber": 77
+          },
+          {
+            "text": "### 13. 你们为什么要做混合召回，而不是只用向量检索？",
+            "lineNumber": 78
+          },
+          {
+            "text": "**参考答案：**",
+            "lineNumber": 79
+          },
+          {
+            "lineNumber": 80
+          },
+          {
+            "text": "因为向量检索和全文检索各有优势。向量检索更擅长语义召回，但对法规编号、专业术语、固定表达未必稳定；全文检索更适合精确关键词命中，尤其在海关这种专业词很多的场景下能提供补充。所以我更倾向于把两者组合起来，再通过重排统一排序，而不是把它们看成二选一。",
+            "lineNumber": 81
+          },
+          {
+            "lineNumber": 82
+          },
+          {
+            "text": "### 14. reranker 是怎么筛噪声的？",
+            "lineNumber": 83
+          },
+          {
+            "text": "**参考答案：**",
+            "lineNumber": 84
+          },
+          {
+            "lineNumber": 85
+          },
+          {
+            "text": "初召回阶段更偏 recall，会混入一些相关但不够直接回答问题的候选。reranker 的作用就是对 query 和每个候选片段做更细粒度匹配，把真正更能回答当前问题的证据排前面，把关键词命中但其实偏背景、偏弱相关的片段往后压。后续只把前几条高分候选给大模型，相当于在生成前做了一次去噪。",
+            "lineNumber": 86
+          },
+          {
+            "lineNumber": 87
+          },
+          {
+            "text": "### 15. topk 为什么不能一直调大？",
+            "lineNumber": 88
+          },
+          {
+            "text": "**参考答案：**",
+            "lineNumber": 89
+          },
+          {
+            "lineNumber": 90
+          },
+          {
+            "text": "&#96;topk&#96; 太小会漏召回，关键证据可能根本进不了候选集；但 &#96;topk&#96; 太大也会引入大量噪声，增加 reranker 负担，并污染最终给模型的上下文。RAG 里最怕的不是没有内容，而是给模型太多半相关内容，让它乱综合。所以调 &#96;topk&#96; 的目标不是越大越好，而是让最终证据既够用又干净。",
+            "lineNumber": 91
+          },
+          {
+            "lineNumber": 92
+          },
+          {
+            "text": "### 16. 你们是怎么调 RAG 效果的？",
+            "lineNumber": 93
+          },
+          {
+            "text": "**参考答案：**",
+            "lineNumber": 94
+          }
+        ]
+      },
+      "score": 0.3266170024871826
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 112
+          },
+          "endPosition": {
+            "line": 554
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 113,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 114,
+                "column": 5
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class KnowledgeEngine:",
+            "lineNumber": 113,
+            "isSignature": true
+          },
+          {
+            "text": "async def aquery(self, question: str) -&gt; Tuple[str, Optional[str]]:",
+            "lineNumber": 449
+          },
+          {
+            "lineNumber": 491
+          },
+          {
+            "text": "        return (answer_text, None)",
+            "lineNumber": 492
+          },
+          {
+            "lineNumber": 493
+          },
+          {
+            "text": "    async def aquery_stream(",
+            "lineNumber": 494
+          },
+          {
+            "text": "        self, question: str, pending_sql_out: Optional[List[str]] = None",
+            "lineNumber": 495
+          },
+          {
+            "text": "    ) -&gt; AsyncIterator[str]:",
+            "lineNumber": 496
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 497
+          },
+          {
+            "text": "        异步流式回答：先出首字再逐 chunk；RAG 使用 LLM astream，其余在线程池执行后按段 yield。",
+            "lineNumber": 498
+          },
+          {
+            "text": "        \"\"\"",
+            "lineNumber": 499
+          },
+          {
+            "text": "        trace = self._reset_trace()",
+            "lineNumber": 500
+          },
+          {
+            "text": "        # 1) QA",
+            "lineNumber": 501
+          },
+          {
+            "text": "        answer = await asyncio.to_thread(self.qa.find, question)",
+            "lineNumber": 502
+          },
+          {
+            "text": "        if answer:",
+            "lineNumber": 503
+          },
+          {
+            "text": "            trace.route = \"qa\"",
+            "lineNumber": 504
+          },
+          {
+            "text": "            trace.final_status = \"qa_hit\"",
+            "lineNumber": 505
+          },
+          {
+            "text": "            for chunk in self._yield_text_chunked(answer):",
+            "lineNumber": 506
+          },
+          {
+            "text": "                yield chunk",
+            "lineNumber": 507
+          },
+          {
+            "text": "            return",
+            "lineNumber": 508
+          },
+          {
+            "lineNumber": 509
+          },
+          {
+            "text": "        # 2) Text2SQL（可能为待确认 SQL）",
+            "lineNumber": 510
+          },
+          {
+            "text": "        result = await asyncio.to_thread(self.text2sql.query, question)",
+            "lineNumber": 511
+          },
+          {
+            "text": "        if result is not None:",
+            "lineNumber": 512
+          },
+          {
+            "text": "            trace.route = \"text2sql\"",
+            "lineNumber": 513
+          },
+          {
+            "text": "            # 删除/修改类需人工确认：将 SQL 放入 pending_sql_out 供 API 写入 _pending_sql",
+            "lineNumber": 514
+          },
+          {
+            "text": "            if isinstance(result, Text2SQLConfirmRequired):",
+            "lineNumber": 515
+          },
+          {
+            "text": "                trace.final_status = \"text2sql_pending\"",
+            "lineNumber": 516
+          },
+          {
+            "text": "                trace.pending_sql = True",
+            "lineNumber": 517
+          },
+          {
+            "text": "                if pending_sql_out is not None:",
+            "lineNumber": 518
+          },
+          {
+            "text": "                    pending_sql_out.append(result.sql)",
+            "lineNumber": 519
+          },
+          {
+            "text": "                for chunk in self._yield_text_chunked(result.message):",
+            "lineNumber": 520
+          },
+          {
+            "text": "                    yield chunk",
+            "lineNumber": 521
+          },
+          {
+            "text": "            else:",
+            "lineNumber": 522
+          },
+          {
+            "text": "                trace.final_status = \"text2sql_answer\"",
+            "lineNumber": 523
+          },
+          {
+            "text": "                for chunk in self._yield_text_chunked(result):",
+            "lineNumber": 524
+          },
+          {
+            "text": "                    yield chunk",
+            "lineNumber": 525
+          },
+          {
+            "text": "            return",
+            "lineNumber": 526
+          },
+          {
+            "lineNumber": 527
+          },
+          {
+            "text": "        # 3) RAG：检索在线程池，生成用 astream",
+            "lineNumber": 528
+          },
+          {
+            "text": "        trace.route = \"rag\"",
+            "lineNumber": 529
+          },
+          {
+            "text": "        rag_result = await asyncio.to_thread(",
+            "lineNumber": 530
+          },
+          {
+            "text": "            self.rag.retrieve_with_validation,",
+            "lineNumber": 531
+          },
+          {
+            "text": "            question, top_k=10, use_rerank=True, rerank_top=5,",
+            "lineNumber": 532
+          },
+          {
+            "text": "        )",
+            "lineNumber": 533
+          },
+          {
+            "text": "        trace.retrieve_attempt = rag_result.attempt",
+            "lineNumber": 534
+          },
+          {
+            "text": "        trace.source_count = len(rag_result.chunks)",
+            "lineNumber": 535
+          },
+          {
+            "text": "        trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))",
+            "lineNumber": 536
+          },
+          {
+            "text": "        trace.retrieved_chunk_ids = list(dict.fromkeys([c.chunk_id for c in rag_result.chunks if c.chunk_id]))",
+            "lineNumber": 537
+          },
+          {
+            "text": "        if rag_result.evals:",
+            "lineNumber": 538
+          },
+          {
+            "text": "            trace.top_match_score =",
+            "lineNumber": 539
+          }
+        ]
+      },
+      "score": 0.32587799429893494
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/rag.py",
+        "range": {
+          "startPosition": {},
+          "endPosition": {
+            "line": 29,
+            "column": 25
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "# src/kb/rag.py",
+            "lineNumber": 1
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 2
+          },
+          {
+            "text": "复杂问题 RAG：BM25 + HNSW 混合检索（3:7），检索评估与重检，答案展示依据来源。",
+            "lineNumber": 3
+          },
+          {
+            "text": "模型使用约定（本项目禁止调用 OpenAI）：",
+            "lineNumber": 4
+          },
+          {
+            "text": "  - 向量模型：仅 BGE-M3（BAAI/bge-m3），本地部署/本地加载，不调用远程 embedding API；",
+            "lineNumber": 5
+          },
+          {
+            "text": "  - 重排模型：仅 BGE Reranker Large（BAAI/bge-reranker-large），本地部署/本地加载，不调用远程 API；",
+            "lineNumber": 6
+          },
+          {
+            "text": "  - 大模型不在此模块调用，由 kb.engine 使用 DeepSeek。",
+            "lineNumber": 7
+          },
+          {
+            "text": "\"\"\"",
+            "lineNumber": 8
+          },
+          {
+            "text": "import hashlib",
+            "lineNumber": 9
+          },
+          {
+            "text": "import threading",
+            "lineNumber": 10
+          },
+          {
+            "text": "import time",
+            "lineNumber": 11
+          },
+          {
+            "text": "from collections import OrderedDict",
+            "lineNumber": 12
+          },
+          {
+            "text": "from typing import List, Optional, Tuple",
+            "lineNumber": 13
+          },
+          {
+            "text": "from dataclasses import dataclass",
+            "lineNumber": 14
+          },
+          {
+            "lineNumber": 15
+          },
+          {
+            "text": "from config import get_settings",
+            "lineNumber": 16
+          },
+          {
+            "text": "from .retrieval_eval import evaluate_retrieval, RetrievalEvalResult",
+            "lineNumber": 17
+          },
+          {
+            "text": "from .embedding_loader import get_bge_embedding, get_bge_reranker",
+            "lineNumber": 18
+          },
+          {
+            "lineNumber": 19
+          },
+          {
+            "text": "_rag_cache: Optional[OrderedDict] = None",
+            "lineNumber": 20
+          },
+          {
+            "text": "_rag_cache_lock = threading.Lock()",
+            "lineNumber": 21
+          },
+          {
+            "lineNumber": 22
+          },
+          {
+            "lineNumber": 23
+          },
+          {
+            "text": "def _rag_cache_key(query: str, total_k: int, use_rerank: bool, rerank_top: int) -&gt; str:",
+            "lineNumber": 24,
+            "isSignature": true
+          },
+          {
+            "text": "    h = hashlib.sha256(f\"{query}|{total_k}|{use_rerank}|{rerank_top}\".encode()).hexdigest()[:32]",
+            "lineNumber": 25
+          },
+          {
+            "text": "    return f\"rag:v1:{h}\"",
+            "lineNumber": 26,
+            "isSignature": true
+          },
+          {
+            "lineNumber": 27
+          },
+          {
+            "lineNumber": 28
+          },
+          {
+            "text": "def _get_settings():",
+            "lineNumber": 29,
+            "isSignature": true
+          },
+          {
+            "text": "    return get_settings()",
+            "lineNumber": 30,
+            "isSignature": true
+          }
+        ]
+      },
+      "score": 0.32572808861732483
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/doc/mineru_client.py",
+        "range": {
+          "startPosition": {
+            "line": 85
+          },
+          "endPosition": {
+            "line": 492
+          }
+        },
+        "signatures": {
+          "ranges": [
+            {
+              "startPosition": {
+                "line": 86,
+                "column": 1
+              },
+              "endPosition": {
+                "line": 87,
+                "column": 5
+              }
+            },
+            {
+              "startPosition": {
+                "line": 154,
+                "column": 5
+              },
+              "endPosition": {
+                "line": 155,
+                "column": 9
+              }
+            }
+          ]
+        },
+        "detailedLines": [
+          {
+            "text": "class MinerUClient:",
+            "lineNumber": 86,
+            "isSignature": true
+          },
+          {
+            "text": "def _chunk_with_strategy(self, task_id: str, full_text: str, doc_name: str = \"\") -&gt; List[ChunkItem]:",
+            "lineNumber": 154
+          },
+          {
+            "lineNumber": 196
+          },
+          {
+            "text": "        if current:",
+            "lineNumber": 197
+          },
+          {
+            "text": "            block = \"\\n\".join(current).strip()",
+            "lineNumber": 198
+          },
+          {
+            "text": "            if block:",
+            "lineNumber": 199
+          },
+          {
+            "text": "                page = self._page_for_offset(offset, pages)",
+            "lineNumber": 200
+          },
+          {
+            "text": "                parent_block = len(chunks)",
+            "lineNumber": 201
+          },
+          {
+            "text": "                cid = _build_structured_chunk_id(doc_name, page, parent_block, 0)",
+            "lineNumber": 202
+          },
+          {
+            "text": "                chunks.append(ChunkItem(",
+            "lineNumber": 203
+          },
+          {
+            "text": "                    content=block,",
+            "lineNumber": 204
+          },
+          {
+            "text": "                    parent_content=None,",
+            "lineNumber": 205
+          },
+          {
+            "text": "                    chunk_id=cid,",
+            "lineNumber": 206
+          },
+          {
+            "text": "                    doc_name=doc_name,",
+            "lineNumber": 207
+          },
+          {
+            "text": "                    page=page,",
+            "lineNumber": 208
+          },
+          {
+            "text": "                    parent_block=parent_block,",
+            "lineNumber": 209
+          },
+          {
+            "text": "                    child_block=0,",
+            "lineNumber": 210
+          },
+          {
+            "text": "                ))",
+            "lineNumber": 211
+          },
+          {
+            "text": "        if not chunks:",
+            "lineNumber": 212
+          },
+          {
+            "text": "            cid = _build_structured_chunk_id(doc_name, 1, 0, 0)",
+            "lineNumber": 213
+          },
+          {
+            "text": "            chunks = [ChunkItem(",
+            "lineNumber": 214
+          },
+          {
+            "text": "                content=full_text[:2000] or \"(无内容)\",",
+            "lineNumber": 215
+          },
+          {
+            "text": "                chunk_id=cid,",
+            "lineNumber": 216
+          },
+          {
+            "text": "                doc_name=doc_name,",
+            "lineNumber": 217
+          },
+          {
+            "text": "                page=1,",
+            "lineNumber": 218
+          },
+          {
+            "text": "                parent_block=0,",
+            "lineNumber": 219
+          },
+          {
+            "text": "                child_block=0,",
+            "lineNumber": 220
+          },
+          {
+            "text": "            )]",
+            "lineNumber": 221
+          },
+          {
+            "text": "        return chunks",
+            "lineNumber": 222
+          },
+          {
+            "lineNumber": 223
+          },
+          {
+            "text": "    def _assign_structured_ids(",
+            "lineNumber": 224
+          },
+          {
+            "text": "        self,",
+            "lineNumber": 225
+          },
+          {
+            "text": "        with_parent: list,",
+            "lineNumber": 226
+          },
+          {
+            "text": "        full_text: str,",
+            "lineNumber": 227
+          },
+          {
+            "text": "        doc_name: str,",
+            "lineNumber": 228
+          },
+          {
+            "text": "        pages: List[tuple],",
+            "lineNumber": 229
+          },
+          {
+            "text": "    ) -&gt; List[ChunkItem]:",
+            "lineNumber": 230
+          },
+          {
+            "text": "        ",
+            "lineNumber": 231
+          }
+        ]
+      },
+      "score": 0.3186629116535187
+    },
+    {
+      "codeBlock": {
+        "relativeWorkspacePath": "./src/kb/engine.py",
+        "range": {
+          "startPosition": {
+            "line": 25,
+            "column": 44
+          },
+          "endPosition": {
+            "line": 69
+          }
+        },
+        "signatures": {},
+        "detailedLines": [
+          {
+            "text": "_RAG_PROMPT = ChatPromptTemplate.from_messages([",
+            "lineNumber": 29
+          },
+          {
+            "text": "    (\"system\", \"\"\"你是一名海关政策与业务知识助手。你必须严格根据给定的参考片段回答，禁止使用参考内容之外的常识、猜测、补充知识或臆断。",
+            "lineNumber": 30
+          },
+          {
+            "lineNumber": 31
+          },
+          {
+            "text": "要求：",
+            "lineNumber": 32
+          },
+          {
+            "text": "1. 只能依据参考内容回答；若参考内容不足，请明确说明“根据当前检索结果无法确认”，并建议用户补充问题或转人工。",
+            "lineNumber": 33
+          },
+          {
+            "text": "2. 不得编造数字、时间、政策条款、流程、名单、结论。",
+            "lineNumber": 34
+          },
+          {
+            "text": "3. 回答采用结构化输出：优先使用“结论：”“依据：”“提示：”这样的结构；简单问题可只保留必要部分。",
+            "lineNumber": 35
+          },
+          {
+            "text": "4. 任何事实性结论后都必须附上证据编号，例如 [证据1]、[证据2]；不得写“根据经验”“通常来说”之类无证据表述。",
+            "lineNumber": 36
+          },
+          {
+            "text": "5. 简单问题简短答，复杂问题分阶段答（先结论再分点补充）。",
+            "lineNumber": 37
+          },
+          {
+            "text": "6. 若收到“重试说明”，表示上一版答案与参考内容关联度不足；你必须更加严格贴合参考内容重新生成。\"\"\"),",
+            "lineNumber": 38
+          },
+          {
+            "text": "    (\"human\", \"\"\"参考内容：",
+            "lineNumber": 39
+          },
+          {
+            "text": "{context}",
+            "lineNumber": 40
+          },
+          {
+            "lineNumber": 41
+          },
+          {
+            "text": "用户问题：{question}",
+            "lineNumber": 42
+          },
+          {
+            "lineNumber": 43
+          },
+          {
+            "text": "场景化补充要求：",
+            "lineNumber": 44
+          },
+          {
+            "text": "{scenario_guidance}",
+            "lineNumber": 45
+          },
+          {
+            "lineNumber": 46
+          },
+          {
+            "text": "重试说明：",
+            "lineNumber": 47
+          },
+          {
+            "text": "{retry_note}",
+            "lineNumber": 48
+          },
+          {
+            "lineNumber": 49
+          },
+          {
+            "text": "请基于参考内容回答：\"\"\"),",
+            "lineNumber": 50
+          },
+          {
+            "text": "])",
+            "lineNumber": 51
+          },
+          {
+            "lineNumber": 52
+          },
+          {
+            "lineNumber": 53
+          },
+          {
+            "text": "def _format_sources(rag_result: RAGRetrieveResult) -&gt; str:",
+            "lineNumber": 54,
+            "isSignature": true
+          },
+          {
+            "text": "    \"\"\"",
+            "lineNumber": 55
+          }
+        ]
+      },
+      "score": 0.3165212869644165
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "chunk|slice|split|overlap|rag_chunk",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "glob": "*.py",
+  "outputMode": "content",
+  "contextBefore": 0,
+  "contextAfter": 0,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "chunk|slice|split|overlap|rag_chunk",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 15,
+  "totalMatches": 285,
+  "topFiles": [
+    {
+      "uri": "src/kb/rag.py",
+      "matchCount": 16
+    },
+    {
+      "uri": "api/main.py",
+      "matchCount": 34
+    },
+    {
+      "uri": "src/answer_cache.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "src/agents/chat_agent.py",
+      "matchCount": 9
+    },
+    {
+      "uri": "src/qa_monitoring.py",
+      "matchCount": 4
+    },
+    {
+      "uri": "src/kb/text2sql.py",
+      "matchCount": 2
+    },
+    {
+      "uri": "src/doc/mineru_client.py",
+      "matchCount": 56
+    },
+    {
+      "uri": "src/doc/milvus_upload.py",
+      "matchCount": 12
+    },
+    {
+      "uri": "src/doc/validation.py",
+      "matchCount": 56
+    },
+    {
+      "uri": "src/kb/__init__.py",
+      "matchCount": 3
+    },
+    {
+      "uri": "src/kb/engine.py",
+      "matchCount": 51
+    },
+    {
+      "uri": "src/kb/chunking.py",
+      "matchCount": 27
+    },
+    {
+      "uri": "src/kb/qa_store.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "src/llm.py",
+      "matchCount": 6
+    },
+    {
+      "uri": "config/settings.py",
+      "matchCount": 7
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have a good picture of chunking. Now I need to check:
+1. Version management - doc_id, doc version, collection version?
+2. Gray release / canary - any rollout logic?
+3. Reflow - re-ingestion, doc update, incremental update?
+
+Let me search for version, doc_id, collection, reflow, gray, 灰度.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "version|doc_id|collection|reflow|灰度|gray|canary",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "glob": "*.py",
+  "outputMode": "content",
+  "contextBefore": 0,
+  "contextAfter": 0,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "version|doc_id|collection|reflow|灰度|gray|canary",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 10,
+  "totalMatches": 78,
+  "topFiles": [
+    {
+      "uri": "src/kb/chunking.py",
+      "matchCount": 5
+    },
+    {
+      "uri": "src/qa_monitoring.py",
+      "matchCount": 4
+    },
+    {
+      "uri": "src/answer_cache.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "config/settings.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "src/kb/rag.py",
+      "matchCount": 11
+    },
+    {
+      "uri": "api/main.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "src/kb/engine.py",
+      "matchCount": 6
+    },
+    {
+      "uri": "src/doc/milvus_upload.py",
+      "matchCount": 20
+    },
+    {
+      "uri": "src/doc/mineru_client.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "src/db_resilience.py",
+      "matchCount": 28
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/chunking.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/doc/milvus_upload.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+The project has:
+- Chunking: chunking.py with child_chunk_size, parent_overlap, parent_ctx_len; mineru_client uses rag_default_chunk_size, rag_parent_overlap; structured chunk_id (doc_name-pN-bN-cN).
+- No explicit version management of documents - doc_id is task_id from upload, no version field.
+- No gray/canary rollout in the codebase.
+- No reflow - upload is "replace" by doc_id? Let me check - upload_parse_result just inserts; there's no "delete by doc_id then insert" or versioned collection. So currently it's append-only per upload (new task_id each time), so same doc re-uploaded would create duplicate chunks with new doc_id (new task_id). So no document versioning, no delete-old-before-insert reflow.
+
+I'll write a doc that:
+1. Explains the project's slicing strategy (parent-child, overlap, config, chunk_id).
+2. Explains version management in general and what the project has (doc_id = task_id, no version field) and what could be added.
+3. Explains gray release in RAG context (traffic split by collection/version, feature flag, shadow read) and that the project doesn't have it.
+4. Explains reflow (re-ingestion, doc update, delete-then-insert, incremental) and what the project has (upload = append, same doc again = new task_id = duplicate) and what could be added.
+</details></think>
+
+---
+
+
+正在撰写 RAG 切片策略、版本管理、灰度与回流的说明文档。
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/config/settings.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/doc/mineru_client.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have enough. The project does not delete old chunks when re-uploading - upload_parse_result just does an insert. So if you upload the same document again with a new task_id, you get duplicate content with different doc_id. There's no "update document" or "delete by doc_id then insert" flow. I'll document this and suggest reflow as an improvement.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/RAG_CHUNKING_VERSION_GRAY_REFLOW.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Done. I'll give the user a short summary.
+</details></think>
+
+---
+
+
+已经写好 **`docs/RAG_CHUNKING_VERSION_GRAY_REFLOW.md`**，按你问的四个点分开说明，并对照了本项目实现。
+
+**文档结构概览：**
+
+1. **切片策略**
+   - **目标**：子块用于向量检索，父块提供上下文，父块间重叠减少边界割裂。
+   - **实现**：`chunking.py` 里子块按 `child_chunk_size` 滑动窗口（无重叠），父块长度 `parent_ctx_len`、重叠 `parent_overlap`（默认 150）；`mineru_client` 用 `rag_default_chunk_size`、`rag_parent_overlap` 调用，并分配结构化 `chunk_id`（`文档名-p页码-b父块-c子块`）。
+   - **配置**：`rag_default_chunk_size`（512）、`rag_parent_overlap`（150）、`rag_chunk_sizes`（多尺寸实验用）。
+
+2. **版本管理**
+   - **含义**：文档多版本、索引/集合多版本，便于区分当前生效与历史。
+   - **现状**：只有上传时的 `task_id` 作为 `doc_id`，无 `doc_version` 等字段；同一文档再次上传会得到新 doc_id，形成多套 chunk 并存。
+   - **可扩展**：元数据加 `doc_version`/`upload_id`，检索按版本过滤；结合“按 doc 先删后写”实现同文档更新。
+
+3. **灰度**
+   - **含义**：新策略/新索引只对部分流量生效，对比效果后再全量。
+   - **现状**：无内置灰度，只用单一 collection 和当前 RAG 流程。
+   - **可扩展**：配置主/灰度 collection 或 version，按用户/比例分流，观测打标后对比再全量。
+
+4. **回流**
+   - **含义**：文档或策略变更后，重新切片、向量化并写回，使检索与最新数据一致。
+   - **现状**：上传只做插入，不按 doc_id 删旧；同一文档重复上传会产生多份 chunk（不同 doc_id）。
+   - **可扩展**：按 doc_id（或业务主键）先删该文档旧 chunk 再写入新 chunk；支持全量回流脚本或按 doc 的增量回流。
+
+面试时可以直接说：**切片**是父子块 + 父块重叠、可配置；**版本**目前没有，可以加版本字段和按版本过滤；**灰度**目前没有，可以在应用层做分流和观测；**回流**目前是“只插不删”，可以做成按 doc 先删后写或全量重建。
+
+---
+
+_**User**_
+
+流式和预加载怎么实现?
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user is asking about how streaming and preloading are implemented in this project. I need to search for:
+1. Streaming - SSE, stream response, astream, stream chunks
+2. Preloading - preload, warmup, load on startup, lazy load
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "stream|StreamingResponse|astream|\\.stream\\(",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "glob": "*.py",
+  "outputMode": "content",
+  "contextBefore": 0,
+  "contextAfter": 0,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "stream|StreamingResponse|astream|\\.stream\\(",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 4,
+  "totalMatches": 46,
+  "topFiles": [
+    {
+      "uri": "src/llm.py",
+      "matchCount": 4
+    },
+    {
+      "uri": "src/agents/chat_agent.py",
+      "matchCount": 4
+    },
+    {
+      "uri": "src/kb/engine.py",
+      "matchCount": 6
+    },
+    {
+      "uri": "api/main.py",
+      "matchCount": 32
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "preload|warm|load.*startup|lazy|get_bge|get_rag|get_graph",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "glob": "*.py",
+  "outputMode": "content",
+  "contextBefore": 0,
+  "contextAfter": 0,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "preload|warm|load.*startup|lazy|get_bge|get_rag|get_graph",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 8,
+  "totalMatches": 21,
+  "topFiles": [
+    {
+      "uri": "src/kb/__init__.py",
+      "matchCount": 2
+    },
+    {
+      "uri": "src/kb/rag.py",
+      "matchCount": 4
+    },
+    {
+      "uri": "src/graph/app.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "src/doc/milvus_upload.py",
+      "matchCount": 2
+    },
+    {
+      "uri": "src/kb/embedding_loader.py",
+      "matchCount": 2
+    },
+    {
+      "uri": "src/graph/__init__.py",
+      "matchCount": 2
+    },
+    {
+      "uri": "src/kb/engine.py",
+      "matchCount": 2
+    },
+    {
+      "uri": "api/main.py",
+      "matchCount": 6
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I need more detail on:
+1. Streaming - the full flow from API to LLM/engine stream, SSE format
+2. Preloading - embedding_loader (lru_cache? lazy?), graph creation, RAG retriever singleton. Let me check embedding_loader and graph/app for when things are loaded.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/embedding_loader.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/graph/app.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+So:
+- Streaming: API returns StreamingResponse with _chat_stream_generator which yields SSE (data: {...}\n\n). The generator does: lock -> ensure state -> resume -> 15-turn check -> cache check -> confirm execute or graph.ainvoke/stream. For chat: chat_agent_stream_async which uses chain.astream. For knowledge: engine.aquery_stream which yields chunks. So the flow is async generator -> SSE.
+- Preloading: Currently there's NO explicit preload in lifespan. BGE embedding and reranker are lazy (first get_bge_embedding() loads). Graph is lazy (first get_graph() creates). RAG retriever is lazy (get_rag_retriever() singleton). So the project uses lazy loading, not startup preload. I should document both: how streaming is implemented, and how "preload" could be done (and that currently it's lazy).
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/llm.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I see that RAG path in aquery_stream does NOT use astream for the answer - it calls _generate_grounded_answer_async which likely uses ainvoke (full response) then _yield_text_chunked to simulate streaming. Let me check _generate_grounded_answer_async.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "_generate_grounded_answer_async|astream|ainvoke",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py",
+  "contextBefore": 0,
+  "contextAfter": 3,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "_generate_grounded_answer_async|astream|ainvoke",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py",
+  "outputMode": "content",
+  "totalFiles": 1,
+  "totalMatches": 9,
+  "topFiles": [
+    {
+      "uri": "src/kb/engine.py",
+      "matchCount": 36
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+So in aquery_stream, the RAG path uses ainvoke (full response) then _yield_text_chunked to break the full answer into 64-char chunks for streaming. So it's "fake" streaming for RAG - the LLM generates the full answer first, then we yield it in chunks. The comment in the docstring says "RAG 使用 LLM astream" but the code actually uses ainvoke. I'll document what's actually there: chat path uses real astream (chat_agent_stream_async -> chain.astream), knowledge/RAG path uses ainvoke + _yield_text_chunked for the answer part (so first token delay is higher for RAG). I'll write the doc accordingly and mention that RAG could be upgraded to astream for true token-by-token.
+</details></think>
+
+---
+
+
+正在撰写流式与预加载的实现说明文档。
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/STREAMING_AND_PRELOAD.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Done. I'll give the user a short summary.
+</details></think>
+
+---
+
+
+已经写好 **`docs/STREAMING_AND_PRELOAD.md`**，按「流式」和「预加载」分开说明，并对照了当前实现。
+
+**文档结构概览：**
+
+1. **流式实现**
+   - **整体链路**：`POST /chat/stream` → `StreamingResponse` + 异步生成器 → 会话锁 → `_chat_stream_generator_impl`，按路由走闲聊或知识库，每个 chunk 用 SSE 写出。
+   - **SSE**：`media_type="text/event-stream"`，每条 `data: {JSON}\n\n`，含 `text`、结束时的 `done`、`conversation_id` 等；响应头带 `Cache-Control`、`X-Accel-Buffering` 避免代理缓冲。
+   - **闲聊**：`chat_agent_stream_async` 里用 `chain.astream(...)`，底层 LLM 真实逐 token 流，首字延迟接近模型首包。
+   - **知识库**：QA/Text2SQL 用 `_yield_text_chunked` 把结果字符串按 64 字一段 yield；**RAG 生成**当前是 `_generate_grounded_answer_async` 里 **ainvoke 拿整段答案**，再 `_yield_text_chunked` 分段推，属于「先整段再拆」的模拟流式；文档中说明了若改为 `astream` 可实现真实 RAG 流式及需处理的点（如 grounding 重试）。
+   - **缓存命中**：整段缓存答案按「首字 + 剩余按段」yield，保证流式展示。
+
+2. **预加载实现**
+   - **现状**：没有在 lifespan 里做统一预加载；BGE 向量/重排、RAG 检索器、LangGraph 图、Milvus、DeepSeek 池等都是**懒加载单例**（首次调用时加载），因此首条相关请求会承担冷启动耗时。
+   - **可扩展**：在 lifespan 的 `yield` 之前按需调用 `get_bge_embedding()`、`get_bge_reranker()`、`get_rag_retriever()`、`get_graph()` 以及 Milvus 连接，实现预加载，降低首请求延迟；并说明预加载会拉长启动时间和占用内存，可按场景取舍。
+
+文末有**小结表**（各路径是否真实 LLM 流、实现方式）和**面试可答要点**，方便你口述或扩展。
+
+---
+
+_**User**_
+
+那你现在把项目实现为真正的流式
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user wants me to implement true streaming for the RAG path. Currently, as documented in STREAMING_AND_PRELOAD.md, the RAG generation uses `ainvoke` to get the full answer and then `_yield_text_chunked` to simulate streaming. I need to:
+
+1. Change RAG generation to use `astream` instead of `ainvoke` in the streaming path
+2. Handle the grounding/regeneration logic - this is tricky because with true streaming we don't have the full answer until the end, so we can't compute grounding_score or has_evidence_citations until after the stream completes. So the flow would be:
+   - Option A: Stream tokens to user, then after stream ends run grounding check on the full answer; if fail, we've already sent the answer - we could either send a "correction" message or just accept it (degraded). For "regenerate" we'd need to not stream the first attempt and buffer it, check score, then either stream it or retry - that would make first response slow again.
+   - Option B: Stream the first generation; when done, compute grounding; if fail, don't regenerate (or regenerate and append as a second message). Simpler but no multi-attempt improvement in stream path.
+   - Option C: For streaming we do one pass only: astream the response, collect the full text as we go and stream each chunk to user. After stream ends we run grounding check and record in trace; we do NOT regenerate in stream mode (to keep true streaming). So: true token-by-token stream, single attempt, grounding recorded for monitoring only.
+
+I'll go with Option C for true streaming: use astream in the RAG path when we're in aquery_stream, yield each token as it comes, collect full answer for post-stream grounding check (for trace/observability only, no regenerate). This gives real first-token latency improvement. If we want to support regenerate in stream mode we could do something like: buffer first full response, check grounding, if fail stream a second response (with a separator like "【修正】" or just append) - but that's more complex. Let me stick to single-pass stream with grounding recorded.
+
+Let me find the exact code to change:
+
+1. In engine.py we have `aquery_stream` which calls `_generate_grounded_answer_async` and then `_yield_text_chunked(answer_text)`. I need to add a new method like `_generate_grounded_answer_async_stream` that uses `astream` and yields chunks, and at the end runs grounding check and sets trace (no regenerate).
+
+2. The sync `_generate_grounded_answer` does up to max_times attempts with retry_note. For streaming we have two choices:
+   - Single attempt, stream tokens, then check grounding (no retry) - simpler, true streaming.
+   - Buffer first attempt in memory, check grounding, if fail then stream second attempt (so user sees first attempt then second) - weird UX. Or: don't stream first attempt, check, then stream only the final one - but then we're not improving first-token latency for the failure case.
+
+I'll implement: streaming path uses astream, single attempt, yield each token; after stream completes we compute grounding and set trace (for monitoring). No regenerate in stream mode. So the streaming RAG path will have slightly different behavior (no retry on low grounding) but true token-by-token streaming. We could add a note in doc that "streaming path does one attempt only; for full regeneration logic use non-stream endpoint."
+
+Let me implement.
+
+I need to:
+1. In engine.py add a method that uses _rag_chain.astream(), yields each chunk's content, collects full answer for post-stream grounding check and trace update.
+2. In aquery_stream, call this new method instead of _generate_grounded_answer_async + _yield_text_chunked.
+
+Check LangChain: chain.astream() for ChatPromptTemplate | LLM typically yields chunks. Each chunk might be AIMessageChunk with content being the delta. So we need to iterate async and yield content deltas.
+
+Let me look at how chat_agent does it: `async for chunk in chain.astream(...)` then `if hasattr(chunk, "content") and chunk.content: yield chunk.content`. So chunk is the final message chunk with content being the delta. For a chain, astream might yield dict with key being the last component - need to check. In LangChain LCEL, chain.astream() typically streams the final output, so each event might be the chunk from the LLM. Let me assume we get chunks with .content (AIMessageChunk) and we yield that content.
+
+Implementation:
+
+1. Add `async def _generate_grounded_answer_stream(self, question, rag_result, trace) -> AsyncIterator[str]`: 
+   - Build context, scenario_guidance, retry_note (empty for single attempt)
+   - Call self._rag_chain.astream(...) and async for chunk: if chunk has content, yield content (and accumulate for later check)
+   - After loop: full_text = accumulated. Run _answer_grounding_score and _answer_has_evidence_citations. Update trace. No regenerate.
+
+2. In aquery_stream, for RAG branch: instead of answer_text = await _generate_grounded_answer_async(...) then for c in _yield_text_chunked(answer_text), do: async for c in self._generate_grounded_answer_stream(...): yield c
+
+Let me also handle the case where the stream returns empty or the model fails - we should have a fallback message. And we need to accumulate the full text - in LangChain astream the chunk might be the full message so far or the delta. I'll assume each chunk has the incremental content (delta). So we accumulate: full_text += chunk.content.
+
+Let me read the engine code again to see the exact signatures and where to plug in.
+</details></think>
+
+---
+
+
+实现 RAG 的真实流式生成：在知识库流式路径用 `astream` 逐 token 输出，并在流结束后做一次 grounding 检查并写入 trace（流式路径不做多轮重试）。
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I need to:
+1. Add a new async generator method `_generate_grounded_answer_stream` that:
+   - Builds context, scenario_guidance, retry_note=""
+   - Uses self._rag_chain.astream(...) and yields each content delta
+   - Accumulates full text for post-stream grounding check
+   - After stream ends, runs grounding score and citation check, updates trace (single attempt, no regenerate)
+   - Handles exception: yield fallback message and set trace
+
+2. In aquery_stream, replace the RAG block that does:
+   answer_text = await self._generate_grounded_answer_async(question, rag_result, trace)
+   for c in self._yield_text_chunked(answer_text):
+       yield c
+   with:
+   async for c in self._generate_grounded_answer_stream(question, rag_result, trace):
+       yield c
+
+LangChain LCEL: chain.astream() yields events. For a prompt | llm chain, the stream typically yields the final output from the LLM, so each yield might be an AIMessageChunk with .content being the delta. Let me check - in LangChain, when you do chain.astream(), you get the stream of the last component. So we get chunks of AIMessage. We need to get the content from each chunk. So async for chunk in self._rag_chain.astream(...): then we need to get the content. The chunk might be a dict with "content" key or an AIMessageChunk. I'll use getattr(chunk, "content", None) or chunk.get("content") if it's dict. And we need to accumulate: full += content.
+
+Let me implement. I'll add the method after _generate_grounded_answer_async.
+</details></think>
+
+---
+
+
+添加 RAG 的真实流式生成方法，并在 `aquery_stream` 中改为使用该流式生成。
+
+
+---
+
+<tool-use data-tool-type="task" data-tool-name="todo_write">
+<details><summary>Tool use: **todo_write** • Todo List</summary>
+
+- [-] Add _generate_grounded_answer_stream (astream) in engine.py
+- [ ] Use it in aquery_stream and update doc
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+LangChain chain.astream() - for a chain that ends with an LLM, the default stream mode yields the final LLM output. So we get something like AIMessageChunk with .content. Let me check - in Python LangChain, when you iterate chain.astream(), you get the streamed output of the last runnable. So each item could be a message chunk. I'll use: async for event in self._rag_chain.astream(...): content = event.content if hasattr(event, 'content') else (event.get('content') if isinstance(event, dict) else None); if content: yield content (and accumulate).
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now I need to change aquery_stream to use _generate_grounded_answer_stream instead of _generate_grounded_answer_async + _yield_text_chunked. The current code is:
+
+        answer_text = await self._generate_grounded_answer_async(question, rag_result, trace)
+        for c in self._yield_text_chunked(answer_text):
+            yield c
+
+Replace with:
+
+        async for c in self._generate_grounded_answer_stream(question, rag_result, trace):
+            yield c
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+LangChain's chain.astream() - I need to verify the event shape. For LCEL, astream() on a chain typically yields the streamed output of the last runnable. So for ChatPromptTemplate | LLM, the last runnable is the LLM, and we get AIMessageChunk or similar. So event.content should work. But sometimes the chain yields dict with key being the variable name - e.g. for a chain that returns {"messages": [...]}, we might get events with key "messages". Our chain is _RAG_PROMPT | self._llm, so the output is the raw LLM output (AIMessage). So astream should yield chunks of that message. Let me check - in LangChain, when you do chain.astream(), the default is to stream the final output. So we get chunks of the final AIMessage. So each chunk has .content. Good.
+
+One issue: in Python 3.9+ AsyncIterator from typing is fine. We're yielding str. But we're appending content to full_text - content might be a single character or a token. So "".join(full_text) is correct.
+
+Let me double-check: _yield_text_chunked is a sync generator (def _yield_text_chunked). So in _generate_grounded_answer_stream we're doing "for c in self._yield_text_chunked(...): yield c" - that's valid in an async generator, we're just yielding sync-iterated values. Good.
+
+I need to add the List import if not present - we have from typing import ... List. Good.
+</details></think>
+
+---
+
+
+检查 LangChain 的 `astream` 返回的事件结构，确保能正确取到 `content`：
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "astream|\\.content",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/agents/chat_agent.py",
+  "contextBefore": 0,
+  "contextAfter": 1,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "astream|\\.content",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/agents/chat_agent.py",
+  "outputMode": "content",
+  "totalFiles": 1,
+  "totalMatches": 7,
+  "topFiles": [
+    {
+      "uri": "src/agents/chat_agent.py",
+      "matchCount": 11
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="read_lints">
+<details>
+<summary>Tool use: **read_lints**</summary>
+
+
+Parameters:
+
+```json
+{
+  "paths": [
+    "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py"
+  ]
+}
+```
+Result:
+
+```json
+{
+  "linterErrorsByFile": [
+    {
+      "relativeWorkspacePath": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py"
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+In chat_agent, chain.astream() yields chunks that have .content. But our chain is _RAG_PROMPT | self._llm - the output of the chain is the LLM output. When you call chain.astream(input), LangChain streams the final output. For a prompt | llm chain, the final output is the AIMessage from the LLM. So each stream event might be the full message with "content" being the delta - I need to check. Actually in LangChain, when the last runnable is an LLM, astream typically yields AIMessageChunk objects, each with .content being the incremental delta. So we're good. But wait - in our chain we have multiple input variables (context, question, scenario_guidance, retry_note). The chain output is a single AIMessage. So astream yields chunks of that message. So event.content should be the delta string. Good. Let me also handle the case where the LLM returns content in a different shape (e.g. some LLMs return dict). I already have isinstance(content, str) check. Good.
+
+Update the doc STREAMING_AND_PRELOAD.md to say RAG now uses true streaming.
+</details></think>
+
+---
+
+
+正在更新文档并标记任务完成。
+
+
+---
+
+<tool-use data-tool-type="task" data-tool-name="todo_write">
+<details><summary>Tool use: **todo_write** • Todo List</summary>
+
+- [x] Add _generate_grounded_answer_stream (astream) in engine.py
+- [-] Use it in aquery_stream and update doc
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/STREAMING_AND_PRELOAD.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/STREAMING_AND_PRELOAD.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/STREAMING_AND_PRELOAD.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I need to fix the doc - the "1.5" section still says "RAG 生成... 内部使用 _rag_chain.ainvoke" in the first bullet. Let me re-read the file and fix any remaining inconsistency. Actually I already replaced that paragraph. Let me also fix the "1.2 整体链路" which might still say "RAG 生成用 ainvoke".
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/STREAMING_AND_PRELOAD.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<tool-use data-tool-type="task" data-tool-name="todo_write">
+<details><summary>Tool use: **todo_write** • Todo List</summary>
+
+- [x] Add _generate_grounded_answer_stream (astream) in engine.py
+- [x] Use it in aquery_stream and update doc
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+LangChain LCEL chain.astream() - when the chain is prompt | llm, the stream events might be per-token from the LLM. But I've seen that sometimes the stream yields the full message chunk with "content" being the cumulative or delta. Let me check - in ChatOpenAI.astream, it typically yields AIMessageChunk with content being the delta. So we're good. One more thing: in our _generate_grounded_answer_stream we're yielding content directly (the string). So the API layer will get many small strings (one per token or a few tokens). That's correct for true streaming. The api main.py already does: async for chunk in engine.aquery_stream(...): yield f"data: {json.dumps({'text': chunk}, ...)}\n\n" - so each chunk is sent as one SSE event. Perfect.
+</details></think>
+
+---
+
+
+已按「真实流式」改完，变更总结如下。
+
+## 1. 新增流式生成方法（`src/kb/engine.py`）
+
+- **`_generate_grounded_answer_stream(question, rag_result, trace)`**  
+  - 异步生成器，内部用 **`_rag_chain.astream(payload)`** 逐 token 消费并 **yield 每个 content 片段**（不再先 ainvoke 再按段 yield）。  
+  - 边流式输出边把片段拼成 `full_text`，流结束后用 `_answer_grounding_score`、`_answer_has_evidence_citations` 做一次 grounding 检查，并写 trace（`grounding_score`、`has_evidence_citations`、`final_status`、`fallback_reason`）。  
+  - **流式路径不做多轮重试**：只生成一次，保证首字延迟 ≈ 检索时间 + 模型首包；非流式接口仍保留 `_generate_grounded_answer_async` 的多轮重试逻辑。  
+  - 异常时 yield 兜底文案，并设置 `trace.final_status` / `fallback_reason`。
+
+## 2. 知识库流式入口改为走流式生成
+
+- **`aquery_stream`** 中 RAG 分支由原来的  
+  `answer_text = await self._generate_grounded_answer_async(...); for c in _yield_text_chunked(answer_text): yield c`  
+  改为  
+  **`async for c in self._generate_grounded_answer_stream(question, rag_result, trace): yield c`**。  
+- 这样走知识库的 `POST /chat/stream` 会从「整段再拆」变为 **LLM 真实逐 token 流式**，首字更快。
+
+## 3. 文档更新（`docs/STREAMING_AND_PRELOAD.md`）
+
+- 已把 RAG 流式描述改为：使用 `_generate_grounded_answer_stream` + `astream`，流结束后做一次 grounding 并写 trace，不做多轮重试。  
+- 小结表里「知识库 RAG」一行已改为「是」真实流式，并注明实现方式。
+
+**行为差异**：非流式 `aquery` / `aquery_stream` 里原来的 RAG 多轮 grounding 重试仍由 `_generate_grounded_answer_async` 负责；流式路径只做单次生成 + 流式输出 + 一次 grounding 记录，在首包延迟和「多轮重试」之间做了取舍。
+
+---
+
+_**User**_
+
+那你给我准备几个项目真实踩坑故事,我面试用
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user wants me to prepare several "real project pitfall stories" (踩坑故事) for interview use, based on this codebase. I should derive these from the actual design and code we've seen - things like:
+
+1. Streaming: RAG was originally "ainvoke then chunk" - fake streaming, first token delay was high; we fixed it with astream but had to give up multi-round grounding retry in stream path.
+2. Lock: When we added conversation lock, the stream endpoint lost the "load state from DB / resume interrupted / 15-turn check" because they were moved and not re-added inside the generator - a regression that had to be fixed.
+3. Cache: Hot key / cache stampede - single-flight lock and local LRU were added for that.
+4. Circuit breaker: DB/Milvus critical vs non-critical - if everything is critical, one dependency can take down the whole service.
+5. Prompt: RAG grounding - model sometimes doesn't cite [证据N], so we had to add retry with retry_note and citation check.
+6. Text2SQL: Multi-table JOIN had to use human-configured relations to avoid Cartesian product; time range from natural language had to be parsed and injected into prompt.
+7. Observation/trace: We had to add latency_ms, route, trace per request to find bottlenecks - without stage timing initially we could only infer from route.
+8. Chunking: Parent overlap 150 to avoid cutting semantics at boundary; structured chunk_id for traceability.
+9. Session lock: Without it, same conversation concurrent requests could corrupt state (e.g. pending_sql, graph state).
+
+I'll write 5-7 short, concrete "pitfall + what we did" stories in Chinese that sound like real war stories, grounded in this project's actual implementation.
+</details></think>
+
+---
+
+
+根据项目里的设计、文档和实现，整理了几条可直接在面试里讲的「踩坑 + 应对」故事，都对应真实代码/设计点。
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/INTERVIEW_PITFALL_STORIES.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Done. I gave 8 concrete stories, all grounded in the project. I'll give the user a short summary.
+</details></think>
+
+---
+
+
+已经写好 **`docs/INTERVIEW_PITFALL_STORIES.md`**，里面放了 **8 个**可直接在面试里讲的踩坑故事，都对应项目里的真实设计/实现。
+
+| # | 主题 | 一句话 |
+|---|--------|--------|
+| 1 | **流式「假流式」** | RAG 用 ainvoke 再按段推，首字慢；改成 astream 真流式，流式路径不做多轮重试。 |
+| 2 | **加锁后流式少逻辑** | 会话锁重构时，流式里漏了「恢复中断 + 15 轮校验」；后来在生成器内部补回。 |
+| 3 | **缓存击穿** | 同一问题高并发未命中一起回源；加单飞锁 + 可选热 key 本地 LRU。 |
+| 4 | **依赖抖整站 500** | DB/Milvus 不区分关键/非关键，全抛错；做熔断 + critical 降级。 |
+| 5 | **RAG 无依据/幻觉** | 仅靠 prompt 不够；加 grounding 校验 + 非流式多轮重试，流式只记 trace。 |
+| 6 | **Text2SQL 多表乱关联** | 模型自造 JOIN 导致笛卡尔积；人工维护表间关联 + prompt 约束 + 校验 + 写操作人工确认。 |
+| 7 | **慢不知道卡在哪** | 只有总延迟和 route；用 trace 字段粗定位，文档里写清可加分段耗时。 |
+| 8 | **同会话并发状态错乱** | 多端同时发导致 pending_sql/图状态被覆盖；加会话锁串行化写。 |
+
+每个故事都按 **「现象 → 原因 → 怎么改 → 收获」** 写好了，你面试时挑 2～3 个讲即可，每个控制在 1～2 分钟。文档末尾有**使用建议**：按岗位选（后端/高并发多讲 3、4、8；RAG/算法多讲 1、5、6），被追问时可以对应到具体模块或文档名。
+
+---
+
+_**User**_
+
+讲讲langchain\langgraph的检索、记忆、调度机制,整理出瓶颈和优化点
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user wants me to explain the retrieval, memory, and scheduling mechanisms in LangChain/LangGraph in the context of this project, and then summarize bottlenecks and optimization points. I need to search the codebase for how LangChain/LangGraph are used - checkpointer, memory, state, graph, retrieval (RAG), and scheduling (supervisor, conditional edges).
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/graph/app.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/agents/state.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "checkpointer|MemorySaver|RedisSaver|get_state|update_state",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "glob": "*.py",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "checkpointer|MemorySaver|RedisSaver|get_state|update_state",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 3,
+  "totalMatches": 55,
+  "topFiles": [
+    {
+      "uri": "src/graph/app.py",
+      "matchCount": 19
+    },
+    {
+      "uri": "config/settings.py",
+      "matchCount": 3
+    },
+    {
+      "uri": "api/main.py",
+      "matchCount": 33
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I need to understand:
+1. Retrieval - in this project RAG retrieval is not inside LangGraph as a "tool" or "retriever node"; it's inside the knowledge_agent which calls the KnowledgeEngine (RAG + QA + Text2SQL). So LangChain/LangGraph's "retrieval" here is: the graph doesn't have a built-in retriever; we have a custom knowledge node that does retrieval outside (in engine). LangChain has things like create_retrieval_chain, etc. LangGraph's "retrieval" in general is often done via tools or a node that calls a retriever. So I'll describe both the general mechanism and how this project does it.
+
+2. Memory - LangGraph checkpointer (MemorySaver / RedisSaver) stores state per thread_id after each step; state includes messages (with add_messages reducer). Long-term memory in this project is PostgreSQL (chat_history) - loaded into state when needed. So we have: short-term = checkpointer (in-memory or Redis), long-term = PostgreSQL, and we merge them at request start (_ensure_state_from_db).
+
+3. Scheduling - LangGraph: START -> supervisor (conditional_edges) -> chat | knowledge | human | __end__; then chat/knowledge have conditional_edges to human or __end__. So the "scheduler" is the supervisor node + route_to_agent (rule-based or LLM). I need to explain conditional_edges, the single "supervisor" pattern, and where bottlenecks are.
+
+Let me also check how knowledge_agent invokes retrieval and how the state flows.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/agents/knowledge_agent.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/agents/supervisor.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Now I have a clear picture. Let me also quickly check: RAG retrieval in this project is inside KnowledgeEngine (rag.retrieve_with_validation), not a LangChain "retriever" in the graph. So:
+- Retrieval: LangChain has retrieval chains (create_retrieval_chain, etc.); LangGraph can have nodes that call retrievers. In this project, retrieval is encapsulated in the knowledge node via KnowledgeEngine (QA → Text2SQL → RAG retrieve + generate). So the "retrieval" in the graph is opaque - the graph doesn't see the retriever, only the knowledge node's input/output.
+- Memory: (1) Short-term: LangGraph checkpointer (MemorySaver or Redis) stores full state after each step by thread_id. (2) Long-term: PostgreSQL chat_history, loaded in _ensure_state_from_db when state is empty. (3) Reducer: add_messages for messages field. (4) Runtime: pending_sql, interrupted in shared_state (memory or Redis).
+- Scheduling: Supervisor node returns next action; conditional_edges use route_to_agent(state) which reads state["next"]. So supervisor writes next, then the compiled graph's conditional_edges call route_to_agent to get the key. Bottlenecks: supervisor can be LLM call (latency); checkpointer write/read per step; loading from DB at start; knowledge node does full pipeline (retrieval + generation) in one go.
+
+I'll write a doc that explains:
+1. Retrieval in LangChain/LangGraph (general) and in this project (knowledge node encapsulates RAG)
+2. Memory: checkpointer (short-term), PostgreSQL (long-term), add_messages reducer, shared_state for pending_sql/interrupted
+3. Scheduling: supervisor + conditional_edges, single-hop (no loop back to supervisor in normal flow)
+4. Bottlenecks and optimization points
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/agents/context_summary.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "add_messages|reducer",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "add_messages|reducer",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 5,
+  "totalMatches": 35,
+  "topFiles": [
+    {
+      "uri": "src/agents/state.py",
+      "matchCount": 4
+    },
+    {
+      "uri": ".specstory/history/2026-03-07_15-28Z-casual-greeting.md",
+      "matchCount": 4
+    },
+    {
+      "uri": ".specstory/history/2026-03-11_05-30Z-项目优化建议.md",
+      "matchCount": 8
+    },
+    {
+      "uri": ".specstory/history/2026-03-07_03-48Z-基于langgraph的知识库智能体设计.md",
+      "matchCount": 18
+    },
+    {
+      "uri": ".specstory/history/2026-03-08_02-52Z-项目技术方案梳理.md",
+      "matchCount": 1
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have enough. Let me write the doc covering:
+1. LangChain/LangGraph retrieval - general (retriever, create_retrieval_chain) and in this project (knowledge node encapsulates engine: QA → Text2SQL → RAG)
+2. Memory - checkpointer (per-step snapshot by thread_id), reducer add_messages, long-term PostgreSQL, shared_state
+3. Scheduling - supervisor node, conditional_edges, route_to_agent, single-hop
+4. Bottlenecks and optimization
+</details></think>
+
+---
+
+
+正在撰写 LangChain/LangGraph 的检索、记忆与调度说明文档。
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/LANGCHAIN_LANGGRAPH_RETRIEVAL_MEMORY_SCHEDULING.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Done. I'll give the user a short summary.
+</details></think>
+
+---
+
+
+已经写好 **`docs/LANGCHAIN_LANGGRAPH_RETRIEVAL_MEMORY_SCHEDULING.md`**，按「检索 → 记忆 → 调度」讲清机制，并单独整理了瓶颈和优化点。
+
+**文档结构概览：**
+
+1. **检索**
+   - LangChain/LangGraph 常见用法：Retriever、链、图内工具/节点/封装。
+   - 本项目：检索不单独成节点，在 **knowledge 节点** 内完成（QA → Text2SQL → RAG）；图只看到 messages 进出的数据流，检索结果不写入 state。
+
+2. **记忆**
+   - **短期**：Checkpointer（MemorySaver / Redis）按 `thread_id` 存图状态；`messages` 用 **add_messages** 做增量追加。
+   - **长期**：PostgreSQL 存对话历史；请求入口 **`_ensure_state_from_db`** 在图 state 为空时从 DB 拉历史并注入，并恢复 pending_sql、interrupted 到 shared_state。
+   - **运行时**：pending_sql、interrupted 放在 shared_state（内存或 Redis），与 checkpoint 分离。
+   - **上下文**：最近 N 轮 + 按条截断 + 可选「旧消息摘要」再喂给 LLM。
+
+3. **调度**
+   - 图结构：START → supervisor → conditional_edges → chat | knowledge | human | __end__；子节点后 human | __end__；**单跳**，无循环。
+   - 路由：总控用规则 + LLM 写 `state["next"]`，**conditional_edges** 用 `route_to_agent(state)` 读 `next` 选边；调度 = 总控一次决策 + 图按 next 选边。
+
+4. **瓶颈表**
+   - 总控歧义时必调 LLM、checkpointer 每步写完整 state、长期记忆加载首请求多一次 DB+update_state、knowledge 整链耗时、窗口/摘要多 token 或多一次 LLM、多 worker 下 MemorySaver 不共享。
+
+5. **优化点表**
+   - 减少总控 LLM（扩充规则）、控制 checkpoint 体积/频率、长期记忆加载与 DB 优化、knowledge 检索缓存与参数、上下文/摘要策略、Redis checkpointer + 会话保持、多步/循环调度扩展。
+
+面试时可以直接说：**检索**在节点内封装、图不直接管检索；**记忆**是 checkpointer 短期 + PostgreSQL 长期 + add_messages + 窗口摘要；**调度**是单总控 + conditional_edges 单跳；然后按「瓶颈 → 优化」表挑几条讲即可。
+
+---
+
+_**User**_
+
+多agent协作如何保证状态一致?长对话如何做持久化?流式响应怎么优化用户体验?
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user is asking three questions:
+1. 多 agent 协作如何保证状态一致？
+2. 长对话如何做持久化？
+3. 流式响应怎么优化用户体验？
+
+I need to answer based on this project's implementation. I've already seen a lot of this - state is in AgentState with add_messages, checkpointer, conversation lock, _ensure_state_from_db, PostgreSQL for long-term, streaming with SSE and astream. Let me write a concise doc or add a section that answers these three in one place, grounded in the codebase.
+</details></think>
+
+---
+
+
+结合项目实现，整理一份针对这三个问题的说明文档。
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/LANGCHAIN_LANGGRAPH_RETRIEVAL_MEMORY_SCHEDULING.md</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "conversation_lock|persist|append|chat_history",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py",
+  "outputMode": "content",
+  "contextBefore": 0,
+  "contextAfter": 0,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "conversation_lock|persist|append|chat_history",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/api/main.py",
+  "outputMode": "content",
+  "totalFiles": 1,
+  "totalMatches": 100,
+  "topFiles": [
+    {
+      "uri": "api/main.py",
+      "matchCount": 100
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have enough. I'll create a single doc that answers:
+1. 多 agent 协作如何保证状态一致 - conversation lock, single state (AgentState), add_messages reducer, checkpointer per thread_id, one writer at a time
+2. 长对话如何做持久化 - PostgreSQL (append messages, session metadata, runtime state), _ensure_state_from_db on load, persist after each turn (conversation session + chat_messages + runtime_state)
+3. 流式响应怎么优化用户体验 - SSE, true streaming (astream for chat and RAG), first token fast, Cache-Control/X-Accel-Buffering, optional: typing indicator, chunk size
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="write" data-tool-name="edit_file_v2">
+
+<details><summary>Tool use: **edit_file_v2** • Edit file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/MULTI_AGENT_STATE_PERSISTENCE_STREAMING_UX.md</summary>
+
+</details>
+
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+Done. I'll give the user a short summary.
+</details></think>
+
+---
+
+
+已经写好 **`docs/MULTI_AGENT_STATE_PERSISTENCE_STREAMING_UX.md`**，按你提的三个问题分块说明，并都扣在项目实现上。
+
+**文档结构概览：**
+
+1. **多 Agent 协作如何保证状态一致**
+   - **单状态 + 单写路径**：共用一份 AgentState，用 add_messages 等 reducer 合并；每轮只走「总控 → 一个子节点」，由图的引擎一次合并、checkpointer 一次落盘。
+   - **会话锁**：对会改该会话的接口用 `conversation_lock(thread_id)`，同一 thread_id 串行，避免并发读-改-写导致覆盖或 pending_sql 错乱。
+   - **Checkpointer**：每步存整份 state、按 thread_id 取最新，没有多 agent 各写各导致的分片不一致。
+   - 小结表：单状态、单跳、会话锁、整份读写。
+
+2. **长对话如何做持久化**
+   - **两层**：短期 = checkpointer（MemorySaver/Redis）；长期 = PostgreSQL（消息历史、会话元数据、运行时状态）。
+   - **写入**：每轮结束后 `_persist_conversation_session`、`_persist_chat_messages`（追加本轮 2 条）、`_persist_runtime_state`（pending_sql、interrupted）。
+   - **加载**：入口 `_ensure_state_from_db` 在图 state 为空时从 PostgreSQL 按 thread_id 拉历史并 `aupdate_state` 注入，同时恢复 shared_state；重启或换 worker 后首请求即可恢复长对话。
+   - 可选：异步写、DB 不可用时降级不阻塞对话。
+
+3. **流式响应怎么优化用户体验**
+   - **后端**：SSE、闲聊/RAG 用 astream 真流式；`Cache-Control` / `X-Accel-Buffering` 避免缓冲；缓存与 QA/Text2SQL 也按段 yield；结束与错误用 `done`/error 明确事件。
+   - **前端可配合**：收到首条 data 就展示、打字机效果、loading 与取消、超时与重试提示。
+   - 小结表：真流式、不缓冲、一致分段、明确结束、前端首条即渲染等。
+
+文末有一小段**面试可答要点**，方便你按「状态一致 → 持久化 → 流式体验」三条线口述。
+
+---
+
+_**User**_
+
+如何设计上下文结果以提升模型推理能力
+
+---
+
+_**Agent (model default, mode Agent)**_
+
+<think><details><summary>Thought Process</summary>
+
+The user is asking how to design context/window to improve the model's reasoning ability. This involves:
+1. What context we feed to the model (messages, retrieval results, prompts)
+2. How we structure it (order, length, summarization, chunking)
+3. What we do in this project - context window, summary, truncation, RAG context format, etc.
+
+I should search the codebase for context-related design: llm_context_window_turns, summarization, truncation, RAG context building, prompt structure.
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="unknown" data-tool-name="ripgrep_raw_search">
+<details>
+<summary>Tool use: **ripgrep_raw_search**</summary>
+
+
+Parameters:
+
+```json
+{
+  "pattern": "context_window|summary|summarize|truncat|max_chars|messages_for_llm",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "glob": "*.py",
+  "outputMode": "content",
+  "contextBefore": 0,
+  "contextAfter": 0,
+  "caseInsensitive": false
+}
+```
+Additional data:
+
+```json
+{
+  "isPruned": true,
+  "pattern": "context_window|summary|summarize|truncat|max_chars|messages_for_llm",
+  "path": "/Users/nanqi/Desktop/常用文件/rag_code_rewritebyai",
+  "outputMode": "content",
+  "totalFiles": 9,
+  "totalMatches": 72,
+  "topFiles": [
+    {
+      "uri": "src/doc/validation.py",
+      "matchCount": 3
+    },
+    {
+      "uri": "src/qa_monitoring.py",
+      "matchCount": 1
+    },
+    {
+      "uri": "src/kb/engine.py",
+      "matchCount": 2
+    },
+    {
+      "uri": "src/chat_history.py",
+      "matchCount": 4
+    },
+    {
+      "uri": "config/settings.py",
+      "matchCount": 5
+    },
+    {
+      "uri": "src/agents/chat_agent.py",
+      "matchCount": 18
+    },
+    {
+      "uri": "api/main.py",
+      "matchCount": 8
+    },
+    {
+      "uri": "src/agents/supervisor.py",
+      "matchCount": 17
+    },
+    {
+      "uri": "src/agents/context_summary.py",
+      "matchCount": 14
+    }
+  ]
+}
+```
+Status: **completed**
+
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/docs/CONTEXT_SAVING.md</summary>
+
+</details>
+</tool-use>
+
+---
+
+<think><details><summary>Thought Process</summary>
+
+I have a good picture. Let me also look at RAG context structure (evidence numbering, scenario_guidance) and prompt structure to complete "context design for reasoning".
+</details></think>
+
+---
+
+
+
+
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/kb/engine.py</summary>
+
+</details>
+</tool-use>
+
+---
+
+<tool-use data-tool-type="read" data-tool-name="read_file_v2">
+<details><summary>Tool use: **read_file_v2** • Read file: /Users/nanqi/Desktop/常用文件/rag_code_rewritebyai/src/agents/context_summary.py</summary>
+
+</details>
+</tool-use>
+
+---
+

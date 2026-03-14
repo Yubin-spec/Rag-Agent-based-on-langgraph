@@ -332,6 +332,76 @@ class KnowledgeEngine:
             else last_answer
         )
 
+    async def _generate_grounded_answer_stream(
+        self,
+        question: str,
+        rag_result: RAGRetrieveResult,
+        trace: Optional[KnowledgeQueryTrace] = None,
+    ) -> AsyncIterator[str]:
+        """
+        流式版：用 astream 逐 token 产出，边收边 yield；流结束后做一次 grounding 检查并写 trace。
+        流式路径不做多轮重试（否则需缓冲整段再判，首包延迟无优势），仅单次生成并记录质量。
+        """
+        context = self._build_rag_context(rag_result)
+        if not context.strip():
+            if trace is not None:
+                trace.final_status = "rag_no_context"
+                trace.fallback_reason = "empty_context"
+            for c in self._yield_text_chunked("未找到相关知识，建议您换个问法或转人工客服。"):
+                yield c
+            return
+
+        settings = get_settings()
+        min_score = float(getattr(settings, "rag_answer_grounding_min_score", 0.18))
+        selected_templates = select_prompt_templates(question)
+        scenario_guidance = render_prompt_template_guidance(question)
+        if trace is not None:
+            trace.scenario_templates = [item.name for item in selected_templates]
+        payload = {
+            "context": context,
+            "question": question,
+            "scenario_guidance": scenario_guidance,
+            "retry_note": "",
+        }
+        full_text: List[str] = []
+
+        try:
+            async for event in self._rag_chain.astream(payload):
+                content = None
+                if hasattr(event, "content"):
+                    content = event.content
+                elif isinstance(event, dict):
+                    content = event.get("content")
+                if content and isinstance(content, str):
+                    full_text.append(content)
+                    yield content
+        except Exception:
+            full_text = []
+            fallback = "根据当前检索结果无法确认，建议您补充问题或转人工客服。"
+            for c in self._yield_text_chunked(fallback):
+                yield c
+            if trace is not None:
+                trace.final_status = "rag_fallback_unconfirmed"
+                trace.fallback_reason = "stream_exception"
+            return
+
+        answer_text = "".join(full_text).strip()
+        if not answer_text:
+            answer_text = "根据当前检索结果无法确认，建议您补充问题或转人工客服。"
+        score = self._answer_grounding_score(answer_text, rag_result)
+        has_citations = self._answer_has_evidence_citations(answer_text)
+        if trace is not None:
+            trace.grounding_score = score
+            trace.has_evidence_citations = has_citations
+            trace.regenerate_count = 0
+            if score >= min_score and has_citations:
+                trace.final_status = "rag_grounded"
+            else:
+                trace.final_status = "rag_fallback_unconfirmed"
+                trace.fallback_reason = (
+                    "low_grounding" if score < min_score else "missing_citations"
+                )
+
     def query(self, question: str) -> Tuple[str, Optional[str]]:
         """
         依次尝试 QA、Text2SQL、RAG，返回 (回复文案, 待确认 SQL 或 None)。
@@ -545,8 +615,7 @@ class KnowledgeEngine:
                 yield chunk
             return
 
-        answer_text = await self._generate_grounded_answer_async(question, rag_result, trace)
-        for c in self._yield_text_chunked(answer_text):
+        async for c in self._generate_grounded_answer_stream(question, rag_result, trace):
             yield c
 
         sources_block = _format_sources(rag_result)
