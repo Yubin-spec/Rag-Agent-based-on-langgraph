@@ -9,36 +9,122 @@
 ### 1.1 设计目标
 
 - 把长文档切成若干**子块**，便于向量化与检索；同时为每个子块提供**父块**（更大一段上下文），检索时既可精确定位片段，又能在生成阶段带上前后文，减少“半句话”割裂。
-- 相邻父块之间保留**重叠**，避免边界处的语义被硬切断。
+- **主题为父子分段**：以固定长度为基准划块，相邻父块保留重叠；不在句子中间、表格中间切断；对齐仅限小幅微调，避免语义/结构驱动导致切片过碎。
 
-### 1.2 本项目实现
+### 1.2 完整切片策略（默认流水线）
 
-| 层级 | 说明 |
-|------|------|
-| **子块（child）** | 按固定字符数 `child_chunk_size` 用滑动窗口切分，**子块之间无重叠**（step = size）。 |
-| **父块（parent）** | 以当前子块为中心，向前取 `parent_ctx_len` 字符作为该子块的“父块”；相邻子块的父块在边界处重叠约 `parent_overlap` 字符，保证衔接。 |
-| **chunk_id** | 结构化编号：`{doc_name}-p{page}-b{parent_block}-c{child_block}`，便于按文档、页码、块层级溯源。 |
+默认策略由**三步**组成，均在 `chunk_text()` 内顺序执行，对应实现位于 `src/kb/chunking.py`。
 
-**核心逻辑**（`src/kb/chunking.py`）：
+---
 
-- `_slide_windows(text, size, overlap)`：滑动窗口得到子块区间；上传时子块 overlap=0。
-- `chunk_text(full_text, child_chunk_size, parent_overlap, parent_ctx_len, doc_id)`：对全文做父子切片，每个子块带一段父块内容。
-- 可选 `chunk_text_multi_size()`：用多种 size（如 256/384/512/768）各切一份，便于做切块大小对比实验。
+#### 第一步：父子分段（基准）
 
-**调用链**：
+- **输入**：解析后的全文 `full_text`（字符串）。
+- **子块**：
+  - 按**固定长度** `child_chunk_size`（默认 512 字符）做滑动窗口，得到子块区间 `(start, end)`。
+  - 子块之间保留**重叠**：`child_overlap = min(50, child_chunk_size // 10)`，下一块 `start = 上一块 end - child_overlap`。
+  - 实现：`_slide_windows(text, child_chunk_size, child_overlap)`。
+- **父块**：
+  - 对每个子块 `[cs, ce]`，父块为**左上下文**：`[parent_start, parent_end]`，其中  
+    `parent_start = max(0, cs - (parent_ctx_len - parent_overlap))`，  
+    `parent_end = min(len(text), parent_start + parent_ctx_len)`。  
+  - `parent_ctx_len = min(child_chunk_size * 2, 768)`，`parent_overlap` 默认 150，保证相邻父块在边界处重叠。
+- **输出**：一组子块区间（字符偏移），以及每个子块对应的父块区间（用于后续生成 `parent_content`）。
 
-- 文档解析（`mineru_client._chunk_with_strategy`）：用 `rag_default_chunk_size`、`rag_parent_overlap`，`parent_ctx_len = min(chunk_size*2, 768)` 调用 `chunk_text`，再按页码为每个块分配结构化 `chunk_id`（`_assign_structured_ids`）。
-- 解析结果中的每个 chunk 含 `content`、`parent_content`、`chunk_id`、`doc_name`、`page`、`parent_block`、`child_block`；写入 Milvus 时一并存，检索可返回 `parent_content` 用于展示与生成。
+---
+
+#### 第二步：句/段边界对齐（避免断句）
+
+- **触发**：`align_to_sentence=True`（默认开启）。
+- **做法**：
+  - 对第一步得到的每个**切点**（子块的 `end`），在 `[end - 60, end + 80]` 字符范围内寻找**最近句/段边界**。
+  - 边界定义：句号、问号、叹号（中英文 `。！？.!?`）之后，或双换行 `\n\n` 之后（即“下一句/段开始前”的位置）。
+  - 将切点微调到该边界；若范围内无边界则保持不变。保证 `end >= start + 1` 且不越界。
+  - 下一块 `start` 仍为 `当前 end - child_overlap`，保证重叠与块数稳定。
+- **实现**：`_align_to_sentence_boundary(text, pos, max_forward=80, max_back=60)`；在生成子块区间时按上述逻辑顺序计算每个 `(start, end)`。
+- **目的**：避免在句子中间切断；限制微调范围，避免切片过碎。
+
+---
+
+#### 第三步：表格边界对齐（结构感知，不拆表）
+
+- **触发**：`align_to_table=True`（默认开启）。
+- **表格识别**：
+  - 全文按行扫描，**表格**定义为：连续多行，每行均包含 `|` 且 `|` 出现次数 ≥ 2（即至少两列）。
+  - 得到若干**表格区间** `(table_start, table_end)`，可能有多段（**跨页多表**）。
+  - 实现：`_get_table_spans(text)`。
+- **做法**：
+  - 对第二步得到的每个子块区间 `(s, e)`：
+    - 若 **e 落在某表内部**（`table_start < e < table_end`）：将 e 调整为该表结尾，但不超过 `e + max_extend`（默认 400 字符），避免单块过大。
+    - 若 **s 落在某表内部**：将 s 调整为该表开头，避免从表中间开始。
+  - 下一块 `start` 仍为 `上一块 end - child_overlap`，保证父子分段与重叠不变。
+  - 实现：`_adjust_spans_for_tables(text, spans, child_overlap, max_extend=400)`。
+- **目的**：不拆表；跨页多表时每张表完整落在同一块或通过重叠与相邻块衔接，不在表中间切断。
+
+---
+
+#### 输出格式与下游
+
+- 每个子块得到：
+  - **content**：`text[cs:ce]`（子块正文）。
+  - **parent_content**：`text[parent_start:parent_end]`（父块正文，左上下文 + 重叠）。
+  - **chunk_id**：在 `chunk_text` 内为 `{doc_id}_{i}`；下游 `_assign_structured_ids` 会按页码等生成结构化编号 `{doc_name}-p{page}-b{parent_block}-c{child_block}`。
+- 解析结果中的每个 chunk 写入 Milvus 时携带 `content`、`parent_content`、`chunk_id`、`doc_name`、`page`、`parent_block`、`child_block`；检索可返回 `parent_content` 用于展示与生成。
+
+---
+
+#### 参数与常量汇总
+
+| 名称 | 默认/取值 | 说明 |
+|------|-----------|------|
+| `child_chunk_size` | 512 | 子块目标长度（字符） |
+| `parent_overlap` | 150 | 父块之间重叠长度 |
+| `parent_ctx_len` | min(chunk_size*2, 768) | 每个子块对应父块长度 |
+| `child_overlap` | min(50, chunk_size//10) | 子块间重叠 |
+| 句边界微调范围 | 向后 80、向前 60 字 | `_align_to_sentence_boundary` 的 max_forward / max_back |
+| 表格单次扩展上限 | 400 字 | `_adjust_spans_for_tables` 的 max_extend |
+
+---
+
+### 1.3 兼容模式（纯固定长度）
+
+- **配置**：`rag_use_legacy_fixed_chunking=True`。
+- **行为**：调用 `chunk_text(..., align_to_sentence=False, align_to_table=False)`，仅执行**第一步**父子分段（固定长度 + 子块重叠），不做句/段对齐与表格对齐。
+- **用途**：兼容旧行为或对比实验。
+
+---
+
+### 1.4 适用文档类型
+
+- 策略作用在**解析后的全文**（`full_text`）上。PDF、Word 经 MinerU（或占位）解析为文本或 Markdown 后，与 Markdown 文档走同一套流水线，**均适用**。
+- 表格识别依赖行内 `|` 且至少两列；若解析结果为带 Markdown 表格的文本，表格边界对齐效果最佳。
+
+---
+
+### 1.5 调用链与配置
+
+- **入口**：文档解析时 `mineru_client._chunk_with_strategy(task_id, full_text, doc_name)`。
+- **策略选择**：  
+  - 默认：`chunk_text(full_text, child_chunk_size=rag_default_chunk_size, parent_overlap=rag_parent_overlap, parent_ctx_len=min(chunk_size*2,768), doc_id=task_id, align_to_sentence=True, align_to_table=True)`。  
+  - `rag_use_legacy_fixed_chunking=True` 时：`chunk_text(..., align_to_sentence=False, align_to_table=False)`。
+- **其后**：对返回的 `List[ChunkWithParent]` 调用 `_assign_structured_ids(..., full_text, doc_name, pages)`，为每个块分配结构化 `chunk_id` 与页码。
 
 **配置项**（`config/settings.py`）：
 
 | 配置 | 默认值 | 说明 |
 |------|--------|------|
-| `rag_default_chunk_size` | 512 | 子块长度（字符） |
+| `rag_default_chunk_size` | 512 | 子块目标长度（字符） |
 | `rag_parent_overlap` | 150 | 父块间重叠长度 |
-| `rag_chunk_sizes` | [256,384,512,768] | 多尺寸验证用，上传时仅用 default |
+| `rag_chunk_sizes` | [256,384,512,768] | 多尺寸验证用（如 `chunk_text_multi_size`） |
+| `rag_use_legacy_fixed_chunking` | False | True 时仅用固定长度、无句/表对齐（兼容） |
 
-**小结**：当前是**固定长度 + 父子块 + 父块重叠**的切片策略；子块无重叠，父块重叠约 150 字，兼顾检索粒度和上下文连贯。
+---
+
+### 1.6 其他策略（非默认，供实验）
+
+- **chunk_text_semantic**：按句/段边界切句再合并到约 `child_chunk_size`；语义驱动，可能产生较多小块，不做默认。
+- **chunk_text_structure_aware**：识别标题/表格/段落，段落内再按句合并；结构+语义驱动，不做默认。
+- **chunk_text_multi_size**：用多种 `child_chunk_size` 各切一份，便于多尺寸对比。
 
 ---
 
@@ -109,7 +195,7 @@
 
 ## 五、小结（面试可答）
 
-- **切片策略**：本项目采用固定长度子块 + 父块上下文 + 父块重叠约 150 字；子块长度可配置（默认 512）；chunk_id 为结构化 `文档名-p页码-b父块-c子块`，便于溯源；配置在 `rag_default_chunk_size`、`rag_parent_overlap`，实现见 `chunking.py` 与 `mineru_client._chunk_with_strategy`。
+- **切片策略**：主题为**父子分段**；默认三步流水线——(1) 固定长度子块+重叠与父块左上下文，(2) 切点句/段边界对齐（±60～80 字），(3) 表格边界对齐（不拆表、跨页多表整表保留）；chunk_id 为结构化 `文档名-p页码-b父块-c子块`；兼容时 `rag_use_legacy_fixed_chunking=True` 仅用第一步；实现见 `chunking.py` 与 `mineru_client._chunk_with_strategy`。
 - **版本管理**：当前无文档版本字段；doc_id 为当次上传的 task_id，同一文档再次上传会得到新 doc_id，形成多套 chunk 并存；可扩展为增加 doc_version/upload_id 并在检索或回流时按版本过滤。
 - **灰度**：当前无内置灰度；若要对新 collection 或新策略做灰度，需在应用层按比例/按用户分流或使用影子索引，并打标观测。
 - **回流**：当前上传仅为“插入”，无按 doc 删除再写；同一文档重复上传会导致重复 chunk。回流可扩展为：按 doc_id（或业务主键）先删该文档旧 chunk 再写入新 chunk；结合版本与灰度可做安全上线与回滚。

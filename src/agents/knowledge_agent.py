@@ -35,7 +35,12 @@ def knowledge_agent_node(state: AgentState) -> dict:
             "next": "__end__",
         }
     answer, pending_sql = engine.query(last)
-    out = {"messages": [AIMessage(content=answer)], "next": "__end__", "route": "knowledge", "qa_trace": engine.get_last_trace()}
+    out: dict = {
+        "messages": [AIMessage(content=answer)],
+        "next": "__end__",
+        "route": "knowledge",
+        "qa_trace": engine.get_last_trace(),
+    }
     # 删除/修改类 SQL 只生成不执行时，由 API 层存入 _pending_sql，等用户确认后执行
     if pending_sql:
         out["pending_sql"] = pending_sql
@@ -68,7 +73,12 @@ async def knowledge_agent_node_async(state: AgentState) -> dict:
         try:
             engine = _get_kb_engine()
             answer, pending_sql = await engine.aquery(last)
-            out: dict = {"messages": [AIMessage(content=answer)], "next": "__end__", "route": "knowledge", "qa_trace": engine.get_last_trace()}
+            out: dict = {
+                "messages": [AIMessage(content=answer)],
+                "next": "__end__",
+                "route": "knowledge",
+                "qa_trace": engine.get_last_trace(),
+            }
             if pending_sql:
                 out["pending_sql"] = pending_sql
             return out

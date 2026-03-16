@@ -12,7 +12,15 @@ from .schema_loader import (
     ColumnInfo,
 )
 from .rag import RAGRetriever, get_rag_retriever, RAGRetrieveResult, ChunkWithEval
-from .chunking import chunk_text, chunk_text_multi_size, ChunkWithParent, DEFAULT_CHUNK_SIZES, DEFAULT_PARENT_OVERLAP
+from .chunking import (
+    chunk_text,
+    chunk_text_semantic,
+    chunk_text_structure_aware,
+    chunk_text_multi_size,
+    ChunkWithParent,
+    DEFAULT_CHUNK_SIZES,
+    DEFAULT_PARENT_OVERLAP,
+)
 from .retrieval_eval import (
     evaluate_retrieval,
     RetrievalEvalResult,
@@ -38,6 +46,8 @@ __all__ = [
     "RAGRetrieveResult",
     "ChunkWithEval",
     "chunk_text",
+    "chunk_text_semantic",
+    "chunk_text_structure_aware",
     "chunk_text_multi_size",
     "ChunkWithParent",
     "DEFAULT_CHUNK_SIZES",

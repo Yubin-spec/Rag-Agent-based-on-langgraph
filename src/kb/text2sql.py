@@ -56,9 +56,10 @@ _GARBLED_CHARS_RE = re.compile(
     r"\u200b-\u200f\u2028-\u202f\u2060\ufeff\ufffe\uffff]"
 )
 # 中文标点 → ASCII 标点（LLM 偶尔输出中文逗号/分号/括号）
+# 弯引号用 Unicode 转义，保证键均为单字符（str.maketrans 要求）
 _CN_PUNCT_MAP = str.maketrans({
     "，": ",", "；": ";", "（": "(", "）": ")", "：": ":",
-    "'": "'", "'": "'", """: "\"", """: "\"",
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
 })
 # 匹配 SQL 关键字开头（用于从混合文本中定位 SQL 起始位置）
 _SQL_KEYWORD_START_RE = re.compile(

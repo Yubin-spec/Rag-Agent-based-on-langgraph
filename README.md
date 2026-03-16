@@ -10,9 +10,9 @@
 - **知识库 Agent**：三种机制  
   1. **高频 QA**：从 `data/high_freq_qa.json` 加载，问法固定时精准匹配。  
   2. **Text2SQL**：自然语言转 SQL，查关系库（示例 schema 见 `src/kb/text2sql.py`）。  
-  3. **RAG**：全文检索与向量检索 **3:7** 混合；**切片策略**支持多种切块大小验证、父块约 **150 字重叠**；**检索评估**（匹配度、命中位置、无关信息比例等），低于阈值则重检（最多 3 次）；答案**展示依据来源**并返回依赖的切片。
+  3. **RAG**：全文检索与向量检索 **3:7** 混合；**切片**以**父子分段**为基础，默认固定长度 + 切点句/段边界对齐（避免断句、不过碎），父块约 **150 字重叠**；**检索评估**（匹配度、命中位置、无关信息比例等），低于阈值则重检（最多 3 次）；答案**展示依据来源**并返回依赖的切片。
 
-- **文档流程**：上传 → MinerU 解析（占位使用父子切片策略）→ 返回解析结果 → 前端对比/自定义 → 确认后上传到 Milvus。
+- **文档流程**：上传 → MinerU 解析（默认父子分段+切点边界对齐）→ 返回解析结果 → 前端对比/自定义 → 确认后上传到 Milvus。
 
 ## 模型约定（禁止 OpenAI）
 
@@ -26,8 +26,24 @@
 
 ## 环境
 
-- Python 3.10+
+- Python 3.10+（本项目根目录有 `.venv`，推荐使用该虚拟环境）。
 - 复制 `.env.example` 为 `.env`，填写 DeepSeek API Key、Milvus 等（勿使用 OpenAI Key 调用 OpenAI 模型）。
+
+**使用并确认当前 Python 环境：**
+
+```bash
+# 激活虚拟环境（使用项目 .venv）
+source .venv/bin/activate
+
+# 查看当前用的是哪个 Python（应看到路径含本项目下的 .venv）
+which python3
+python3 -c "import sys; print('executable:', sys.executable); print('prefix:', sys.prefix)"
+
+# 或直接运行项目自带脚本查看
+python scripts/which_env.py
+```
+
+未激活时，`python3` 会指向系统或 Homebrew 的 Python；激活后应指向 `<项目根>/.venv/bin/python3`。Cursor / VS Code 可在右下角或命令面板选择解释器，选本项目 `.venv` 下的 Python 即可。
 
 ```bash
 cp .env.example .env
@@ -61,9 +77,9 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000
 
 ## RAG 配置与评估
 
-- `config/settings.py`：`rag_chunk_sizes`（可验证的切块大小）、`rag_parent_overlap`（默认 150）、`rag_bm25_ratio` / `rag_vector_ratio`（0.3 : 0.7）、`rag_min_match_score`（默认 0.3）、`rag_max_retrieve_attempts`（默认 3）。
+- `config/settings.py`：`rag_chunk_sizes`、`rag_parent_overlap`（默认 150）、`rag_use_legacy_fixed_chunking`（True 时仅用固定长度切片）、`rag_bm25_ratio` / `rag_vector_ratio`（0.3 : 0.7）、`rag_min_match_score`、`rag_max_retrieve_attempts`（默认 3）。
 - 评估指标（`src/kb/retrieval_eval.py`）：`compute_match_score`、`compute_match_positions`、`compute_irrelevant_ratio`、`compute_query_coverage`。
-- 切片验证：`src/kb/chunking.py` 提供 `chunk_text`、`chunk_text_multi_size`，可对同一文档用不同 size 切片并对比效果。
+- 切片：主题为父子分段，默认 `chunk_text(..., align_to_sentence=True)`（固定长度+切点边界对齐）；详见 `docs/RAG_CHUNKING_VERSION_GRAY_REFLOW.md`。
 
 ## 扩展
 

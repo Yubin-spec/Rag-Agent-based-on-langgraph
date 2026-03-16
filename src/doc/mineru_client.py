@@ -161,12 +161,16 @@ class MinerUClient:
             chunk_size = getattr(self.settings, "rag_default_chunk_size", 512)
             parent_overlap = getattr(self.settings, "rag_parent_overlap", 150)
             parent_ctx = min(chunk_size * 2, 768)
+            use_legacy = getattr(self.settings, "rag_use_legacy_fixed_chunking", False)
+            # 主题为父子分段；默认句/段边界对齐 + 表格边界对齐（不拆表、跨页多表整表保留）
             with_parent = chunk_text(
                 full_text,
                 child_chunk_size=chunk_size,
                 parent_overlap=parent_overlap,
                 parent_ctx_len=parent_ctx,
                 doc_id=task_id,
+                align_to_sentence=not use_legacy,
+                align_to_table=not use_legacy,
             )
             return self._assign_structured_ids(with_parent, full_text, doc_name, pages)
         except Exception:

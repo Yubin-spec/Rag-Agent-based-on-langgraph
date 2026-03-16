@@ -60,3 +60,21 @@
 
 - **PostgreSQL 异步驱动**：`chat_history` 已支持 asyncpg（`chat_history_use_asyncpg=true`），可减少 to_thread 占用。
 - **Milvus 异步客户端**：若官方提供 async SDK，RAG 检索可改为全异步，进一步减少 to_thread。当前 Milvus 通过 `db_resilience` 管理（重试、熔断、懒重连），详见 [数据库韧性](DB_RESILIENCE.md)。
+
+## 8. 性能档位与推荐配置（线程池 / API 并发）
+
+不同业务对「延迟 / 吞吐」要求不同，建议按**场景选择一档配置**，再结合压测微调。
+
+> 下表只覆盖**线程池与 API 并发**两类参数；RAG 检索与上下文长度的档位见 `RAG_HA_LOW_LATENCY_DESIGN.md` 中的对应小节。
+
+| 场景 | 典型需求 | 建议配置（起点） | 说明 |
+|------|----------|------------------|------|
+| **本地开发 / Demo** | 并发低，便于调试 | `asyncio_thread_pool_workers=16`；`api_max_concurrent_requests=0`（无限制） | 默认即可；无须限流，方便单人调试。 |
+| **实时对话（在线客服、助理）** | 首包 <1s，P95 <3s；QPS 中等 | `asyncio_thread_pool_workers=32`；`api_max_concurrent_requests=cpu_cores*4` | 线程池适度放大，避免 QA/持久化 to_thread 堵塞；API 并发与 CPU 成正比，防止过载。 |
+| **半实时质检 / 运营审核** | P95 可容忍 5–8s；QPS 较低 | `asyncio_thread_pool_workers=32`；`api_max_concurrent_requests=cpu_cores*2` | 以稳定性和资源占用为主；通常配合较重的 RAG/生成参数。 |
+| **批量离线任务（脚本调用 API）** | 吞吐优先，可适当排队 | `asyncio_thread_pool_workers=32~64`；`api_max_concurrent_requests` 视后端 DB/Milvus 能力设为较小值（如 16） | 建议通过外层调度控制并发，而不是无限放大 API 层并发。 |
+
+落地建议：
+
+- **始终先用压测验证**：以上只是起点，实际值需结合 CPU 核数、DB/Milvus 集群能力与 LLM 延迟，通过压测（QPS–P95/P99 曲线）调整。
+- **API 限流优先保护下游**：`api_max_concurrent_requests` 主要保护 DB/Milvus/LLM，不必等到整体 CPU 打满才限流；宁可稍早排队，也不要让下游摊平雪崩。

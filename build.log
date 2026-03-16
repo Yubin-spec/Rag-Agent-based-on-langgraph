@@ -1,0 +1,579 @@
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 2.80kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/python:3.11-slim
+#2 DONE 1.6s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 542B done
+#3 DONE 0.0s
+
+#4 [ 1/12] FROM docker.io/library/python:3.11-slim@sha256:d6e4d224f70f9e0172a06a3a2eba2f768eb146811a349278b38fff3a36463b47
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 5.09kB done
+#5 DONE 0.0s
+
+#6 [ 2/12] WORKDIR /app
+#6 CACHED
+
+#7 [ 3/12] RUN if [ "1" = "1" ]; then     for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do       [ -f "$f" ] && sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|http://security.debian.org/debian-security|http://mirrors.aliyun.com/debian-security|g' "$f" || true;     done;     fi
+#7 CACHED
+
+#8 [ 4/12] RUN apt-get update || apt-get update     && apt-get install -y --no-install-recommends build-essential     && rm -rf /var/lib/apt/lists/*
+#8 CACHED
+
+#9 [ 5/12] COPY requirements.txt .
+#9 CACHED
+
+#10 [ 6/12] RUN if [ "1" = "1" ]; then     pip install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --default-timeout=120;     pip install --no-cache-dir -r requirements.txt         -i https://mirrors.aliyun.com/pypi/simple/         --trusted-host mirrors.aliyun.com         --extra-index-url https://pypi.org/simple/         --default-timeout=120 --retries 5;     else     pip install --upgrade pip --default-timeout=120;     pip install --no-cache-dir -r requirements.txt --default-timeout=120 --retries 5;     fi
+#10 0.797 Looking in indexes: https://mirrors.aliyun.com/pypi/simple/
+#10 0.797 Requirement already satisfied: pip in /usr/local/lib/python3.11/site-packages (24.0)
+#10 0.924 Collecting pip
+#10 0.957   Downloading https://mirrors.aliyun.com/pypi/packages/de/f0/c81e05b613866b76d2d1066490adf1a3dbc4ee9d9c839961c3fc8a6997af/pip-26.0.1-py3-none-any.whl (1.8 MB)
+#10 1.104      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.8/1.8 MB 12.1 MB/s eta 0:00:00
+#10 1.126 Installing collected packages: pip
+#10 1.126   Attempting uninstall: pip
+#10 1.127     Found existing installation: pip 24.0
+#10 1.141     Uninstalling pip-24.0:
+#10 1.186       Successfully uninstalled pip-24.0
+#10 1.525 Successfully installed pip-26.0.1
+#10 1.525 WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+#10 1.812 Looking in indexes: https://mirrors.aliyun.com/pypi/simple/, https://pypi.org/simple/
+#10 2.919 Collecting langgraph>=0.2.0 (from -r requirements.txt (line 2))
+#10 3.747   Downloading langgraph-1.1.2-py3-none-any.whl.metadata (7.4 kB)
+#10 4.207 Collecting langchain>=0.3.0 (from -r requirements.txt (line 3))
+#10 4.461   Downloading langchain-1.2.12-py3-none-any.whl.metadata (5.7 kB)
+#10 4.896 Collecting langchain-community>=0.3.0 (from -r requirements.txt (line 4))
+#10 5.153   Downloading langchain_community-0.4.1-py3-none-any.whl.metadata (3.0 kB)
+#10 5.672 Collecting langchain-core>=0.3.0 (from -r requirements.txt (line 5))
+#10 5.838   Downloading langchain_core-1.2.19-py3-none-any.whl.metadata (4.4 kB)
+#10 6.134 Collecting openai>=1.0.0 (from -r requirements.txt (line 8))
+#10 6.297   Downloading openai-2.28.0-py3-none-any.whl.metadata (29 kB)
+#10 6.567 Collecting langchain-openai>=0.2.0 (from -r requirements.txt (line 9))
+#10 6.755   Downloading langchain_openai-1.1.11-py3-none-any.whl.metadata (3.1 kB)
+#10 6.957 Collecting sentence-transformers>=3.0.0 (from -r requirements.txt (line 10))
+#10 7.140   Downloading sentence_transformers-5.3.0-py3-none-any.whl.metadata (16 kB)
+#10 7.365 Collecting FlagEmbedding>=1.2.0 (from -r requirements.txt (line 11))
+#10 7.607   Downloading FlagEmbedding-1.3.5.tar.gz (163 kB)
+#10 7.764   Installing build dependencies: started
+#10 10.62   Installing build dependencies: finished with status 'done'
+#10 10.62   Getting requirements to build wheel: started
+#10 10.78   Getting requirements to build wheel: finished with status 'done'
+#10 10.78   Preparing metadata (pyproject.toml): started
+#10 10.87   Preparing metadata (pyproject.toml): finished with status 'done'
+#10 11.08 Collecting pymilvus>=2.4.0 (from -r requirements.txt (line 14))
+#10 11.28   Downloading pymilvus-2.6.10-py3-none-any.whl.metadata (6.8 kB)
+#10 11.46 Collecting rank_bm25>=0.2.2 (from -r requirements.txt (line 15))
+#10 11.60   Downloading rank_bm25-0.2.2-py3-none-any.whl.metadata (3.2 kB)
+#10 12.23 Collecting sqlalchemy>=2.0.0 (from -r requirements.txt (line 18))
+#10 12.40   Downloading sqlalchemy-2.0.48-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (9.5 kB)
+#10 12.61 Collecting fastapi>=0.115.0 (from -r requirements.txt (line 24))
+#10 12.85   Downloading fastapi-0.135.1-py3-none-any.whl.metadata (30 kB)
+#10 13.10 Collecting uvicorn>=0.32.0 (from uvicorn[standard]>=0.32.0->-r requirements.txt (line 25))
+#10 13.25   Downloading uvicorn-0.41.0-py3-none-any.whl.metadata (6.7 kB)
+#10 13.51 Collecting python-multipart>=0.0.12 (from -r requirements.txt (line 26))
+#10 13.66   Downloading python_multipart-0.0.22-py3-none-any.whl.metadata (1.8 kB)
+#10 13.90 Collecting httpx>=0.27.0 (from -r requirements.txt (line 27))
+#10 14.05   Downloading httpx-0.28.1-py3-none-any.whl.metadata (7.1 kB)
+#10 14.26 Collecting redis>=5.0.0 (from -r requirements.txt (line 30))
+#10 14.42   Downloading redis-7.3.0-py3-none-any.whl.metadata (12 kB)
+#10 14.66 Collecting asyncpg>=0.29.0 (from -r requirements.txt (line 36))
+#10 14.80   Downloading asyncpg-0.31.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (4.4 kB)
+#10 15.17 Collecting pydantic>=2.0.0 (from -r requirements.txt (line 39))
+#10 15.31   Downloading pydantic-2.12.5-py3-none-any.whl.metadata (90 kB)
+#10 15.61 Collecting pydantic-settings>=2.0.0 (from -r requirements.txt (line 40))
+#10 15.76   Downloading pydantic_settings-2.13.1-py3-none-any.whl.metadata (3.4 kB)
+#10 16.00 Collecting python-dotenv>=1.0.0 (from -r requirements.txt (line 41))
+#10 16.16   Downloading python_dotenv-1.2.2-py3-none-any.whl.metadata (27 kB)
+#10 16.39 Collecting pyyaml>=6.0.0 (from -r requirements.txt (line 42))
+#10 16.54   Downloading pyyaml-6.0.3-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (2.4 kB)
+#10 16.72 Collecting langgraph-checkpoint<5.0.0,>=2.1.0 (from langgraph>=0.2.0->-r requirements.txt (line 2))
+#10 16.86   Downloading langgraph_checkpoint-4.0.1-py3-none-any.whl.metadata (4.9 kB)
+#10 17.05 Collecting langgraph-prebuilt<1.1.0,>=1.0.8 (from langgraph>=0.2.0->-r requirements.txt (line 2))
+#10 17.19   Downloading langgraph_prebuilt-1.0.8-py3-none-any.whl.metadata (5.2 kB)
+#10 17.40 Collecting langgraph-sdk<0.4.0,>=0.3.0 (from langgraph>=0.2.0->-r requirements.txt (line 2))
+#10 17.57   Downloading langgraph_sdk-0.3.11-py3-none-any.whl.metadata (1.6 kB)
+#10 17.86 Collecting xxhash>=3.5.0 (from langgraph>=0.2.0->-r requirements.txt (line 2))
+#10 18.00   Downloading xxhash-3.6.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (13 kB)
+#10 18.35 Collecting ormsgpack>=1.12.0 (from langgraph-checkpoint<5.0.0,>=2.1.0->langgraph>=0.2.0->-r requirements.txt (line 2))
+#10 18.49   Downloading ormsgpack-1.12.2-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl.metadata (3.2 kB)
+#10 19.06 Collecting orjson>=3.11.5 (from langgraph-sdk<0.4.0,>=0.3.0->langgraph>=0.2.0->-r requirements.txt (line 2))
+#10 19.27   Downloading orjson-3.11.7-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl.metadata (41 kB)
+#10 19.48 Collecting jsonpatch<2.0.0,>=1.33.0 (from langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 19.67   Downloading jsonpatch-1.33-py2.py3-none-any.whl.metadata (3.0 kB)
+#10 19.92 Collecting langsmith<1.0.0,>=0.3.45 (from langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 20.06   Downloading langsmith-0.7.17-py3-none-any.whl.metadata (15 kB)
+#10 20.36 Collecting packaging>=23.2.0 (from langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 20.51   Downloading packaging-26.0-py3-none-any.whl.metadata (3.3 kB)
+#10 20.73 Collecting tenacity!=8.4.0,<10.0.0,>=8.1.0 (from langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 20.86   Downloading tenacity-9.1.4-py3-none-any.whl.metadata (1.2 kB)
+#10 21.07 Collecting typing-extensions<5.0.0,>=4.7.0 (from langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 21.24   Downloading typing_extensions-4.15.0-py3-none-any.whl.metadata (3.3 kB)
+#10 21.53 Collecting uuid-utils<1.0,>=0.12.0 (from langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 21.67   Downloading uuid_utils-0.14.1-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl.metadata (4.8 kB)
+#10 21.92 Collecting annotated-types>=0.6.0 (from pydantic>=2.0.0->-r requirements.txt (line 39))
+#10 22.06   Downloading annotated_types-0.7.0-py3-none-any.whl.metadata (15 kB)
+#10 23.23 Collecting pydantic-core==2.41.5 (from pydantic>=2.0.0->-r requirements.txt (line 39))
+#10 23.38   Downloading pydantic_core-2.41.5-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl.metadata (7.3 kB)
+#10 23.57 Collecting typing-inspection>=0.4.2 (from pydantic>=2.0.0->-r requirements.txt (line 39))
+#10 23.72   Downloading typing_inspection-0.4.2-py3-none-any.whl.metadata (2.6 kB)
+#10 23.89 Collecting jsonpointer>=1.9 (from jsonpatch<2.0.0,>=1.33.0->langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 24.03   Downloading jsonpointer-3.0.0-py2.py3-none-any.whl.metadata (2.3 kB)
+#10 24.21 Collecting requests-toolbelt>=1.0.0 (from langsmith<1.0.0,>=0.3.45->langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 24.39   Downloading requests_toolbelt-1.0.0-py2.py3-none-any.whl.metadata (14 kB)
+#10 24.62 Collecting requests>=2.0.0 (from langsmith<1.0.0,>=0.3.45->langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 24.76   Downloading requests-2.32.5-py3-none-any.whl.metadata (4.9 kB)
+#10 25.09 Collecting zstandard>=0.23.0 (from langsmith<1.0.0,>=0.3.45->langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 25.23   Downloading zstandard-0.25.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl.metadata (3.3 kB)
+#10 25.70 Collecting anyio (from httpx>=0.27.0->-r requirements.txt (line 27))
+#10 25.86   Downloading anyio-4.12.1-py3-none-any.whl.metadata (4.3 kB)
+#10 26.15 Collecting certifi (from httpx>=0.27.0->-r requirements.txt (line 27))
+#10 26.31   Downloading certifi-2026.2.25-py3-none-any.whl.metadata (2.5 kB)
+#10 26.54 Collecting httpcore==1.* (from httpx>=0.27.0->-r requirements.txt (line 27))
+#10 26.70   Downloading httpcore-1.0.9-py3-none-any.whl.metadata (21 kB)
+#10 26.89 Collecting idna (from httpx>=0.27.0->-r requirements.txt (line 27))
+#10 27.06   Downloading idna-3.11-py3-none-any.whl.metadata (8.4 kB)
+#10 27.24 Collecting h11>=0.16 (from httpcore==1.*->httpx>=0.27.0->-r requirements.txt (line 27))
+#10 27.39   Downloading h11-0.16.0-py3-none-any.whl.metadata (8.3 kB)
+#10 27.57 Collecting langchain-classic<2.0.0,>=1.0.0 (from langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 27.74   Downloading langchain_classic-1.0.3-py3-none-any.whl.metadata (4.8 kB)
+#10 29.11 Collecting aiohttp<4.0.0,>=3.8.3 (from langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 29.26   Downloading aiohttp-3.13.3-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (8.1 kB)
+#10 29.47 Collecting dataclasses-json<0.7.0,>=0.6.7 (from langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 29.63   Downloading dataclasses_json-0.6.7-py3-none-any.whl.metadata (25 kB)
+#10 29.81 Collecting httpx-sse<1.0.0,>=0.4.0 (from langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 29.95   Downloading httpx_sse-0.4.3-py3-none-any.whl.metadata (9.7 kB)
+#10 30.55 Collecting numpy>=1.26.2 (from langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 30.69   Downloading numpy-2.4.3-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl.metadata (6.6 kB)
+#10 31.25 Collecting greenlet>=1 (from sqlalchemy>=2.0.0->-r requirements.txt (line 18))
+#10 31.39   Downloading greenlet-3.3.2-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl.metadata (3.7 kB)
+#10 31.73 Collecting aiohappyeyeballs>=2.5.0 (from aiohttp<4.0.0,>=3.8.3->langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 31.88   Downloading aiohappyeyeballs-2.6.1-py3-none-any.whl.metadata (5.9 kB)
+#10 32.07 Collecting aiosignal>=1.4.0 (from aiohttp<4.0.0,>=3.8.3->langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 32.25   Downloading aiosignal-1.4.0-py3-none-any.whl.metadata (3.7 kB)
+#10 32.45 Collecting attrs>=17.3.0 (from aiohttp<4.0.0,>=3.8.3->langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 32.61   Downloading attrs-25.4.0-py3-none-any.whl.metadata (10 kB)
+#10 32.88 Collecting frozenlist>=1.1.1 (from aiohttp<4.0.0,>=3.8.3->langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 33.03   Downloading frozenlist-1.8.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (20 kB)
+#10 33.58 Collecting multidict<7.0,>=4.5 (from aiohttp<4.0.0,>=3.8.3->langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 33.72   Downloading multidict-6.7.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (5.3 kB)
+#10 34.06 Collecting propcache>=0.2.0 (from aiohttp<4.0.0,>=3.8.3->langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 34.21   Downloading propcache-0.4.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (13 kB)
+#10 35.17 Collecting yarl<2.0,>=1.17.0 (from aiohttp<4.0.0,>=3.8.3->langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 35.40   Downloading yarl-1.23.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (79 kB)
+#10 35.63 Collecting marshmallow<4.0.0,>=3.18.0 (from dataclasses-json<0.7.0,>=0.6.7->langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 35.77   Downloading marshmallow-3.26.2-py3-none-any.whl.metadata (7.3 kB)
+#10 36.08 Collecting typing-inspect<1,>=0.4.0 (from dataclasses-json<0.7.0,>=0.6.7->langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 36.24   Downloading typing_inspect-0.9.0-py3-none-any.whl.metadata (1.5 kB)
+#10 36.47 Collecting langchain-text-splitters<2.0.0,>=1.1.1 (from langchain-classic<2.0.0,>=1.0.0->langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 36.61   Downloading langchain_text_splitters-1.1.1-py3-none-any.whl.metadata (3.3 kB)
+#10 37.00 Collecting charset_normalizer<4,>=2 (from requests>=2.0.0->langsmith<1.0.0,>=0.3.45->langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 37.15   Downloading charset_normalizer-3.4.5-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (39 kB)
+#10 37.40 Collecting urllib3<3,>=1.21.1 (from requests>=2.0.0->langsmith<1.0.0,>=0.3.45->langchain-core>=0.3.0->-r requirements.txt (line 5))
+#10 37.54   Downloading urllib3-2.6.3-py3-none-any.whl.metadata (6.9 kB)
+#10 37.74 Collecting mypy-extensions>=0.3.0 (from typing-inspect<1,>=0.4.0->dataclasses-json<0.7.0,>=0.6.7->langchain-community>=0.3.0->-r requirements.txt (line 4))
+#10 37.89   Downloading mypy_extensions-1.1.0-py3-none-any.whl.metadata (1.1 kB)
+#10 38.16 Collecting distro<2,>=1.7.0 (from openai>=1.0.0->-r requirements.txt (line 8))
+#10 38.30   Downloading distro-1.9.0-py3-none-any.whl.metadata (6.8 kB)
+#10 38.63 Collecting jiter<1,>=0.10.0 (from openai>=1.0.0->-r requirements.txt (line 8))
+#10 38.77   Downloading jiter-0.13.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl.metadata (5.2 kB)
+#10 38.96 Collecting sniffio (from openai>=1.0.0->-r requirements.txt (line 8))
+#10 39.11   Downloading sniffio-1.3.1-py3-none-any.whl.metadata (3.9 kB)
+#10 39.36 Collecting tqdm>4 (from openai>=1.0.0->-r requirements.txt (line 8))
+#10 39.59   Downloading tqdm-4.67.3-py3-none-any.whl.metadata (57 kB)
+#10 39.90 Collecting tiktoken<1.0.0,>=0.7.0 (from langchain-openai>=0.2.0->-r requirements.txt (line 9))
+#10 40.12   Downloading tiktoken-0.12.0-cp311-cp311-manylinux_2_28_aarch64.whl.metadata (6.7 kB)
+#10 41.32 Collecting regex>=2022.1.18 (from tiktoken<1.0.0,>=0.7.0->langchain-openai>=0.2.0->-r requirements.txt (line 9))
+#10 41.46   Downloading regex-2026.2.28-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (40 kB)
+#10 41.71 Collecting transformers<6.0.0,>=4.41.0 (from sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 41.88   Downloading transformers-5.3.0-py3-none-any.whl.metadata (32 kB)
+#10 42.24 Collecting huggingface-hub>=0.20.0 (from sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 42.38   Downloading huggingface_hub-1.7.1-py3-none-any.whl.metadata (13 kB)
+#10 42.65 Collecting torch>=1.11.0 (from sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 42.88   Downloading torch-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl.metadata (31 kB)
+#10 43.17 Collecting scikit-learn (from sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 43.40   Downloading scikit_learn-1.8.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl.metadata (11 kB)
+#10 43.92 Collecting scipy (from sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 44.07   Downloading scipy-1.17.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl.metadata (62 kB)
+#10 44.53 Collecting tokenizers<=0.23.0,>=0.22.0 (from transformers<6.0.0,>=4.41.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 44.67   Downloading tokenizers-0.22.2-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl.metadata (7.3 kB)
+#10 44.88 Collecting typer (from transformers<6.0.0,>=4.41.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 45.03   Downloading typer-0.24.1-py3-none-any.whl.metadata (16 kB)
+#10 45.40 Collecting safetensors>=0.4.3 (from transformers<6.0.0,>=4.41.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 45.55   Downloading safetensors-0.7.0-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl.metadata (4.1 kB)
+#10 45.76 Collecting filelock>=3.10.0 (from huggingface-hub>=0.20.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 45.90   Downloading filelock-3.25.2-py3-none-any.whl.metadata (2.0 kB)
+#10 46.15 Collecting fsspec>=2023.5.0 (from huggingface-hub>=0.20.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 46.30   Downloading fsspec-2026.2.0-py3-none-any.whl.metadata (10 kB)
+#10 46.64 Collecting hf-xet<2.0.0,>=1.4.2 (from huggingface-hub>=0.20.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 46.78   Downloading hf_xet-1.4.2-cp37-abi3-manylinux_2_28_aarch64.whl.metadata (4.9 kB)
+#10 47.12 Collecting datasets>=2.19.0 (from FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 47.27   Downloading datasets-4.7.0-py3-none-any.whl.metadata (19 kB)
+#10 47.69 Collecting accelerate>=0.20.1 (from FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 47.83   Downloading accelerate-1.13.0-py3-none-any.whl.metadata (19 kB)
+#10 48.17 Collecting peft (from FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 48.31   Downloading peft-0.18.1-py3-none-any.whl.metadata (14 kB)
+#10 48.54 Collecting ir-datasets (from FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 48.69   Downloading ir_datasets-0.5.11-py3-none-any.whl.metadata (12 kB)
+#10 48.95 Collecting sentencepiece (from FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 49.16   Downloading sentencepiece-0.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl.metadata (10 kB)
+#10 49.61 Collecting protobuf (from FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 49.76   Downloading protobuf-7.34.0-cp310-abi3-manylinux2014_aarch64.whl.metadata (595 bytes)
+#10 49.76 Requirement already satisfied: setuptools>69 in /usr/local/lib/python3.11/site-packages (from pymilvus>=2.4.0->-r requirements.txt (line 14)) (79.0.1)
+#10 50.73 Collecting grpcio!=1.68.0,!=1.68.1,!=1.69.0,!=1.70.0,!=1.70.1,!=1.71.0,!=1.72.1,!=1.73.0,>=1.66.2 (from pymilvus>=2.4.0->-r requirements.txt (line 14))
+#10 50.87   Downloading grpcio-1.78.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl.metadata (3.8 kB)
+#10 51.19 Collecting pandas>=1.2.4 (from pymilvus>=2.4.0->-r requirements.txt (line 14))
+#10 51.36   Downloading pandas-3.0.1-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl.metadata (79 kB)
+#10 51.69 Collecting cachetools>=5.0.0 (from pymilvus>=2.4.0->-r requirements.txt (line 14))
+#10 51.83   Downloading cachetools-7.0.5-py3-none-any.whl.metadata (5.6 kB)
+#10 52.04 Collecting starlette>=0.46.0 (from fastapi>=0.115.0->-r requirements.txt (line 24))
+#10 52.19   Downloading starlette-0.52.1-py3-none-any.whl.metadata (6.3 kB)
+#10 52.37 Collecting annotated-doc>=0.0.2 (from fastapi>=0.115.0->-r requirements.txt (line 24))
+#10 52.52   Downloading annotated_doc-0.0.4-py3-none-any.whl.metadata (6.6 kB)
+#10 52.71 Collecting click>=7.0 (from uvicorn>=0.32.0->uvicorn[standard]>=0.32.0->-r requirements.txt (line 25))
+#10 52.89   Downloading click-8.3.1-py3-none-any.whl.metadata (2.6 kB)
+#10 53.27 Collecting psutil (from accelerate>=0.20.1->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 53.41   Downloading psutil-7.2.2-cp36-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (22 kB)
+#10 53.78 Collecting pyarrow>=21.0.0 (from datasets>=2.19.0->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 53.94   Downloading pyarrow-23.0.1-cp311-cp311-manylinux_2_28_aarch64.whl.metadata (3.1 kB)
+#10 54.14 Collecting dill<0.4.1,>=0.3.0 (from datasets>=2.19.0->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 54.30   Downloading dill-0.4.0-py3-none-any.whl.metadata (10 kB)
+#10 54.52 Collecting multiprocess<0.70.19 (from datasets>=2.19.0->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 54.66   Downloading multiprocess-0.70.18-py311-none-any.whl.metadata (7.5 kB)
+#10 54.95 Collecting python-dateutil>=2.8.2 (from pandas>=1.2.4->pymilvus>=2.4.0->-r requirements.txt (line 14))
+#10 55.12   Downloading python_dateutil-2.9.0.post0-py2.py3-none-any.whl.metadata (8.4 kB)
+#10 55.33 Collecting six>=1.5 (from python-dateutil>=2.8.2->pandas>=1.2.4->pymilvus>=2.4.0->-r requirements.txt (line 14))
+#10 55.48   Downloading six-1.17.0-py2.py3-none-any.whl.metadata (1.7 kB)
+#10 55.69 Collecting sympy>=1.13.3 (from torch>=1.11.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 55.84   Downloading sympy-1.14.0-py3-none-any.whl.metadata (12 kB)
+#10 56.06 Collecting networkx>=2.5.1 (from torch>=1.11.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 56.21   Downloading networkx-3.6.1-py3-none-any.whl.metadata (6.8 kB)
+#10 56.41 Collecting jinja2 (from torch>=1.11.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 56.57   Downloading jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+#10 56.76 Collecting mpmath<1.4,>=1.1.0 (from sympy>=1.13.3->torch>=1.11.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 56.93   Downloading mpmath-1.3.0-py3-none-any.whl.metadata (8.6 kB)
+#10 57.15 Collecting httptools>=0.6.3 (from uvicorn[standard]>=0.32.0->-r requirements.txt (line 25))
+#10 57.30   Downloading httptools-0.7.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (3.5 kB)
+#10 57.62 Collecting uvloop>=0.15.1 (from uvicorn[standard]>=0.32.0->-r requirements.txt (line 25))
+#10 57.76   Downloading uvloop-0.22.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (4.9 kB)
+#10 58.09 Collecting watchfiles>=0.20 (from uvicorn[standard]>=0.32.0->-r requirements.txt (line 25))
+#10 58.23   Downloading watchfiles-1.1.1-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl.metadata (4.9 kB)
+#10 58.57 Collecting websockets>=10.4 (from uvicorn[standard]>=0.32.0->-r requirements.txt (line 25))
+#10 58.72   Downloading websockets-16.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (6.8 kB)
+#10 59.04 Collecting beautifulsoup4>=4.4.1 (from ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 59.19   Downloading beautifulsoup4-4.14.3-py3-none-any.whl.metadata (3.8 kB)
+#10 59.40 Collecting inscriptis>=2.2.0 (from ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 59.57   Downloading inscriptis-2.7.1-py3-none-any.whl.metadata (27 kB)
+#10 60.12 Collecting lxml>=4.5.2 (from ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 60.26   Downloading lxml-6.0.2-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl.metadata (3.6 kB)
+#10 60.43 Collecting trec-car-tools>=2.5.4 (from ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 60.57   Downloading trec_car_tools-2.6-py3-none-any.whl.metadata (640 bytes)
+#10 60.83 Collecting lz4>=3.1.10 (from ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 60.97   Downloading lz4-4.4.5-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (3.8 kB)
+#10 61.22 Collecting warc3-wet>=0.2.3 (from ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 61.36   Downloading warc3_wet-0.2.5-py3-none-any.whl.metadata (2.2 kB)
+#10 61.61 Collecting warc3-wet-clueweb09>=0.2.5 (from ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 61.75   Downloading warc3-wet-clueweb09-0.2.5.tar.gz (17 kB)
+#10 61.77   Installing build dependencies: started
+#10 62.93   Installing build dependencies: finished with status 'done'
+#10 62.93   Getting requirements to build wheel: started
+#10 63.07   Getting requirements to build wheel: finished with status 'done'
+#10 63.07   Preparing metadata (pyproject.toml): started
+#10 63.14   Preparing metadata (pyproject.toml): finished with status 'done'
+#10 63.38 Collecting zlib-state>=0.1.3 (from ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 63.52   Downloading zlib_state-0.1.10.tar.gz (9.6 kB)
+#10 63.54   Installing build dependencies: started
+#10 64.68   Installing build dependencies: finished with status 'done'
+#10 64.69   Getting requirements to build wheel: started
+#10 64.82   Getting requirements to build wheel: finished with status 'done'
+#10 64.83   Preparing metadata (pyproject.toml): started
+#10 64.90   Preparing metadata (pyproject.toml): finished with status 'done'
+#10 65.15 Collecting ijson>=3.1.3 (from ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 65.30   Downloading ijson-3.5.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (23 kB)
+#10 65.52 Collecting unlzw3>=0.2.1 (from ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 65.67   Downloading unlzw3-0.2.3-py3-none-any.whl.metadata (2.3 kB)
+#10 65.96 Collecting soupsieve>=1.6.1 (from beautifulsoup4>=4.4.1->ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 66.10   Downloading soupsieve-2.8.3-py3-none-any.whl.metadata (4.6 kB)
+#10 66.33 Collecting cbor>=1.0.0 (from trec-car-tools>=2.5.4->ir-datasets->FlagEmbedding>=1.2.0->-r requirements.txt (line 11))
+#10 66.48   Downloading cbor-1.0.0.tar.gz (20 kB)
+#10 66.52   Installing build dependencies: started
+#10 67.63   Installing build dependencies: finished with status 'done'
+#10 67.63   Getting requirements to build wheel: started
+#10 67.77   Getting requirements to build wheel: finished with status 'done'
+#10 67.77   Preparing metadata (pyproject.toml): started
+#10 67.84   Preparing metadata (pyproject.toml): finished with status 'done'
+#10 68.15 Collecting MarkupSafe>=2.0 (from jinja2->torch>=1.11.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 68.29   Downloading markupsafe-3.0.3-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl.metadata (2.7 kB)
+#10 68.61 Collecting joblib>=1.3.0 (from scikit-learn->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 68.76   Downloading joblib-1.5.3-py3-none-any.whl.metadata (5.5 kB)
+#10 69.27 Collecting threadpoolctl>=3.2.0 (from scikit-learn->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 69.48   Downloading threadpoolctl-3.6.0-py3-none-any.whl.metadata (13 kB)
+#10 69.67 Collecting shellingham>=1.3.0 (from typer->transformers<6.0.0,>=4.41.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 69.83   Downloading shellingham-1.5.4-py2.py3-none-any.whl.metadata (3.5 kB)
+#10 70.03 Collecting rich>=12.3.0 (from typer->transformers<6.0.0,>=4.41.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 70.17   Downloading rich-14.3.3-py3-none-any.whl.metadata (18 kB)
+#10 70.39 Collecting markdown-it-py>=2.2.0 (from rich>=12.3.0->typer->transformers<6.0.0,>=4.41.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 70.53   Downloading markdown_it_py-4.0.0-py3-none-any.whl.metadata (7.3 kB)
+#10 70.72 Collecting pygments<3.0.0,>=2.13.0 (from rich>=12.3.0->typer->transformers<6.0.0,>=4.41.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 70.86   Downloading pygments-2.19.2-py3-none-any.whl.metadata (2.5 kB)
+#10 71.05 Collecting mdurl~=0.1 (from markdown-it-py>=2.2.0->rich>=12.3.0->typer->transformers<6.0.0,>=4.41.0->sentence-transformers>=3.0.0->-r requirements.txt (line 10))
+#10 71.20   Downloading mdurl-0.1.2-py3-none-any.whl.metadata (1.6 kB)
+#10 71.36 Downloading langgraph-1.1.2-py3-none-any.whl (167 kB)
+#10 71.87 Downloading langgraph_checkpoint-4.0.1-py3-none-any.whl (50 kB)
+#10 72.10 Downloading langgraph_prebuilt-1.0.8-py3-none-any.whl (35 kB)
+#10 72.28 Downloading langgraph_sdk-0.3.11-py3-none-any.whl (94 kB)
+#10 72.52 Downloading langchain-1.2.12-py3-none-any.whl (112 kB)
+#10 72.77 Downloading langchain_core-1.2.19-py3-none-any.whl (503 kB)
+#10 73.15 Downloading pydantic-2.12.5-py3-none-any.whl (463 kB)
+#10 73.42 Downloading pydantic_core-2.41.5-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (1.9 MB)
+#10 73.82    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.9/1.9 MB 4.8 MB/s  0:00:00
+#10 73.96 Downloading pyyaml-6.0.3-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (775 kB)
+#10 74.06    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 775.6/775.6 kB 8.5 MB/s  0:00:00
+#10 74.20 Downloading jsonpatch-1.33-py2.py3-none-any.whl (12 kB)
+#10 74.36 Downloading langsmith-0.7.17-py3-none-any.whl (359 kB)
+#10 74.55 Downloading httpx-0.28.1-py3-none-any.whl (73 kB)
+#10 74.72 Downloading httpcore-1.0.9-py3-none-any.whl (78 kB)
+#10 74.90 Downloading tenacity-9.1.4-py3-none-any.whl (28 kB)
+#10 75.05 Downloading typing_extensions-4.15.0-py3-none-any.whl (44 kB)
+#10 75.25 Downloading uuid_utils-0.14.1-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (344 kB)
+#10 75.40 Downloading langchain_community-0.4.1-py3-none-any.whl (2.5 MB)
+#10 75.60    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.5/2.5 MB 12.6 MB/s  0:00:00
+#10 75.77 Downloading sqlalchemy-2.0.48-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (3.3 MB)
+#10 75.98    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.3/3.3 MB 21.4 MB/s  0:00:00
+#10 76.13 Downloading pydantic_settings-2.13.1-py3-none-any.whl (58 kB)
+#10 76.29 Downloading aiohttp-3.13.3-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (1.7 MB)
+#10 76.37    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.7/1.7 MB 21.0 MB/s  0:00:00
+#10 76.51 Downloading dataclasses_json-0.6.7-py3-none-any.whl (28 kB)
+#10 76.65 Downloading httpx_sse-0.4.3-py3-none-any.whl (9.0 kB)
+#10 76.81 Downloading langchain_classic-1.0.3-py3-none-any.whl (1.0 MB)
+#10 76.87    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.0/1.0 MB 17.0 MB/s  0:00:00
+#10 77.01 Downloading langchain_text_splitters-1.1.1-py3-none-any.whl (35 kB)
+#10 77.17 Downloading marshmallow-3.26.2-py3-none-any.whl (50 kB)
+#10 77.34 Downloading multidict-6.7.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (246 kB)
+#10 78.01 Downloading requests-2.32.5-py3-none-any.whl (64 kB)
+#10 78.15 Downloading charset_normalizer-3.4.5-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (188 kB)
+#10 78.39 Downloading idna-3.11-py3-none-any.whl (71 kB)
+#10 78.53 Downloading typing_inspect-0.9.0-py3-none-any.whl (8.8 kB)
+#10 78.70 Downloading urllib3-2.6.3-py3-none-any.whl (131 kB)
+#10 78.91 Downloading yarl-1.23.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (100 kB)
+#10 79.07 Downloading openai-2.28.0-py3-none-any.whl (1.1 MB)
+#10 79.70    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.1/1.1 MB 2.0 MB/s  0:00:00
+#10 79.85 Downloading anyio-4.12.1-py3-none-any.whl (113 kB)
+#10 80.00 Downloading distro-1.9.0-py3-none-any.whl (20 kB)
+#10 80.15 Downloading jiter-0.13.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (354 kB)
+#10 80.33 Downloading langchain_openai-1.1.11-py3-none-any.whl (87 kB)
+#10 80.68 Downloading tiktoken-0.12.0-cp311-cp311-manylinux_2_28_aarch64.whl (1.1 MB)
+#10 80.82    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.1/1.1 MB 8.0 MB/s  0:00:00
+#10 81.01 Downloading sentence_transformers-5.3.0-py3-none-any.whl (512 kB)
+#10 81.25 Downloading transformers-5.3.0-py3-none-any.whl (10.7 MB)
+#10 81.97    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.7/10.7 MB 14.5 MB/s  0:00:00
+#10 82.21 Downloading huggingface_hub-1.7.1-py3-none-any.whl (616 kB)
+#10 82.28    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 616.3/616.3 kB 6.3 MB/s  0:00:00
+#10 82.43 Downloading hf_xet-1.4.2-cp37-abi3-manylinux_2_28_aarch64.whl (4.0 MB)
+#10 82.78    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.0/4.0 MB 11.4 MB/s  0:00:00
+#10 82.92 Downloading tokenizers-0.22.2-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (3.3 MB)
+#10 84.05    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.3/3.3 MB 2.7 MB/s  0:00:01
+#10 84.21 Downloading pymilvus-2.6.10-py3-none-any.whl (312 kB)
+#10 84.39 Downloading python_dotenv-1.2.2-py3-none-any.whl (22 kB)
+#10 84.53 Downloading rank_bm25-0.2.2-py3-none-any.whl (8.6 kB)
+#10 84.68 Downloading fastapi-0.135.1-py3-none-any.whl (116 kB)
+#10 84.82 Downloading uvicorn-0.41.0-py3-none-any.whl (68 kB)
+#10 84.96 Downloading python_multipart-0.0.22-py3-none-any.whl (24 kB)
+#10 85.20 Downloading redis-7.3.0-py3-none-any.whl (404 kB)
+#10 85.57 Downloading asyncpg-0.31.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (2.9 MB)
+#10 85.90    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.9/2.9 MB 45.1 MB/s  0:00:00
+#10 86.04 Downloading accelerate-1.13.0-py3-none-any.whl (383 kB)
+#10 86.25 Downloading aiohappyeyeballs-2.6.1-py3-none-any.whl (15 kB)
+#10 86.39 Downloading aiosignal-1.4.0-py3-none-any.whl (7.5 kB)
+#10 86.56 Downloading annotated_doc-0.0.4-py3-none-any.whl (5.3 kB)
+#10 86.78 Downloading annotated_types-0.7.0-py3-none-any.whl (13 kB)
+#10 86.93 Downloading attrs-25.4.0-py3-none-any.whl (67 kB)
+#10 87.10 Downloading cachetools-7.0.5-py3-none-any.whl (13 kB)
+#10 87.30 Downloading certifi-2026.2.25-py3-none-any.whl (153 kB)
+#10 87.45 Downloading click-8.3.1-py3-none-any.whl (108 kB)
+#10 87.60 Downloading datasets-4.7.0-py3-none-any.whl (527 kB)
+#10 87.72    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 527.5/527.5 kB 25.6 MB/s  0:00:00
+#10 87.87 Downloading dill-0.4.0-py3-none-any.whl (119 kB)
+#10 88.05 Downloading fsspec-2026.2.0-py3-none-any.whl (202 kB)
+#10 88.23 Downloading multiprocess-0.70.18-py311-none-any.whl (144 kB)
+#10 88.38 Downloading filelock-3.25.2-py3-none-any.whl (26 kB)
+#10 88.53 Downloading frozenlist-1.8.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (233 kB)
+#10 88.74 Downloading greenlet-3.3.2-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl (581 kB)
+#10 88.78    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 581.1/581.1 kB 29.5 MB/s  0:00:00
+#10 88.92 Downloading grpcio-1.78.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl (6.5 MB)
+#10 89.25    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.5/6.5 MB 20.1 MB/s  0:00:00
+#10 89.40 Downloading h11-0.16.0-py3-none-any.whl (37 kB)
+#10 89.55 Downloading jsonpointer-3.0.0-py2.py3-none-any.whl (7.6 kB)
+#10 89.70 Downloading mypy_extensions-1.1.0-py3-none-any.whl (5.0 kB)
+#10 89.92 Downloading numpy-2.4.3-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl (16.0 MB)
+#10 90.65    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 16.0/16.0 MB 21.7 MB/s  0:00:00
+#10 90.80 Downloading orjson-3.11.7-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (128 kB)
+#10 90.97 Downloading ormsgpack-1.12.2-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (203 kB)
+#10 91.12 Downloading packaging-26.0-py3-none-any.whl (74 kB)
+#10 91.29 Downloading pandas-3.0.1-cp311-cp311-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl (10.8 MB)
+#10 93.47    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.8/10.8 MB 5.8 MB/s  0:00:02
+#10 93.62 Downloading propcache-0.4.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (214 kB)
+#10 93.78 Downloading protobuf-7.34.0-cp310-abi3-manylinux2014_aarch64.whl (325 kB)
+#10 93.97 Downloading pyarrow-23.0.1-cp311-cp311-manylinux_2_28_aarch64.whl (44.5 MB)
+#10 98.17    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 44.5/44.5 MB 10.6 MB/s  0:00:04
+#10 98.32 Downloading python_dateutil-2.9.0.post0-py2.py3-none-any.whl (229 kB)
+#10 98.48 Downloading regex-2026.2.28-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (791 kB)
+#10 98.61    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 791.9/791.9 kB 13.1 MB/s  0:00:00
+#10 98.84 Downloading requests_toolbelt-1.0.0-py2.py3-none-any.whl (54 kB)
+#10 98.98 Downloading safetensors-0.7.0-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (491 kB)
+#10 99.16 Downloading six-1.17.0-py2.py3-none-any.whl (11 kB)
+#10 99.36 Downloading starlette-0.52.1-py3-none-any.whl (74 kB)
+#10 99.53 Downloading torch-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl (146.0 MB)
+#10 110.1    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 146.0/146.0 MB 13.8 MB/s  0:00:10
+#10 110.4 Downloading networkx-3.6.1-py3-none-any.whl (2.1 MB)
+#10 110.6    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 9.2 MB/s  0:00:00
+#10 110.7 Downloading sympy-1.14.0-py3-none-any.whl (6.3 MB)
+#10 111.6    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.3/6.3 MB 7.0 MB/s  0:00:00
+#10 111.8 Downloading mpmath-1.3.0-py3-none-any.whl (536 kB)
+#10 111.8    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 536.2/536.2 kB 13.7 MB/s  0:00:00
+#10 112.0 Downloading tqdm-4.67.3-py3-none-any.whl (78 kB)
+#10 112.1 Downloading typing_inspection-0.4.2-py3-none-any.whl (14 kB)
+#10 112.2 Downloading httptools-0.7.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (454 kB)
+#10 112.5 Downloading uvloop-0.22.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (3.8 MB)
+#10 112.8    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.8/3.8 MB 10.6 MB/s  0:00:00
+#10 113.0 Downloading watchfiles-1.1.1-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (448 kB)
+#10 113.2 Downloading websockets-16.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (185 kB)
+#10 113.4 Downloading xxhash-3.6.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (213 kB)
+#10 113.7 Downloading zstandard-0.25.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl (5.1 MB)
+#10 114.3    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 5.1/5.1 MB 8.9 MB/s  0:00:00
+#10 114.4 Downloading ir_datasets-0.5.11-py3-none-any.whl (866 kB)
+#10 114.6    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 866.1/866.1 kB 4.1 MB/s  0:00:00
+#10 114.7 Downloading beautifulsoup4-4.14.3-py3-none-any.whl (107 kB)
+#10 114.9 Downloading ijson-3.5.0-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (138 kB)
+#10 115.1 Downloading inscriptis-2.7.1-py3-none-any.whl (45 kB)
+#10 115.5 Downloading lxml-6.0.2-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl (5.0 MB)
+#10 116.0    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 5.0/5.0 MB 13.2 MB/s  0:00:00
+#10 116.1 Downloading lz4-4.4.5-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (1.3 MB)
+#10 116.2    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.3/1.3 MB 14.5 MB/s  0:00:00
+#10 116.4 Downloading soupsieve-2.8.3-py3-none-any.whl (37 kB)
+#10 116.5 Downloading trec_car_tools-2.6-py3-none-any.whl (8.4 kB)
+#10 116.7 Downloading unlzw3-0.2.3-py3-none-any.whl (6.7 kB)
+#10 116.8 Downloading warc3_wet-0.2.5-py3-none-any.whl (18 kB)
+#10 117.0 Downloading jinja2-3.1.6-py3-none-any.whl (134 kB)
+#10 117.2 Downloading markupsafe-3.0.3-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (24 kB)
+#10 117.3 Downloading peft-0.18.1-py3-none-any.whl (556 kB)
+#10 117.4    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 557.0/557.0 kB 17.5 MB/s  0:00:00
+#10 117.5 Downloading psutil-7.2.2-cp36-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl (156 kB)
+#10 117.7 Downloading scikit_learn-1.8.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl (8.8 MB)
+#10 118.6    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 8.8/8.8 MB 10.2 MB/s  0:00:00
+#10 118.8 Downloading joblib-1.5.3-py3-none-any.whl (309 kB)
+#10 118.9 Downloading scipy-1.17.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl (33.1 MB)
+#10 121.5    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 33.1/33.1 MB 12.8 MB/s  0:00:02
+#10 121.7 Downloading threadpoolctl-3.6.0-py3-none-any.whl (18 kB)
+#10 121.9 Downloading sentencepiece-0.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl (1.3 MB)
+#10 122.0    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.3/1.3 MB 17.4 MB/s  0:00:00
+#10 122.1 Downloading sniffio-1.3.1-py3-none-any.whl (10 kB)
+#10 122.3 Downloading typer-0.24.1-py3-none-any.whl (56 kB)
+#10 122.4 Downloading rich-14.3.3-py3-none-any.whl (310 kB)
+#10 122.6 Downloading pygments-2.19.2-py3-none-any.whl (1.2 MB)
+#10 122.7    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.2/1.2 MB 12.2 MB/s  0:00:00
+#10 122.8 Downloading markdown_it_py-4.0.0-py3-none-any.whl (87 kB)
+#10 123.1 Downloading mdurl-0.1.2-py3-none-any.whl (10.0 kB)
+#10 123.2 Downloading shellingham-1.5.4-py2.py3-none-any.whl (9.8 kB)
+#10 123.5 Building wheels for collected packages: FlagEmbedding, cbor, warc3-wet-clueweb09, zlib-state
+#10 123.5   Building wheel for FlagEmbedding (pyproject.toml): started
+#10 123.6   Building wheel for FlagEmbedding (pyproject.toml): finished with status 'done'
+#10 123.6   Created wheel for FlagEmbedding: filename=flagembedding-1.3.5-py3-none-any.whl size=233820 sha256=ec23cec29f59c96f19efa21aeef0fe02623311c4e2299903bda17c12e9f4567a
+#10 123.6   Stored in directory: /tmp/pip-ephem-wheel-cache-sq5w90ji/wheels/fc/1c/66/c9c846a8f8cbd9574db8d76b0a61410a087bc07d53682a54f4
+#10 123.6   Building wheel for cbor (pyproject.toml): started
+#10 123.9   Building wheel for cbor (pyproject.toml): finished with status 'done'
+#10 123.9   Created wheel for cbor: filename=cbor-1.0.0-cp311-cp311-linux_aarch64.whl size=54529 sha256=ed782c69997fb791f48a8c997c5aad0d0ccac9f509356e2ac5432916276d4486
+#10 123.9   Stored in directory: /tmp/pip-ephem-wheel-cache-sq5w90ji/wheels/21/6b/45/0c34253b1af07d1d9dc524f6d44d74a6b191c43152e6aaf641
+#10 123.9   Building wheel for warc3-wet-clueweb09 (pyproject.toml): started
+#10 124.0   Building wheel for warc3-wet-clueweb09 (pyproject.toml): finished with status 'done'
+#10 124.0   Created wheel for warc3-wet-clueweb09: filename=warc3_wet_clueweb09-0.2.5-py3-none-any.whl size=18998 sha256=b9460d28acb764dcfd91a0b41aa1b616ab206d4f759c1bd30c6b5e5383d89094
+#10 124.0   Stored in directory: /tmp/pip-ephem-wheel-cache-sq5w90ji/wheels/63/f9/dc/2dd16d3330e327236e4d407941975c42d5159d200cdb7922d8
+#10 124.0   Building wheel for zlib-state (pyproject.toml): started
+#10 124.1   Building wheel for zlib-state (pyproject.toml): finished with status 'error'
+#10 124.1   error: subprocess-exited-with-error
+#10 124.1   
+#10 124.1   × Building wheel for zlib-state (pyproject.toml) did not run successfully.
+#10 124.1   │ exit code: 1
+#10 124.1   ╰─> [34 lines of output]
+#10 124.1       /tmp/pip-build-env-zrx5wag1/overlay/lib/python3.11/site-packages/setuptools/dist.py:765: SetuptoolsDeprecationWarning: License classifiers are deprecated.
+#10 124.1       !!
+#10 124.1       
+#10 124.1               ********************************************************************************
+#10 124.1               Please consider removing the following classifiers in favor of a SPDX license expression:
+#10 124.1       
+#10 124.1               License :: OSI Approved :: MIT License
+#10 124.1       
+#10 124.1               See https://packaging.python.org/en/latest/guides/writing-pyproject-toml/#license for details.
+#10 124.1               ********************************************************************************
+#10 124.1       
+#10 124.1       !!
+#10 124.1         self._finalize_license_expression()
+#10 124.1       running bdist_wheel
+#10 124.1       running build
+#10 124.1       running build_py
+#10 124.1       creating build/lib.linux-aarch64-cpython-311/zlib_state
+#10 124.1       copying zlib_state/__init__.py -> build/lib.linux-aarch64-cpython-311/zlib_state
+#10 124.1       running egg_info
+#10 124.1       writing zlib_state.egg-info/PKG-INFO
+#10 124.1       writing dependency_links to zlib_state.egg-info/dependency_links.txt
+#10 124.1       writing top-level names to zlib_state.egg-info/top_level.txt
+#10 124.1       reading manifest file 'zlib_state.egg-info/SOURCES.txt'
+#10 124.1       adding license file 'LICENSE'
+#10 124.1       writing manifest file 'zlib_state.egg-info/SOURCES.txt'
+#10 124.1       running build_ext
+#10 124.1       building '_zlib_state' extension
+#10 124.1       creating build/temp.linux-aarch64-cpython-311/src
+#10 124.1       gcc -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -I/usr/local/include/python3.11 -c src/zlib_state.c -o build/temp.linux-aarch64-cpython-311/src/zlib_state.o
+#10 124.1       src/zlib_state.c:9:10: fatal error: zlib.h: No such file or directory
+#10 124.1           9 | #include <zlib.h>
+#10 124.1             |          ^~~~~~~~
+#10 124.1       compilation terminated.
+#10 124.1       error: command '/usr/bin/gcc' failed with exit code 1
+#10 124.1       [end of output]
+#10 124.1   
+#10 124.1   note: This error originates from a subprocess, and is likely not a problem with pip.
+#10 124.1   ERROR: Failed building wheel for zlib-state
+#10 124.1 Successfully built FlagEmbedding cbor warc3-wet-clueweb09
+#10 124.1 Failed to build zlib-state
+#10 125.1 error: failed-wheel-build-for-install
+#10 125.1 
+#10 125.1 × Failed to build installable wheels for some pyproject.toml based projects
+#10 125.1 ╰─> zlib-state
+#10 ERROR: process "/bin/sh -c if [ \"$PIP_USE_MIRROR\" = \"1\" ]; then     pip install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --default-timeout=120;     pip install --no-cache-dir -r requirements.txt         -i https://mirrors.aliyun.com/pypi/simple/         --trusted-host mirrors.aliyun.com         --extra-index-url https://pypi.org/simple/         --default-timeout=120 --retries 5;     else     pip install --upgrade pip --default-timeout=120;     pip install --no-cache-dir -r requirements.txt --default-timeout=120 --retries 5;     fi" did not complete successfully: exit code: 1
+------
+ > [ 6/12] RUN if [ "1" = "1" ]; then     pip install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --default-timeout=120;     pip install --no-cache-dir -r requirements.txt         -i https://mirrors.aliyun.com/pypi/simple/         --trusted-host mirrors.aliyun.com         --extra-index-url https://pypi.org/simple/         --default-timeout=120 --retries 5;     else     pip install --upgrade pip --default-timeout=120;     pip install --no-cache-dir -r requirements.txt --default-timeout=120 --retries 5;     fi:
+124.1       [end of output]
+124.1   
+124.1   note: This error originates from a subprocess, and is likely not a problem with pip.
+124.1   ERROR: Failed building wheel for zlib-state
+124.1 Successfully built FlagEmbedding cbor warc3-wet-clueweb09
+124.1 Failed to build zlib-state
+125.1 error: failed-wheel-build-for-install
+125.1 
+125.1 × Failed to build installable wheels for some pyproject.toml based projects
+125.1 ╰─> zlib-state
+------
+Dockerfile:27
+--------------------
+  26 |     COPY requirements.txt .
+  27 | >>> RUN if [ "$PIP_USE_MIRROR" = "1" ]; then \
+  28 | >>>     pip install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --default-timeout=120; \
+  29 | >>>     pip install --no-cache-dir -r requirements.txt \
+  30 | >>>         -i https://mirrors.aliyun.com/pypi/simple/ \
+  31 | >>>         --trusted-host mirrors.aliyun.com \
+  32 | >>>         --extra-index-url https://pypi.org/simple/ \
+  33 | >>>         --default-timeout=120 --retries 5; \
+  34 | >>>     else \
+  35 | >>>     pip install --upgrade pip --default-timeout=120; \
+  36 | >>>     pip install --no-cache-dir -r requirements.txt --default-timeout=120 --retries 5; \
+  37 | >>>     fi
+  38 |     
+--------------------
+ERROR: failed to build: failed to solve: process "/bin/sh -c if [ \"$PIP_USE_MIRROR\" = \"1\" ]; then     pip install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com --default-timeout=120;     pip install --no-cache-dir -r requirements.txt         -i https://mirrors.aliyun.com/pypi/simple/         --trusted-host mirrors.aliyun.com         --extra-index-url https://pypi.org/simple/         --default-timeout=120 --retries 5;     else     pip install --upgrade pip --default-timeout=120;     pip install --no-cache-dir -r requirements.txt --default-timeout=120 --retries 5;     fi" did not complete successfully: exit code: 1
+
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/bgetzdxuspc5i50trx3qqs339

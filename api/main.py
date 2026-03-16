@@ -573,10 +573,9 @@ def llm_router_status():
 @app.get("/")
 def index():
     """根路径：若存在 frontend/index.html 则返回该页面，否则返回 API 说明 JSON。"""
-    if FRONTEND_DIR.exists():
-        index_file = FRONTEND_DIR / "index.html"
-        if index_file.exists():
-            return FileResponse(index_file)
+    index_file = FRONTEND_DIR / "index.html"
+    if index_file.is_file():
+        return FileResponse(index_file, media_type="text/html")
     return {"message": "Knowledge Base Agent API", "docs": "/docs"}
 
 

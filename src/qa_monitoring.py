@@ -283,33 +283,33 @@ def upsert_feedback(
             if conn is None:
                 logger.warning("保存问答反馈降级：数据库不可用")
             else:
-            conn.execute(
-                text(f"""
-                    INSERT INTO {_FEEDBACK_TABLE} (
-                        observation_id, conversation_id, user_id, actor_key, rating, tags, free_text, created_at, updated_at
-                    )
-                    VALUES (
-                        :observation_id, :conversation_id, :user_id, :actor_key, :rating,
-                        CAST(:tags AS JSONB), :free_text, NOW(), NOW()
-                    )
-                    ON CONFLICT (actor_key, observation_id)
-                    DO UPDATE SET
-                        rating = EXCLUDED.rating,
-                        tags = EXCLUDED.tags,
-                        free_text = EXCLUDED.free_text,
-                        updated_at = NOW()
-                """),
-                {
-                    "observation_id": observation_id[:64],
-                    "conversation_id": conversation_id[:128],
-                    "user_id": user_id,
-                    "actor_key": actor_key,
-                    "rating": rating[:16],
-                    "tags": json.dumps(safe_tags, ensure_ascii=False),
-                    "free_text": (free_text or "")[:5000],
-                },
-            )
-            conn.commit()
+                conn.execute(
+                    text(f"""
+                        INSERT INTO {_FEEDBACK_TABLE} (
+                            observation_id, conversation_id, user_id, actor_key, rating, tags, free_text, created_at, updated_at
+                        )
+                        VALUES (
+                            :observation_id, :conversation_id, :user_id, :actor_key, :rating,
+                            CAST(:tags AS JSONB), :free_text, NOW(), NOW()
+                        )
+                        ON CONFLICT (actor_key, observation_id)
+                        DO UPDATE SET
+                            rating = EXCLUDED.rating,
+                            tags = EXCLUDED.tags,
+                            free_text = EXCLUDED.free_text,
+                            updated_at = NOW()
+                    """),
+                    {
+                        "observation_id": observation_id[:64],
+                        "conversation_id": conversation_id[:128],
+                        "user_id": user_id,
+                        "actor_key": actor_key,
+                        "rating": rating[:16],
+                        "tags": json.dumps(safe_tags, ensure_ascii=False),
+                        "free_text": (free_text or "")[:5000],
+                    },
+                )
+                conn.commit()
     except Exception as e:
         logger.warning("保存问答反馈失败: %s", e)
     return {

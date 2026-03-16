@@ -18,6 +18,8 @@ services:
     volumes:
       # 持久化：SQLite、上传文件、Schema 覆盖、高频 QA 数据
       - ./data:/app/data
+    # 前端页面：挂载后根路径 / 返回 index.html（与镜像内 COPY frontend 二选一或并存）
+      - ./frontend:/app/frontend
     # 可选：需缓存时启动 redis，仅启动 app 时缓存不可用
     depends_on:
       redis:

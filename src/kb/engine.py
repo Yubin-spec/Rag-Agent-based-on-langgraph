@@ -88,6 +88,9 @@ class KnowledgeQueryTrace:
     retrieved_chunk_ids: list[str] = field(default_factory=list)
     fallback_reason: str = ""
     pending_sql: bool = False
+    # 二次 RAG：是否触发过第二轮检索，以及使用的 Q2（改写/细化后的问题）
+    second_round_used: bool = False
+    second_round_query: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """转换为可序列化 dict。"""
@@ -107,6 +110,8 @@ class KnowledgeQueryTrace:
             "retrieved_chunk_ids": list(self.retrieved_chunk_ids),
             "fallback_reason": self.fallback_reason,
             "pending_sql": self.pending_sql,
+            "second_round_used": self.second_round_used,
+            "second_round_query": self.second_round_query,
         }
 
 
@@ -194,6 +199,136 @@ class KnowledgeEngine:
         if not candidates:
             return 0.0
         return max(evaluate_retrieval(answer, text).normalized_score for text in candidates)
+
+    def _should_use_second_round(self, trace: KnowledgeQueryTrace) -> bool:
+        """
+        是否触发二次 RAG：
+        - 需显式开启 rag_enable_second_round；
+        - 且首轮为 rag_no_hit / rag_fallback_unconfirmed，或 grounding_score 明显低于阈值。
+        """
+        settings = get_settings()
+        if not getattr(settings, "rag_enable_second_round", False):
+            return False
+        # 首轮结论型状态
+        if trace.final_status in ("rag_no_hit", "rag_no_context", "rag_fallback_unconfirmed"):
+            return True
+        # 根据 grounding_score 判断是否明显偏低
+        g = float(trace.grounding_score or 0.0)
+        base = float(getattr(settings, "rag_answer_grounding_min_score", 0.18))
+        cfg = float(getattr(settings, "rag_second_round_min_grounding", 0.0) or 0.0)
+        threshold = cfg if cfg > 0 else base / 2.0
+        return g > 0 and g < threshold
+
+    def _build_second_round_query(
+        self,
+        question: str,
+        answer1: str,
+        trace: KnowledgeQueryTrace,
+    ) -> str:
+        """
+        构造第二轮检索用的 Q2：
+        - 若检索本身较弱（top_match_score 低），尝试在原问题后补充从已有证据中抽取的关键词；
+        - 若主要问题在于答案与证据不对齐，则对原问题做轻微强调，而不改变其语义。
+        """
+        base_q = (question or "").strip()
+        if not base_q:
+            return base_q
+        # 简单启发式：匹配度过低时，从已检索的文档中抽取少量高频中文词作补充
+        if trace.top_match_score < 0.1 and trace.source_count > 0:
+            try:
+                import jieba
+
+                texts: list[str] = []
+                # 仅取前几个证据，避免太长
+                for c in getattr(self, "_last_rag_chunks_for_q1", [])[:3]:
+                    parent = (getattr(c, "parent_content", "") or "").strip()
+                    content = (getattr(c, "content", "") or "").strip()
+                    if parent:
+                        texts.append(parent)
+                    if content and content != parent:
+                        texts.append(content)
+                joined = "\n".join(texts)[:1000]
+                if joined:
+                    tokens = [t for t in jieba.cut(joined) if len(t.strip()) >= 2]
+                    # 按出现顺序去重，取前几个长词
+                    seen = set()
+                    keywords: list[str] = []
+                    for t in tokens:
+                        if t not in seen:
+                            seen.add(t)
+                            keywords.append(t)
+                        if len(keywords) >= 3:
+                            break
+                    if keywords:
+                        extra = "、".join(keywords)
+                        return f"{base_q}（重点关注：{extra}）"
+            except Exception:
+                pass
+        # 其余情况：保持原 query，仅在 trace 中记录，方便后续演进为 LLM 改写
+        return base_q
+
+    def _maybe_second_round_rag(
+        self,
+        question: str,
+        answer1: str,
+        rag_result1: RAGRetrieveResult,
+        trace: KnowledgeQueryTrace,
+    ) -> Tuple[str, RAGRetrieveResult]:
+        """
+        根据 trace 判定是否需要二次 RAG：
+        - 不满足条件时直接返回首轮结果；
+        - 满足条件时基于 Q2 再检索一次，并用第二轮结果重生成答案。
+        """
+        if not self._should_use_second_round(trace):
+            return answer1, rag_result1
+        # 在 engine 层构造 Q2 并记录
+        q2 = self._build_second_round_query(question, answer1, trace)
+        if not q2 or q2 == question:
+            # 即使 Q2 与原问题相同，也只做一次额外尝试，方便后续演进为 LLM 改写
+            q2 = question
+        trace.second_round_used = True
+        trace.second_round_query = q2
+        settings = get_settings()
+        factor = max(1.0, float(getattr(settings, "rag_second_round_top_k_factor", 1.5) or 1.5))
+        base_top_k = 10
+        base_rerank_top = 5
+        top_k2 = int(base_top_k * factor)
+        rerank_top2 = int(base_rerank_top * min(factor, 2.0))
+        try:
+            rag_result2 = self.rag.retrieve_with_validation(
+                q2,
+                top_k=top_k2,
+                use_rerank=True,
+                rerank_top=rerank_top2,
+            )
+        except Exception:
+            # 检索异常时保留首轮结果
+            return answer1, rag_result1
+        # 若二次仍无命中，则不强制覆盖首轮答案
+        if not rag_result2.chunks:
+            # 标记为二次仍无命中，便于后续分析
+            trace.final_status = "rag_second_round_no_hit"
+            trace.fallback_reason = trace.fallback_reason or "second_round_no_retrieval_hit"
+            return answer1, rag_result1
+        # 用二次检索结果更新 trace 中的检索指标
+        trace.retrieve_attempt += rag_result2.attempt
+        trace.source_count = len(rag_result2.chunks)
+        trace.retrieved_doc_ids = list(
+            dict.fromkeys([c.doc_id for c in rag_result2.chunks if c.doc_id])
+        )
+        trace.retrieved_chunk_ids = list(
+            dict.fromkeys([c.chunk_id for c in rag_result2.chunks if c.chunk_id])
+        )
+        if rag_result2.evals:
+            trace.top_match_score = max(
+                e.match_score for e in rag_result2.evals if e is not None
+            )
+            trace.top_normalized_score = max(
+                e.normalized_score for e in rag_result2.evals if e is not None
+            )
+        # 基于 Q2 和二次检索结果重新生成答案（grounding 逻辑复用）
+        answer2 = self._generate_grounded_answer(q2, rag_result2, trace=trace)
+        return answer2, rag_result2
 
     def _generate_grounded_answer(
         self,
@@ -438,12 +573,20 @@ class KnowledgeEngine:
         if rag_result.evals:
             trace.top_match_score = max(e.match_score for e in rag_result.evals if e is not None)
             trace.top_normalized_score = max(e.normalized_score for e in rag_result.evals if e is not None)
+        # 记录首轮检索指标
         if not rag_result.chunks:
             trace.final_status = "rag_no_hit"
             trace.fallback_reason = "no_retrieval_hit"
             return ("未找到相关知识，建议您换个问法或转人工客服。", None)
 
+        # 先基于首轮检索结果生成答案
+        # 为了在二次 RAG 中使用首轮答案 A1，需要暂存 A1 与首轮检索结果
+        self._last_rag_chunks_for_q1 = rag_result.chunks
         answer_text = self._generate_grounded_answer(question, rag_result, trace=trace)
+        # 根据 trace 判定是否需要二次 RAG；若触发则用 Q2 + 新检索结果覆盖
+        answer_text, rag_result = self._maybe_second_round_rag(
+            question, answer_text, rag_result, trace
+        )
 
         # 答案 + 依据来源（依赖的切片全部展示）
         sources_block = _format_sources(rag_result)
@@ -487,7 +630,7 @@ class KnowledgeEngine:
                 yield chunk
             return
 
-        # 3) RAG：检索后流式生成
+        # 3) RAG：检索后流式生成（当前流式路径仅使用首轮 RAG，不做二次 RAG，以保障首包延迟）
         trace.route = "rag"
         rag_result = self.rag.retrieve_with_validation(
             question, top_k=10, use_rerank=True, rerank_top=5
@@ -555,7 +698,15 @@ class KnowledgeEngine:
             trace.final_status = "rag_no_hit"
             trace.fallback_reason = "no_retrieval_hit"
             return ("未找到相关知识，建议您换个问法或转人工客服。", None)
-        answer_text = await self._generate_grounded_answer_async(question, rag_result, trace=trace)
+        # 首轮异步生成答案
+        self._last_rag_chunks_for_q1 = rag_result.chunks
+        answer_text = await self._generate_grounded_answer_async(
+            question, rag_result, trace=trace
+        )
+        # 如有需要，执行二次 RAG 并重生成答案
+        answer_text, rag_result = self._maybe_second_round_rag(
+            question, answer_text, rag_result, trace
+        )
         sources_block = _format_sources(rag_result)
         if sources_block:
             return (answer_text + "\n\n" + sources_block, None)

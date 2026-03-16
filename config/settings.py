@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     rag_min_match_score: float = 0.3
     rag_max_retrieve_attempts: int = 3
     rag_default_chunk_size: int = 512
+    # 默认：父子分段 + 切点句/段边界对齐（避免断句、不过碎）。True 时仅用固定长度无对齐（兼容旧行为）
+    rag_use_legacy_fixed_chunking: bool = False
     rag_answer_grounding_min_score: float = 0.18  # 最终答案与检索文档的最低关联度，低于该值视为可能幻觉
     rag_answer_max_regenerate_times: int = 3  # 最终答案与文档关联度低时，最多重生成 3 次
     # 注入生成阶段的检索上下文总字符数上限，0 表示不限制；超出则从末尾丢弃 chunk，控制 token
@@ -68,6 +70,24 @@ class Settings(BaseSettings):
     # RAG 检索结果缓存：进程内 LRU 条数，0 表示关闭；相同 query 命中则跳过 Milvus+BM25
     rag_retrieval_cache_max_entries: int = 0
     rag_retrieval_cache_ttl_seconds: int = 300  # 仅当 max_entries>0 时有效
+    # RRF 融合：True 时 BM25 与向量两路用 RRF 合并排序，否则按比例取条数
+    rag_use_rrf: bool = True
+    rag_rrf_k: int = 60  # RRF 公式 1/(k+rank) 的 k
+    # 重排前规则过滤：True 时丢弃与 query 无任何词/字重叠的 chunk，减少送入重排的噪音
+    rag_pre_rerank_require_query_overlap: bool = True
+    # 重排后多样性：保留重排得分最高的前 N 条作为必选证据（保证 top 可引用），其余名额用 MMR 选多样性
+    rag_rerank_anchor_count: int = 3  # 必选证据条数，保证最终 top3 可引用
+    rag_use_diversity_after_rerank: bool = True
+    rag_diversity_mmr_lambda: float = 0.8  # MMR 中相关性权重，越高越偏向重排分
+    # Query 规则改写：配置表路径非空且启用时，检索前对 query 做归一化/纠错/同义词替换（规则需自行梳理，见 docs/QUERY_REWRITE_RULES.md）
+    rag_use_query_rewrite_by_rules: bool = False
+    rag_query_rewrite_rules_path: str = "data/query_rewrite_rules.json"  # 相对项目根；示例见 data/query_rewrite_rules.example.json
+    # 二次 RAG：首轮 RAG+生成效果不达标时，是否尝试基于 Q2（改写/细化后的问题）再检索一次
+    rag_enable_second_round: bool = False
+    # 触发二次 RAG 的 grounding 下限；若为 0 则默认使用 rag_answer_grounding_min_score 的一半
+    rag_second_round_min_grounding: float = 0.1
+    # 二次 RAG 时放大的 top_k 系数（>1 表示扩大召回范围）
+    rag_second_round_top_k_factor: float = 1.5
 
     # ---------- Text2SQL ----------
     text2sql_database_uri: str = "sqlite:///./data/kb.db"

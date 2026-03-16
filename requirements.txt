@@ -13,6 +13,7 @@ FlagEmbedding>=1.2.0
 # Vector DB & Retrieval
 pymilvus>=2.4.0
 rank_bm25>=0.2.2
+jieba>=0.42.1
 
 # Text2SQL / DB
 sqlalchemy>=2.0.0

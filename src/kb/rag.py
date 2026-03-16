@@ -1,12 +1,13 @@
 # src/kb/rag.py
 """
-复杂问题 RAG：BM25 + HNSW 混合检索（3:7），检索评估与重检，答案展示依据来源。
+复杂问题 RAG：BM25 + HNSW 混合检索，RRF 融合、BGE 重排、规则预过滤与重排后多样性，检索评估与重检。
 模型使用约定（本项目禁止调用 OpenAI）：
   - 向量模型：仅 BGE-M3（BAAI/bge-m3），本地部署/本地加载，不调用远程 embedding API；
   - 重排模型：仅 BGE Reranker Large（BAAI/bge-reranker-large），本地部署/本地加载，不调用远程 API；
   - 大模型不在此模块调用，由 kb.engine 使用 DeepSeek。
 """
 import hashlib
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -14,8 +15,20 @@ from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 from config import get_settings
-from .retrieval_eval import evaluate_retrieval, RetrievalEvalResult
+from .retrieval_eval import evaluate_retrieval, RetrievalEvalResult, compute_query_coverage
 from .embedding_loader import get_bge_embedding, get_bge_reranker
+from .query_rewrite import rewrite_query_by_rules
+
+
+def _jieba_tokenize_for_search(text: str) -> List[str]:
+    """jieba 精确搜索分词，用于 BM25 索引与查询。"""
+    if not text or not text.strip():
+        return [" "]
+    try:
+        import jieba
+        return list(jieba.cut_for_search(text.strip()))
+    except Exception:
+        return list(text.strip()) or [" "]
 
 _rag_cache: Optional[OrderedDict] = None
 _rag_cache_lock = threading.Lock()
@@ -28,6 +41,14 @@ def _rag_cache_key(query: str, total_k: int, use_rerank: bool, rerank_top: int) 
 
 def _get_settings():
     return get_settings()
+
+
+def _effective_query_for_retrieval(raw_query: str) -> str:
+    """检索用 query：若启用规则改写则先做规则改写，否则返回原 query。"""
+    s = _get_settings()
+    if getattr(s, "rag_use_query_rewrite_by_rules", False) and getattr(s, "rag_query_rewrite_rules_path", "").strip():
+        return rewrite_query_by_rules(raw_query.strip(), s.rag_query_rewrite_rules_path.strip())
+    return raw_query.strip()
 
 _rag_retriever_singleton: Optional["RAGRetriever"] = None
 
@@ -62,7 +83,8 @@ class RAGRetrieveResult:
 
 class RAGRetriever:
     """
-    RAG 检索器：全文(BM25)与向量(Milvus/HNSW)按 3:7 合并，BGE 重排，
+    RAG 检索器：BM25（jieba 精确搜索分词）+ 向量(Milvus/HNSW)，RRF 融合或比例合并，
+    重排前规则过滤（无 query 重叠则丢弃），BGE 重排，重排后多样性（top 锚定条数保证可引用，其余 MMR），
     对候选做匹配度/无关比例评估，低于阈值则重检（最多 3 次）。
     向量与重排均为本地部署：BGE-M3 / BGE Reranker 在进程内加载，不调用任何远程 embedding/rerank API。
     """
@@ -150,12 +172,12 @@ class RAGRetriever:
         )
 
     def _bm25_search(self, query: str, top_k: int) -> List[dict]:
-        """BM25 全文检索（按字 tokenize），返回 content、score、source=bm25 的 dict 列表。"""
+        """BM25 全文检索（jieba 精确搜索分词），返回 content、score、source=bm25 的 dict 列表。"""
         if not self._bm25_index or not self._bm25_corpus:
             return []
         try:
             from rank_bm25 import BM25Okapi
-            tokenized_query = list(query.strip()) or [" "]
+            tokenized_query = _jieba_tokenize_for_search(query)
             scores = self._bm25_index.get_scores(tokenized_query)
             indexed = sorted(range(len(scores)), key=lambda i: -scores[i])
             out = []
@@ -209,6 +231,95 @@ class RAGRetriever:
                     _rag_cache.popitem(last=False)
         return combined
 
+    def _rrf_merge(
+        self,
+        vector_raw: List[dict],
+        bm25_raw: List[dict],
+        k: int,
+        total_k: int,
+    ) -> List[dict]:
+        """RRF 融合两路结果：按 content 去重，按 RRF 得分排序后取 top total_k。"""
+        big = 9999
+        key_to_doc: dict = {}
+        for rank, c in enumerate(vector_raw, start=1):
+            key = (c.get("content") or "").strip() or str(id(c))
+            if key not in key_to_doc:
+                key_to_doc[key] = {**c, "rank_vector": rank, "rank_bm25": big}
+            else:
+                key_to_doc[key]["rank_vector"] = min(key_to_doc[key]["rank_vector"], rank)
+        for rank, c in enumerate(bm25_raw, start=1):
+            key = (c.get("content") or "").strip() or str(id(c))
+            if key not in key_to_doc:
+                key_to_doc[key] = {**c, "rank_vector": big, "rank_bm25": rank}
+            else:
+                key_to_doc[key]["rank_bm25"] = min(key_to_doc[key].get("rank_bm25") or big, rank)
+        merged = []
+        for doc in key_to_doc.values():
+            rv = doc.pop("rank_vector", big)
+            rb = doc.pop("rank_bm25", big)
+            rrf = 1.0 / (k + rv) + 1.0 / (k + rb)
+            doc["_rrf_score"] = rrf
+            merged.append(doc)
+        merged.sort(key=lambda x: x.get("_rrf_score", 0), reverse=True)
+        for d in merged:
+            d.pop("_rrf_score", None)
+        return merged[:total_k]
+
+    def _rule_filter_by_query_overlap(self, query: str, candidates: List[dict]) -> List[dict]:
+        """规则过滤：仅保留与 query 至少有一个词/字重叠的 chunk。"""
+        out = []
+        for c in candidates:
+            text = (c.get("parent_content") or "") + "\n" + (c.get("content") or "")
+            if compute_query_coverage(query, text) > 0:
+                out.append(c)
+        return out
+
+    def _diversity_select(
+        self,
+        reranked: List[dict],
+        anchor_count: int,
+        target_top: int,
+        mmr_lambda: float,
+    ) -> List[dict]:
+        """重排后多样性：前 anchor_count 条必选（保证可引用），其余用 MMR 从剩余中选满 target_top。"""
+        if not reranked or target_top <= 0:
+            return reranked[:target_top]
+        anchor = list(reranked[:anchor_count])
+        if target_top <= anchor_count:
+            return anchor[:target_top]
+        remaining = list(reranked[anchor_count:])
+        if not remaining:
+            return anchor
+
+        def _norm_terms(t: str) -> set:
+            s = re.sub(r"\s+", "", (t or "").strip().lower())
+            return set(s) if s else set()
+
+        def _jaccard(c1: dict, c2: dict) -> float:
+            t1 = _norm_terms((c1.get("content") or "") + " " + (c1.get("parent_content") or ""))
+            t2 = _norm_terms((c2.get("content") or "") + " " + (c2.get("parent_content") or ""))
+            inter = len(t1 & t2)
+            union = len(t1 | t2)
+            return inter / union if union else 0.0
+
+        selected = list(anchor)
+        need = target_top - len(selected)
+        for _ in range(need):
+            if not remaining:
+                break
+            best_idx = -1
+            best_mmr = -1.0
+            for i, c in enumerate(remaining):
+                r_score = c.get("rerank_score", c.get("score", 0)) or 0
+                max_sim = max(_jaccard(c, s) for s in selected) if selected else 0.0
+                mmr = mmr_lambda * r_score - (1.0 - mmr_lambda) * max_sim
+                if mmr > best_mmr:
+                    best_mmr = mmr
+                    best_idx = i
+            if best_idx >= 0:
+                selected.append(remaining.pop(best_idx))
+        return selected
+
     def _merge_3_7_impl(
         self,
         query: str,
@@ -216,17 +327,33 @@ class RAGRetriever:
         use_rerank: bool = True,
         rerank_top: int = 5,
     ) -> List[dict]:
-        """实际检索逻辑（供 _merge_3_7 调用，可被缓存包装）。"""
+        """实际检索逻辑：RRF 融合（可选）、规则预过滤、BGE 重排、重排后多样性（保证 top 可引用）。"""
         s = _get_settings()
-        bm25_k = max(1, int(round(total_k * s.rag_bm25_ratio)))
-        vector_k = max(1, int(round(total_k * s.rag_vector_ratio)))
-        vector_raw = self._vector_search(query, vector_k + 10)
-        bm25_raw = self._bm25_search(query, bm25_k + 5)
-        bm25_take = bm25_raw[:bm25_k]
-        vector_take = vector_raw[:vector_k]
-        combined = bm25_take + vector_take
+        bm25_ratio = s.rag_bm25_ratio
+        vector_ratio = s.rag_vector_ratio
+        # 两路多取一些候选，便于 RRF 或比例合并
+        expand = 2 if getattr(s, "rag_use_rrf", True) else 1
+        bm25_k = max(1, int(round(total_k * bm25_ratio)) * expand + 5)
+        vector_k = max(1, int(round(total_k * vector_ratio)) * expand + 10)
+        vector_raw = self._vector_search(query, vector_k)
+        bm25_raw = self._bm25_search(query, bm25_k)
+
+        if getattr(s, "rag_use_rrf", True) and (vector_raw or bm25_raw):
+            rrf_k = max(1, getattr(s, "rag_rrf_k", 60))
+            combined = self._rrf_merge(vector_raw, bm25_raw, rrf_k, total_k)
+        else:
+            bm25_take = bm25_raw[: max(1, int(round(total_k * bm25_ratio)))]
+            vector_take = vector_raw[: max(1, int(round(total_k * vector_ratio)))]
+            combined = bm25_take + vector_take
+
         if not combined:
             return []
+
+        if getattr(s, "rag_pre_rerank_require_query_overlap", True):
+            combined = self._rule_filter_by_query_overlap(query, combined)
+        if not combined:
+            return []
+
         if use_rerank and self._reranker and len(combined) > rerank_top:
             pairs = [(query, c["content"] or c["parent_content"]) for c in combined]
             rerank_scores = self._reranker.compute_score(pairs)
@@ -235,7 +362,18 @@ class RAGRetriever:
             for i, c in enumerate(combined):
                 c["rerank_score"] = rerank_scores[i] if i < len(rerank_scores) else 0.0
             combined.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
-        return combined[:rerank_top if use_rerank else total_k]
+
+            if getattr(s, "rag_use_diversity_after_rerank", True) and len(combined) > rerank_top:
+                anchor_count = min(rerank_top, max(0, getattr(s, "rag_rerank_anchor_count", 3)))
+                mmr_lambda = max(0.0, min(1.0, getattr(s, "rag_diversity_mmr_lambda", 0.8)))
+                combined = self._diversity_select(
+                    combined, anchor_count, rerank_top, mmr_lambda
+                )
+            else:
+                combined = combined[:rerank_top]
+        else:
+            combined = combined[: rerank_top if use_rerank else total_k]
+        return combined
 
     def _evaluate_candidates(self, query: str, candidates: List[dict]) -> List[ChunkWithEval]:
         """对候选做评估，附加 RetrievalEvalResult。"""
@@ -275,7 +413,8 @@ class RAGRetriever:
         rerank_top: int = 5,
     ) -> List[dict]:
         """兼容旧接口：混合检索 3:7，重排，返回 dict 列表（无评估与重检）。"""
-        merged = self._merge_3_7(query, top_k, use_rerank, rerank_top)
+        q = _effective_query_for_retrieval(query)
+        merged = self._merge_3_7(q, top_k, use_rerank, rerank_top)
         return [
             {
                 "content": c.get("content"),
@@ -296,8 +435,10 @@ class RAGRetriever:
         """
         混合检索（3:7）+ 评估；若最佳匹配度 < 0.3 或过无关则重检，最多 3 次。
         返回通过的切片及评估信息，供生成答案并展示来源。
+        若启用 query 规则改写，检索与评估均使用改写后的 query。
         """
         s = _get_settings()
+        q = _effective_query_for_retrieval(query)
         min_score = s.rag_min_match_score
         max_attempts = s.rag_max_retrieve_attempts
         current_k = top_k
@@ -305,10 +446,10 @@ class RAGRetriever:
         last_evals: List[RetrievalEvalResult] = []
 
         for attempt in range(1, max_attempts + 1):
-            merged = self._merge_3_7(query, current_k, use_rerank, rerank_top)
+            merged = self._merge_3_7(q, current_k, use_rerank, rerank_top)
             if not merged:
                 return RAGRetrieveResult(chunks=[], evals=[], attempt=attempt)
-            chunks_with_eval = self._evaluate_candidates(query, merged)
+            chunks_with_eval = self._evaluate_candidates(q, merged)
             evals = [c.eval_result for c in chunks_with_eval if c.eval_result is not None]
             last_chunks_with_eval = chunks_with_eval
             last_evals = evals
@@ -321,11 +462,11 @@ class RAGRetriever:
         return RAGRetrieveResult(chunks=[], evals=last_evals, attempt=max_attempts)
 
     def build_bm25_from_docs(self, docs: List[dict]) -> None:
-        """用文档列表构建 BM25 索引（content 字段）。"""
+        """用文档列表构建 BM25 索引（content 字段，jieba 精确搜索分词）。"""
         try:
             from rank_bm25 import BM25Okapi
             corpus = [d.get("content", "") for d in docs]
-            tokenized = [list(t) for t in corpus]
+            tokenized = [_jieba_tokenize_for_search(t) for t in corpus]
             self._bm25_index = BM25Okapi(tokenized)
             self._bm25_corpus = corpus
         except Exception:

@@ -83,6 +83,22 @@
   - 检索质量评估 + 重检：匹配度过低时自动重检（如放宽条件或换策略），避免无效大上下文拖慢生成。
 - **本项目**：`rag_min_match_score`、`rag_max_retrieve_attempts` 控制重检；`rag_max_context_chars` 限制注入上下文；RAG 混合检索 3:7 + 重排后取 top 若干条。
 
+### 3.4.1 二次 RAG 策略（Agentic RAG 一步）
+
+- **思路**：当首轮 RAG + 生成仍不达标（无命中、grounding 很低或缺少证据编号）时，不是简单重跑，而是在 **KnowledgeEngine 层发起“第二轮、不同策略的 RAG”**：
+  - 根据首轮 trace（`final_status`、`grounding_score`、`top_match_score` 等）判断是否需要第二轮；
+  - 基于「原问题 + 首轮答案 + 检索指标」构造一个更聚焦的 Q2，并记录在 `KnowledgeQueryTrace.second_round_query`；
+  - 二次检索时适度放大 top_k（`rag_second_round_top_k_factor`），有机会召回与首轮不同的证据集合；
+  - 再用现有 grounding 机制对二次结果生成答案，并将 `second_round_used` 标记到 trace。
+- **配置**：
+  - `rag_enable_second_round`：是否开启二次 RAG（默认关闭，仅在质量优先场景启用）；
+  - `rag_second_round_min_grounding`：grounding 低于该值时可以触发二次 RAG（为 0 时默认取首轮阈值的一半）；
+  - `rag_second_round_top_k_factor`：二次检索时放大的 top_k 系数（例如 1.5）。
+- **本项目**：
+  - 首轮 RAG 仍按 `rag.py + KnowledgeEngine` 现有逻辑执行，支持评估与重检、grounding、多轮重生成；
+  - 当且仅当启用二次 RAG 且首轮 trace 判定“明显不达标”时，才由 KnowledgeEngine 触发 Q2 + 第二轮检索与生成；
+  - 流式路径目前只走首轮 RAG（保证首包延迟），二次 RAG 仅用于同步问答路径。
+
 ### 3.5 超时与限流
 
 - **思路**：单请求不无限挂起；整体流量有上限，避免排队过长导致延迟恶化。

@@ -17,7 +17,7 @@
 POST /doc/upload
   → MinerUClient.parse_file_async()
     → MinerU API（若配置）或占位解析
-    → 页码检测 + 结构化 chunk_id 生成
+    → 切片策略（见下） + 页码检测 + 结构化 chunk_id 生成
   → validate_parse_result()  ← 第一次校验
   → 返回 ParseResult + ValidationReport
 
@@ -26,6 +26,13 @@ POST /doc/confirm_upload
   → MilvusUploader.upload_parse_result()
   → 写入 Milvus（含结构化元数据）
 ```
+
+**切片策略**（`mineru_client._chunk_with_strategy`）：
+
+- **默认**：父子分段为基础，固定长度 + 切点句/段边界对齐（`chunk_text(..., align_to_sentence=True)`），避免断句且不过碎。
+- **兼容**：`rag_use_legacy_fixed_chunking=True` 时仅用固定长度、无对齐。
+
+详见 `docs/RAG_CHUNKING_VERSION_GRAY_REFLOW.md`。
 
 ---
 
