@@ -6,9 +6,10 @@
 
 ## 一、多 Agent 协作如何保证状态一致
 
-### 1.1 单状态 + 单写路径
+### 1.1 单状态 + 父子图共享 state
 
 - **统一状态**：所有 agent（总控、闲聊、知识库、人工）共用同一份 **AgentState**，由 LangGraph 在每次节点执行后按 **add_messages** 等 reducer 合并节点返回值，再写入 checkpointer。不存在「每个 agent 各管一块、再对账」的分散状态。
+- **父子图共享 state**：`knowledge` 被实现为一个子图（QA→Text2SQL→RAG）。父图调用子图时不通过 Redis 之类的“共享键”通信，而是让子图**接收并返回同一份 AgentState**；子图节点通过读写 state 字段（如 `messages/pending_sql/next`）把结果“回传”给父图。
 - **单写路径**：一轮用户消息只走「总控 → 一个子节点 → 结束」；子节点返回的 `messages`、`next`、`pending_sql`、`qa_trace` 由图引擎**一次**合并进 state，然后 checkpointer **一次**落盘。没有「多节点并发写同一 state」的竞态。
 
 ### 1.2 会话级锁（同一 thread_id 串行）
@@ -17,14 +18,14 @@
 - **做法**：对会**修改该会话状态**的接口（`/chat`、`/chat/stream`、确认执行、删除会话、重命名会话）在入口处加 **conversation_lock(thread_id)**：同一 thread_id 在这些路径上**串行执行**，保证「读 state → 图执行 → 写 state / 持久化」整段流程只有一个请求在执行。
 - **实现**：`conversation_lock` 按 thread_id 哈希分桶，锁数量有上限；配置 `conversation_lock_enabled` 可关闭（仅单用户/单会话场景）。
 
-### 1.3 Checkpointer 的「每步一整份」
+### 1.3 Checkpointer 的「每步一整份」（跨轮/跨进程）
 
-- LangGraph 在**每个节点执行完后**把当前**完整 state** 写入 checkpointer（MemorySaver 或 Redis），key 为 thread_id（及可选的 checkpoint_id）。因此任意时刻「图状态」只有一个最新版本，不存在多 agent 各自写不同字段导致不一致；读取时也是按 thread_id 取最新 checkpoint，语义清晰。
+- LangGraph 在**每个节点执行完后**把当前**完整 state** 写入 checkpointer（MemorySaver 或 Redis），key 为 thread_id（及可选的 checkpoint_id）。注意：checkpointer 的 key 用于**跨轮对话/多 worker**下持久化与恢复，不是父子图在一次执行过程中的通信手段。
 
 ### 1.4 小结（状态一致）
 
 | 手段 | 说明 |
-|------|------|
+| ---- | ---- |
 | 单状态 + add_messages | 所有 agent 共用一个 state，消息增量追加，无多源合并冲突。 |
 | 单跳执行 | 每轮只跑总控 + 一个子节点，状态只在一处被更新。 |
 | 会话锁 | 同一 thread_id 的写请求串行，避免并发读-改-写导致覆盖或错乱。 |
@@ -37,7 +38,7 @@
 ### 2.1 两层存储
 
 | 层级 | 存储 | 内容 | 用途 |
-|------|------|------|------|
+| ---- | ---- | ---- | ---- |
 | **短期** | Checkpointer（MemorySaver / Redis） | 图 state 快照（含 messages、next、pending_sql 等） | 同进程/同集群内多轮对话、恢复中断。 |
 | **长期** | PostgreSQL（`chat_history_postgresql_uri`） | 消息历史、会话元数据、运行时状态（pending_sql、interrupted） | 进程重启后恢复、跨实例查看历史、列表与删除/重命名。 |
 
@@ -90,7 +91,7 @@
 ### 3.4 小结（流式体验）
 
 | 点 | 说明 |
-|------|------|
+| ---- | ---- |
 | 真流式 | 闲聊/RAG 用 astream 逐 token，首字快。 |
 | SSE + 不缓冲 | 标准 SSE 格式，响应头禁止缓冲，首包尽快到前端。 |
 | 缓存/非 LLM 路径 | 也按段 yield，体验一致。 |

@@ -2,10 +2,22 @@
 """
 LangGraph 多智能体图：Supervisor 模式 + 人工介入（interrupt）。
 流程：START → 总控(supervisor) → 条件边(chat | knowledge | human) → 对应子节点 → END。
-chat、knowledge 异常时可路由到 human；human 节点内调用 interrupt(payload) 暂停，
+
+其中 knowledge 为“知识库 Agent/子图”，内部拆分为 3 个独立节点（multi-node）：
+QA → Text2SQL → RAG
+
+chat、knowledge_* 异常时可路由到 human；human 节点内调用 interrupt(payload) 暂停，
 调用方从 result["__interrupt__"] 取 payload 展示，恢复时用 Command(resume=...) 继续执行。
 短期记忆：可选 Redis checkpointer（chat_checkpointer_redis_url）实现多 worker 共享状态，否则 MemorySaver。
 """
+import sys
+from pathlib import Path
+
+# 保证直接运行本文件时（如 python src/graph/app.py）项目根在 path 中，可 import src
+_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 import logging
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -13,7 +25,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from src.agents.state import AgentState, NextAction
 from src.agents.supervisor import supervisor_node_async, route_to_agent
 from src.agents.chat_agent import chat_agent_node_async
-from src.agents.knowledge_agent import knowledge_agent_node_async
+from src.graph.knowledge_subgraph import get_knowledge_graph
 from src.agents.human_agent import human_handoff_node_async
 
 logger = logging.getLogger(__name__)
@@ -58,7 +70,8 @@ def create_graph(*, checkpointer=None):
 
     builder.add_node("supervisor", supervisor_node_async)
     builder.add_node("chat", chat_agent_node_async)
-    builder.add_node("knowledge", knowledge_agent_node_async)
+    # knowledge 作为一个“子智能体/子图”，内部再按 QA→Text2SQL→RAG 跑完
+    builder.add_node("knowledge", get_knowledge_graph())
     builder.add_node("human", human_handoff_node_async)
 
     builder.add_edge(START, "supervisor")

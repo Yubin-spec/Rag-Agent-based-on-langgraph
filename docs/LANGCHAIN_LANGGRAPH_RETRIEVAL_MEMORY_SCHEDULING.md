@@ -14,10 +14,14 @@
   - **独立节点**：专门做一个「检索节点」，从 state 取 question，调用检索，把 chunks 写入 state，下一节点再消费；
   - **封装在业务节点内**：如本项目的 knowledge 节点，内部自己调 RAG 引擎（QA → Text2SQL → retrieve_with_validation + 生成），图只看到「输入消息 → 输出消息」。
 
-### 1.2 本项目实现
+### 1.2 本项目实现（更新：knowledge 子图）
 
-- **图内无显式 Retriever 节点**：检索不作为图的单独节点，而是**封装在 knowledge 节点**里。
-- **Knowledge 节点**：调用 `KnowledgeEngine`，内部顺序为 **QA 精准匹配 → Text2SQL → RAG**（RAG 含 `retrieve_with_validation`：BM25+向量混合、重排、评估与重检，再生成）。检索与生成都在同一节点内完成，图的状态只传递 `messages` 和可选的 `pending_sql`、`qa_trace`。
+- **图内无显式 Retriever 节点**：检索不作为图的单独节点，而是封装在 knowledge 子图的 RAG 节点中。
+- **knowledge 子图**：父图层面仍只有一个 `knowledge` 分支，但 `knowledge` 实现为子图，内部节点为：
+  - `knowledge_qa`：高频 QA 命中直接结束；
+  - `knowledge_text2sql`：数据查询/写操作确认（可能返回 `pending_sql`）；
+  - `knowledge_rag`：RAG 检索+生成（含二次 RAG）。
+  二级意图识别（Text2SQL vs RAG）采用“规则优先 + 歧义 LLM 推理 + 低置信澄清”。
 - **检索结果不写入图 state**：chunks、context 仅在本节点内使用，生成完答案后只把 `AIMessage(content=answer)` 和 `qa_trace` 写回 state，避免 state 膨胀。
 
 **小结**：检索在本项目中是「知识库节点内部实现细节」；图层面只有「总控 → 知识库节点 → 输出消息」的数据流，没有单独的 retrieval state 或工具暴露给图。
@@ -53,9 +57,10 @@
 
 ## 三、调度机制（Scheduling）
 
-### 3.1 图结构
+### 3.1 图结构（更新：knowledge 子图）
 
 - **单总控（Supervisor）**：`START → supervisor → conditional_edges → chat | knowledge | human | __end__`；chat/knowledge 执行后再 `conditional_edges → human | __end__`，human 后直接 `END`。
+- **knowledge 为子图**：父图不关心其内部节点；`knowledge` 自己在子图内完成 QA/Text2SQL/RAG 的多节点执行后返回。
 - **无「多轮推理循环」**：正常路径是「总控 → 一个子节点 → 结束」；只有异常或转人工时才进 human 节点。没有「子节点执行完再回到总控」的边，因此**每轮用户消息只触发一次总控 + 一次子节点**。
 
 ### 3.2 路由如何决定（调度逻辑）
@@ -74,7 +79,7 @@
 ## 四、瓶颈分析
 
 | 环节 | 瓶颈 | 说明 |
-|------|------|------|
+| ---- | ---- | ---- |
 | **总控** | 规则未命中时必调 LLM | 每轮至少一次总控；歧义句会多一次 LLM 调用，延迟与成本增加。 |
 | **Checkpointer** | 每步写一次完整 state | 节点结束后整图 state 序列化写入 MemorySaver/Redis；state 大（如 messages 很多）时写放大会明显。 |
 | **长期记忆加载** | 首请求或空 state 时查 DB | `_ensure_state_from_db` 从 PostgreSQL 拉历史并 `aupdate_state`，请求首包会多一次 DB 往返与一次 state 更新。 |
@@ -87,7 +92,7 @@
 ## 五、优化点
 
 | 方向 | 优化思路 |
-|------|----------|
+| ---- | -------- |
 | **减少总控 LLM 调用** | 扩充规则（关键词/短语、长度+业务词组合），让更多请求规则直接路由；或对「高置信规则」优先，仅低置信再调 LLM。 |
 | **Checkpointer 体积与频率** | 若 state 很大，可考虑只 checkpoint 必要字段或做压缩；或降低 checkpoint 频率（如仅关键节点后写入），需权衡恢复粒度。Redis 版注意大 value 对网络与内存的影响。 |
 | **长期记忆加载** | 首包优化：对「必加载」的会话做预热或缓存最近一条 checkpoint；或异步预加载，首请求先返回「加载中」再轮询（体验差）。更实际的是保证 DB 与连接池健康、索引合理，缩短单次加载时间。 |

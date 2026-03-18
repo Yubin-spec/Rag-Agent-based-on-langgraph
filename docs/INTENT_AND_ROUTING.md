@@ -4,7 +4,7 @@
 
 ## 流程概览
 
-```
+```text
 用户输入 → 规则预判 → 命中？ → 是 → 直接返回 chat / knowledge
                     → 否 → 调用 DeepSeek（最近 N 轮对话）→ 解析 "chat" | "knowledge" → 路由
 ```
@@ -46,12 +46,36 @@
 - **规则词**：在 `src/agents/supervisor.py` 中修改 `KNOWLEDGE_KEYWORDS`（元组）、`CHAT_PHRASES`（frozenset）。新增业务领域词可加入 `KNOWLEDGE_KEYWORDS`；新增固定闲聊话术可加入 `CHAT_PHRASES`。
 - **LLM 行为**：总控 Prompt 见同文件中的 `_SUPERVISOR_PROMPT`；上下文窗口由 `config/settings.py` 的 `llm_context_window_turns`、`llm_context_summarize_old` 控制。
 
-## 知识库内部路由（非总控）
+## 知识库内部路由（二级路由）
 
-知识库 Agent 内部**不做**意图分类模型，按固定顺序尝试三种能力：
+进入知识库 Agent（`knowledge`）后，会进行**第二层意图识别**，将请求分发到 knowledge 子图内的节点。
 
-1. **高频 QA**：问句与 `data/high_freq_qa.json` 精准匹配，命中即返回。
-2. **Text2SQL**：由规则判断是否「像数据查询/删改」（关键词 + 启发式），命中则生成/确认 SQL。
-3. **RAG**：以上均未命中时走检索 + 生成。
+### 流程
 
-详见 README「结构概览」与各模块文档。
+```text
+knowledge_qa 命中？ → 是 → 直接结束（返回 QA 答案）
+              → 否 → 二级路由（Text2SQL vs RAG）
+                        → Text2SQL：生成查询/写操作确认（可能产出 pending_sql）→ 结束
+                        → RAG：检索+生成（含二次 RAG）→ 结束
+```
+
+### 二级路由策略（更“面试化”）
+
+本项目采用 **规则优先 + 歧义时模型推理 + 低置信度澄清** 的混合策略（避免触发词误判）：
+
+- **规则短路（高性能）**：明显数据查询/删改意图 → 直接走 Text2SQL；明显非数据查询 → 直接走 RAG。
+- **歧义走 LLM（高准确）**：规则无法判定（或配置允许覆盖规则）时，调用 DeepSeek 做二分类 `text2sql|rag`，并输出 `confidence/reason`。
+- **低置信度澄清（最少误判）**：若 `confidence` 低于阈值，优先返回一条澄清问题，让用户选“查数据”还是“问政策/流程”，避免硬分流走错链路。
+
+配置项见 `config/settings.py`：
+
+- `knowledge_router_use_llm_when_uncertain`
+- `knowledge_router_rules_short_circuit`
+- `knowledge_router_cache_max_entries`
+- `knowledge_router_clarify_on_low_confidence`
+- `knowledge_router_low_confidence_threshold`
+
+实现位置：
+
+- 二级路由器：`src/agents/knowledge_agent.py`（`_rule_based_text2sql_candidate`、`_KB_ROUTER_PROMPT`、`_decide_text2sql_candidate`）
+- knowledge 子图：`src/graph/knowledge_subgraph.py`（`_route_after_qa`、`_route_after_text2sql`）

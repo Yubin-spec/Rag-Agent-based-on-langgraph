@@ -16,6 +16,7 @@ from config import get_settings
 from src.llm import get_deepseek_llm
 from .prompt_templates import render_prompt_template_guidance, select_prompt_templates
 from .qa_store import QAStore
+from .intent_router import rule_based_text2sql_candidate
 from .text2sql import Text2SQL, Text2SQLConfirmRequired
 from .rag import get_rag_retriever, RAGRetrieveResult
 from .retrieval_eval import evaluate_retrieval
@@ -88,6 +89,16 @@ class KnowledgeQueryTrace:
     retrieved_chunk_ids: list[str] = field(default_factory=list)
     fallback_reason: str = ""
     pending_sql: bool = False
+    # QA 命中追踪：记录命中类型与分数，便于阈值标定与误命中分析
+    qa_match_type: str = ""
+    qa_matched_question: str = ""
+    qa_matched_alias: str = ""
+    qa_match_score: float = 0.0
+    qa_query_coverage: float = 0.0
+    qa_top2_score: float = 0.0
+    qa_margin: float = 0.0
+    qa_irrelevant_ratio: float = 0.0
+    qa_ngram_overlap_cnt: int = 0
     # 二次 RAG：是否触发过第二轮检索，以及使用的 Q2（改写/细化后的问题）
     second_round_used: bool = False
     second_round_query: str = ""
@@ -110,6 +121,15 @@ class KnowledgeQueryTrace:
             "retrieved_chunk_ids": list(self.retrieved_chunk_ids),
             "fallback_reason": self.fallback_reason,
             "pending_sql": self.pending_sql,
+            "qa_match_type": self.qa_match_type,
+            "qa_matched_question": self.qa_matched_question,
+            "qa_matched_alias": self.qa_matched_alias,
+            "qa_match_score": self.qa_match_score,
+            "qa_query_coverage": self.qa_query_coverage,
+            "qa_top2_score": self.qa_top2_score,
+            "qa_margin": self.qa_margin,
+            "qa_irrelevant_ratio": self.qa_irrelevant_ratio,
+            "qa_ngram_overlap_cnt": self.qa_ngram_overlap_cnt,
             "second_round_used": self.second_round_used,
             "second_round_query": self.second_round_query,
         }
@@ -543,11 +563,33 @@ class KnowledgeEngine:
         当 Text2SQL 返回删除/修改类需人工确认时，第二项为待执行 SQL，由上层写入 state.pending_sql 并交 API 确认执行。
         """
         trace = self._reset_trace()
-        # 1) 高频 QA 精准匹配
-        answer = self.qa.find(question)
+        # 0) 先做 Text2SQL 意图识别：若明确是结构化数据查询/写操作，则短路跳过 QA 匹配
+        if rule_based_text2sql_candidate(question) is True:
+            result = self.text2sql.query(question)
+            if result is not None:
+                trace.route = "text2sql"
+                if isinstance(result, Text2SQLConfirmRequired):
+                    trace.final_status = "text2sql_pending"
+                    trace.pending_sql = True
+                    return (result.message, result.sql)
+                trace.final_status = "text2sql_answer"
+                return (result, None)
+            # 若 Text2SQL 没产出，继续走 QA→RAG（避免误杀）
+
+        # 1) 高频 QA 匹配（非 Text2SQL 场景的快路径）
+        answer, qa_meta = self.qa.match(question)
         if answer:
             trace.route = "qa"
             trace.final_status = "qa_hit"
+            trace.qa_match_type = str(qa_meta.get("match_type") or "")
+            trace.qa_matched_question = str(qa_meta.get("matched_question") or "")
+            trace.qa_matched_alias = str(qa_meta.get("matched_alias") or "")
+            trace.qa_match_score = float(qa_meta.get("score") or 0.0)
+            trace.qa_query_coverage = float(qa_meta.get("query_coverage") or 0.0)
+            trace.qa_top2_score = float(qa_meta.get("top2_score") or 0.0)
+            trace.qa_margin = float(qa_meta.get("margin") or 0.0)
+            trace.qa_irrelevant_ratio = float(qa_meta.get("irrelevant_ratio") or 0.0)
+            trace.qa_ngram_overlap_cnt = int(qa_meta.get("ngram_overlap_cnt") or 0)
             return (answer, None)
 
         # 2) 结构化数据 Text2SQL（可能返回待确认 SQL）
@@ -562,10 +604,16 @@ class KnowledgeEngine:
             return (result, None)
 
         # 3) RAG：带评估与重检，并返回依据来源
+        return self.query_rag_only(question)
+
+    def query_rag_only(self, question: str) -> Tuple[str, Optional[str]]:
+        """
+        仅执行 RAG（不走 QA/Text2SQL），用于将知识库能力拆成多个 LangGraph 节点时复用。
+        返回 (回复文案, None)；RAG 不产生 pending_sql。
+        """
+        trace = self._reset_trace()
         trace.route = "rag"
-        rag_result = self.rag.retrieve_with_validation(
-            question, top_k=10, use_rerank=True, rerank_top=5
-        )
+        rag_result = self.rag.retrieve_with_validation(question, top_k=10, use_rerank=True, rerank_top=5)
         trace.retrieve_attempt = rag_result.attempt
         trace.source_count = len(rag_result.chunks)
         trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))
@@ -573,22 +621,15 @@ class KnowledgeEngine:
         if rag_result.evals:
             trace.top_match_score = max(e.match_score for e in rag_result.evals if e is not None)
             trace.top_normalized_score = max(e.normalized_score for e in rag_result.evals if e is not None)
-        # 记录首轮检索指标
         if not rag_result.chunks:
             trace.final_status = "rag_no_hit"
             trace.fallback_reason = "no_retrieval_hit"
             return ("未找到相关知识，建议您换个问法或转人工客服。", None)
 
-        # 先基于首轮检索结果生成答案
-        # 为了在二次 RAG 中使用首轮答案 A1，需要暂存 A1 与首轮检索结果
         self._last_rag_chunks_for_q1 = rag_result.chunks
         answer_text = self._generate_grounded_answer(question, rag_result, trace=trace)
-        # 根据 trace 判定是否需要二次 RAG；若触发则用 Q2 + 新检索结果覆盖
-        answer_text, rag_result = self._maybe_second_round_rag(
-            question, answer_text, rag_result, trace
-        )
+        answer_text, rag_result = self._maybe_second_round_rag(question, answer_text, rag_result, trace)
 
-        # 答案 + 依据来源（依赖的切片全部展示）
         sources_block = _format_sources(rag_result)
         if sources_block:
             return (answer_text + "\n\n" + sources_block, None)
@@ -610,11 +651,33 @@ class KnowledgeEngine:
         Yields: 文本片段（str）。
         """
         trace = self._reset_trace()
-        # 1) QA 精准匹配
-        answer = self.qa.find(question)
+        # 0) Text2SQL 意图识别：明确是 Text2SQL 则短路跳过 QA
+        if rule_based_text2sql_candidate(question) is True:
+            result = self.text2sql.query(question)
+            if result is not None:
+                trace.route = "text2sql"
+                trace.final_status = "text2sql_pending" if isinstance(result, Text2SQLConfirmRequired) else "text2sql_answer"
+                trace.pending_sql = isinstance(result, Text2SQLConfirmRequired)
+                msg = result.message if isinstance(result, Text2SQLConfirmRequired) else result
+                for chunk in self._yield_text_chunked(msg):
+                    yield chunk
+                return
+            # Text2SQL 无法产出则继续 QA→RAG
+
+        # 1) QA 匹配（非 Text2SQL 场景）
+        answer, qa_meta = self.qa.match(question)
         if answer:
             trace.route = "qa"
             trace.final_status = "qa_hit"
+            trace.qa_match_type = str(qa_meta.get("match_type") or "")
+            trace.qa_matched_question = str(qa_meta.get("matched_question") or "")
+            trace.qa_matched_alias = str(qa_meta.get("matched_alias") or "")
+            trace.qa_match_score = float(qa_meta.get("score") or 0.0)
+            trace.qa_query_coverage = float(qa_meta.get("query_coverage") or 0.0)
+            trace.qa_top2_score = float(qa_meta.get("top2_score") or 0.0)
+            trace.qa_margin = float(qa_meta.get("margin") or 0.0)
+            trace.qa_irrelevant_ratio = float(qa_meta.get("irrelevant_ratio") or 0.0)
+            trace.qa_ngram_overlap_cnt = int(qa_meta.get("ngram_overlap_cnt") or 0)
             for chunk in self._yield_text_chunked(answer):
                 yield chunk
             return
@@ -665,13 +728,36 @@ class KnowledgeEngine:
         返回 (回复文案, 待确认 SQL 或 None)。
         """
         trace = self._reset_trace()
-        # 1) QA
-        answer = await asyncio.to_thread(self.qa.find, question)
+        # 0) Text2SQL 意图识别：明确是 Text2SQL 则短路跳过 QA
+        if rule_based_text2sql_candidate(question) is True:
+            result = await asyncio.to_thread(self.text2sql.query, question)
+            if result is not None:
+                trace.route = "text2sql"
+                if isinstance(result, Text2SQLConfirmRequired):
+                    trace.final_status = "text2sql_pending"
+                    trace.pending_sql = True
+                    return (result.message, result.sql)
+                trace.final_status = "text2sql_answer"
+                return (result, None)
+            # Text2SQL 无法产出则继续 QA→RAG
+
+        # 1) QA（非 Text2SQL 场景）
+        answer, qa_meta = await asyncio.to_thread(self.qa.match, question)
         if answer:
             trace.route = "qa"
             trace.final_status = "qa_hit"
+            trace.qa_match_type = str(qa_meta.get("match_type") or "")
+            trace.qa_matched_question = str(qa_meta.get("matched_question") or "")
+            trace.qa_matched_alias = str(qa_meta.get("matched_alias") or "")
+            trace.qa_match_score = float(qa_meta.get("score") or 0.0)
+            trace.qa_query_coverage = float(qa_meta.get("query_coverage") or 0.0)
+            trace.qa_top2_score = float(qa_meta.get("top2_score") or 0.0)
+            trace.qa_margin = float(qa_meta.get("margin") or 0.0)
+            trace.qa_irrelevant_ratio = float(qa_meta.get("irrelevant_ratio") or 0.0)
+            trace.qa_ngram_overlap_cnt = int(qa_meta.get("ngram_overlap_cnt") or 0)
             return (answer, None)
-        # 2) Text2SQL
+
+        # 2) Text2SQL（非明确场景才尝试，避免误触发）
         result = await asyncio.to_thread(self.text2sql.query, question)
         if result is not None:
             trace.route = "text2sql"
@@ -681,12 +767,18 @@ class KnowledgeEngine:
                 return (result.message, result.sql)
             trace.final_status = "text2sql_answer"
             return (result, None)
-        # 3) RAG：检索在线程池，生成用 ainvoke
+
+        # 3) RAG
+        return await self.aquery_rag_only(question)
+
+    async def aquery_rag_only(self, question: str) -> Tuple[str, Optional[str]]:
+        """
+        异步仅执行 RAG（不走 QA/Text2SQL），用于将知识库能力拆成多个 LangGraph 节点时复用。
+        返回 (回复文案, None)。
+        """
+        trace = self._reset_trace()
         trace.route = "rag"
-        rag_result = await asyncio.to_thread(
-            self.rag.retrieve_with_validation,
-            question, top_k=10, use_rerank=True, rerank_top=5,
-        )
+        rag_result = await asyncio.to_thread(self.rag.retrieve_with_validation, question, top_k=10, use_rerank=True, rerank_top=5)
         trace.retrieve_attempt = rag_result.attempt
         trace.source_count = len(rag_result.chunks)
         trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))
@@ -698,15 +790,10 @@ class KnowledgeEngine:
             trace.final_status = "rag_no_hit"
             trace.fallback_reason = "no_retrieval_hit"
             return ("未找到相关知识，建议您换个问法或转人工客服。", None)
-        # 首轮异步生成答案
+
         self._last_rag_chunks_for_q1 = rag_result.chunks
-        answer_text = await self._generate_grounded_answer_async(
-            question, rag_result, trace=trace
-        )
-        # 如有需要，执行二次 RAG 并重生成答案
-        answer_text, rag_result = self._maybe_second_round_rag(
-            question, answer_text, rag_result, trace
-        )
+        answer_text = await self._generate_grounded_answer_async(question, rag_result, trace=trace)
+        answer_text, rag_result = self._maybe_second_round_rag(question, answer_text, rag_result, trace)
         sources_block = _format_sources(rag_result)
         if sources_block:
             return (answer_text + "\n\n" + sources_block, None)
@@ -719,20 +806,47 @@ class KnowledgeEngine:
         异步流式回答：先出首字再逐 chunk；RAG 使用 LLM astream，其余在线程池执行后按段 yield。
         """
         trace = self._reset_trace()
+        # 0) Text2SQL 意图识别：明确是 Text2SQL 则短路跳过 QA
+        if rule_based_text2sql_candidate(question) is True:
+            result = await asyncio.to_thread(self.text2sql.query, question)
+            if result is not None:
+                trace.route = "text2sql"
+                if isinstance(result, Text2SQLConfirmRequired):
+                    trace.final_status = "text2sql_pending"
+                    trace.pending_sql = True
+                    if pending_sql_out is not None:
+                        pending_sql_out.append(result.sql)
+                    for chunk in self._yield_text_chunked(result.message):
+                        yield chunk
+                else:
+                    trace.final_status = "text2sql_answer"
+                    for chunk in self._yield_text_chunked(result):
+                        yield chunk
+                return
+            # Text2SQL 无法产出则继续 QA→RAG
+
         # 1) QA
-        answer = await asyncio.to_thread(self.qa.find, question)
+        answer, qa_meta = await asyncio.to_thread(self.qa.match, question)
         if answer:
             trace.route = "qa"
             trace.final_status = "qa_hit"
+            trace.qa_match_type = str(qa_meta.get("match_type") or "")
+            trace.qa_matched_question = str(qa_meta.get("matched_question") or "")
+            trace.qa_matched_alias = str(qa_meta.get("matched_alias") or "")
+            trace.qa_match_score = float(qa_meta.get("score") or 0.0)
+            trace.qa_query_coverage = float(qa_meta.get("query_coverage") or 0.0)
+            trace.qa_top2_score = float(qa_meta.get("top2_score") or 0.0)
+            trace.qa_margin = float(qa_meta.get("margin") or 0.0)
+            trace.qa_irrelevant_ratio = float(qa_meta.get("irrelevant_ratio") or 0.0)
+            trace.qa_ngram_overlap_cnt = int(qa_meta.get("ngram_overlap_cnt") or 0)
             for chunk in self._yield_text_chunked(answer):
                 yield chunk
             return
 
-        # 2) Text2SQL（可能为待确认 SQL）
+        # 2) Text2SQL（非明确场景才尝试）
         result = await asyncio.to_thread(self.text2sql.query, question)
         if result is not None:
             trace.route = "text2sql"
-            # 删除/修改类需人工确认：将 SQL 放入 pending_sql_out 供 API 写入 _pending_sql
             if isinstance(result, Text2SQLConfirmRequired):
                 trace.final_status = "text2sql_pending"
                 trace.pending_sql = True

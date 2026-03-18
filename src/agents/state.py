@@ -9,7 +9,7 @@ from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
 
 
-# 总控/子节点路由下一跳：chat（闲聊）、knowledge（知识库）、human（人工介入）、__end__（结束）
+# 总控/子节点路由下一跳：chat（闲聊）、knowledge（知识库子图/子智能体）、human（人工介入）、__end__（结束）
 NextAction = Literal["chat", "knowledge", "human", "__end__"]
 
 
@@ -29,6 +29,13 @@ class AgentState(TypedDict):
     human_message: NotRequired[Optional[str]]
     route: NotRequired[Optional[str]]
     qa_trace: NotRequired[dict]
+    # knowledge 子链路的中间标志（用于拆分节点间通信）
+    qa_hit: NotRequired[bool]
+    text2sql_hit: NotRequired[bool]
+    text2sql_candidate: NotRequired[bool]
+    kb_clarify: NotRequired[bool]
+    kb_route_reason: NotRequired[str]
+    kb_route_confidence: NotRequired[float]
 
 
 def next_action_from_str(s: str) -> NextAction:

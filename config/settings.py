@@ -95,6 +95,18 @@ class Settings(BaseSettings):
     text2sql_schema_overrides_path: str = "./data/text2sql_schema_overrides.json"  # 人工审核的表/列含义及表间关联
     text2sql_default_limit: int = 500  # SELECT 无 LIMIT 时自动追加的上限，避免大表全表扫；0 表示不自动加
 
+    # ---------- knowledge 二级路由（QA miss 后：Text2SQL vs RAG） ----------
+    # True：当规则判别不确定时，调用 DeepSeek 做一次二分类推理（更准，略慢）
+    knowledge_router_use_llm_when_uncertain: bool = True
+    # 规则判别命中时的优先级策略：True 表示规则直接决定不再调用 LLM；False 表示始终调用 LLM 覆盖规则（更准更慢）
+    knowledge_router_rules_short_circuit: bool = True
+    # LLM 路由结果进程内缓存（LRU）条数；0 表示不缓存
+    knowledge_router_cache_max_entries: int = 256
+    # 低置信度时是否发起澄清（避免硬分流误判）
+    knowledge_router_clarify_on_low_confidence: bool = True
+    # 低置信度阈值（0~1），低于该值时优先澄清
+    knowledge_router_low_confidence_threshold: float = 0.6
+
     # ---------- MinerU 文档解析（本地部署版） ----------
     # MinerU 本地部署时填写本地服务地址，如 http://127.0.0.1:8001；为空则使用占位解析（仅文本+切块）
     mineru_api_url: str = ""
@@ -112,6 +124,25 @@ class Settings(BaseSettings):
     # ---------- 路径 ----------
     upload_dir: str = "./data/uploads"
     qa_data_path: str = "./data/high_freq_qa.json"
+    # 高频 QA 匹配策略：
+    # - exact/alias：强精确匹配（最高精度）
+    # - semantic：轻量相似度（用于兜底召回，需阈值控制）
+    # - contains：历史包含匹配（兼容旧行为，误命中风险更高，建议逐步关闭）
+    qa_enable_semantic_match: bool = True
+    # 默认值偏保守但可命中常见改写；上线后建议用线上弱反馈分布再收紧/放宽
+    qa_semantic_min_score: float = 0.55
+    qa_semantic_min_query_coverage: float = 0.35
+    qa_semantic_require_any_overlap: bool = True  # True 时先做字符重叠过滤，再计算分数
+    qa_semantic_top_k: int = 30  # 召回候选数量（越大越不漏，越慢）
+    qa_semantic_min_margin: float = 0.03  # top1-top2 分差，小于该值认为歧义，避免误命中
+    # 语义匹配性能优化：先用便宜的 ngram 重叠做候选预筛，再对少量候选做 evaluate_retrieval 精排
+    qa_semantic_ngram_size: int = 2  # 中文场景用 2-gram 通常性价比最好
+    qa_semantic_prefilter_top_n: int = 80  # 预筛后最多进入精排的候选数
+    qa_match_cache_max_entries: int = 512  # 高频 QA 匹配结果 LRU 缓存（按归一化 query）
+    # 验证器：防止“分数最高但其实不相关”
+    qa_semantic_max_irrelevant_ratio: float = 0.75  # 无关信息比例上限；越低越严格
+    qa_semantic_min_ngram_overlap_count: int = 3  # query 与候选 ngram 重叠计数下限
+    qa_enable_legacy_contains_match: bool = True
 
     # ---------- 对话与上下文（性能与隔离） ----------
     max_conversation_turns: int = 15  # 单对话最多轮数，超过后提示新开对话
