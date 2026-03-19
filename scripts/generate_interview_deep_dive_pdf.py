@@ -155,7 +155,7 @@ def build_pdf(out_path: Path) -> None:
     story.append(Paragraph("Q8：你们的生成后校验怎么做？为什么有效？", h2))
     story.append(Paragraph("原理：幻觉常来自“检索证据不相关”或“生成偏离证据”。因此除了 prompt 约束，还需要一个客观的 grounding 信号来判断是否偏离。", base))
     story.append(Paragraph("实现：engine.py 在生成后会计算“答案与证据的最大相关度”（_answer_grounding_score）。做法是把答案文本做归一化（去掉[证据N]与结构化标签），再把“答案当查询”，与每个检索块文本以及整体 context 计算 normalized_score，取最大值作为 grounding_score。", base))
-    story.append(Paragraph("若 grounding_score 低于 settings.rag_answer_grounding_min_score=0.18，则触发最多 rag_answer_max_regenerate_times=3 次重生成；仍不达标则保守拒答/提示补充信息。并且答案必须包含证据编号（_answer_has_evidence_citations），否则也会被视为不可信。", base))
+    story.append(Paragraph("若 grounding_score 低于 settings.rag_answer_grounding_min_score=0.3，则触发最多 rag_answer_max_regenerate_times=3 次重生成；仍不达标则保守拒答/提示补充信息。并且答案必须包含证据编号（_answer_has_evidence_citations），否则也会被视为不可信。", base))
     story.append(Paragraph("可背一句：我们不依赖“另一个大模型裁判”，而是用轻量可重复的检索相关度指标做 grounding gate，成本可控、行为可解释。", base))
 
     story.append(PageBreak())

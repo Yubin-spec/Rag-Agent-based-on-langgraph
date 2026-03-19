@@ -14,7 +14,7 @@
 ### 2.1 数据隔离（按会话）
 
 - **conversation_id = thread_id**：前端（或接入方）为「一次对话」生成或使用同一个 `conversation_id`，请求体里传 `conversation_id`；服务端用其作为 LangGraph 的 `thread_id`。
-- **Checkpointer**：LangGraph 使用 `MemorySaver()`，按 `thread_id` 存状态；不同 `conversation_id` 对应不同 `thread_id`，因此**不同对话的消息互不可见**。
+- **Checkpointer**：LangGraph 使用可选 checkpointer（`chat_checkpointer_postgresql_uri` 优先、可选 `chat_checkpointer_redis_url`，不配置则回退 `MemorySaver()`），按 `thread_id` 存状态；不同 `conversation_id` 对应不同 `thread_id`，因此**不同对话的消息互不可见**。
 - **请求约定**：同一对话的所有轮次都带同一个 `conversation_id`；不传则服务端生成新 UUID，视为新对话。
 
 ### 2.2 单对话 15 轮上限
@@ -51,6 +51,7 @@
 ### 2.5 长期记忆（PostgreSQL，可选）
 
 - **短期**：LangGraph 使用 `MemorySaver()`，按 `thread_id` 在进程内存中存状态；进程重启后丢失。
+- **短期**：LangGraph 使用可选 checkpointer（`chat_checkpointer_postgresql_uri` / `chat_checkpointer_redis_url`），以 `thread_id` 存状态；未配置则回退 `MemorySaver()`（进程重启后丢失）。
 - **长期**：若配置 `chat_history_postgresql_uri`（PostgreSQL 连接串），则：
   - 启动时自动建表 `chat_history`（thread_id, role, content, created_at）；
   - 每次请求开始时，若该会话在内存中无状态，则从 PostgreSQL 加载历史并注入图状态；
@@ -114,7 +115,7 @@
 | `deepseek_api_endpoints` | 空 | DeepSeek 多 endpoint 配置，支持权重轮询 |
 | `deepseek_circuit_breaker_failures` | 3 | 单节点连续失败多少次后熔断 |
 | `deepseek_circuit_breaker_open_seconds` | 30 | 熔断持续时间 |
-| `rag_answer_grounding_min_score` | 0.18 | 最终答案与检索文档的最低关联度阈值 |
+| `rag_answer_grounding_min_score` | 0.3 | 最终答案与检索文档的最低关联度阈值（海关高精度场景） |
 | `rag_answer_max_regenerate_times` | 3 | 低关联或缺少证据编号时最多重生成次数 |
 | `qa_monitoring_postgresql_uri` | 空 | 问答效果监控与反馈分析库；为空时复用 `chat_history_postgresql_uri` |
 
@@ -126,3 +127,28 @@
 - **15 轮上限**：入口根据 `HumanMessage` 数量判断，≥15 直接返回提示，不再调图。
 - **省 token + 保留早期信息**：总控/闲聊送「历史对话摘要（若启用）+ 最近 10 轮」给大模型；知识库只用当前问句；历史全量保留在图状态中，窗口外通过摘要带入。
 - **异步并发**：Chat 使用 `async` + 图 `ainvoke`/节点异步，避免阻塞，支持多用户并发与低延迟。
+
+---
+
+## 七、高频 QA 存储策略说明（补充）
+
+当前线上默认采用“分层存储”：
+
+- 高频 QA：Milvus FAQ 专属 collection（默认 `faq_chunks`）
+- 文档知识：Milvus（文档切片向量检索）
+- 结构化数据：`data/kb.db`（Text2SQL）
+
+这样分层的原因是：高频 QA 追求稳定命中与可控误答，而文档问答追求语义召回与证据覆盖。
+
+当前匹配流程：
+
+- 先对 `question_norm` 做 exact/alias 强匹配；
+- 未命中时做 FAQ collection 向量召回（粗排）；
+- 对候选做语义精排（top1/top2）并执行 guardrail；
+- 失败则回退 Text2SQL / RAG。
+
+关键配置：
+
+- `qa_store_backend=milvus`
+- `qa_milvus_collection=faq_chunks`
+- `qa_milvus_semantic_top_k`、`qa_milvus_nprobe`

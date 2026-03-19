@@ -7,7 +7,10 @@
 **是什么**：当前进程内、按会话（`thread_id`）保存的**图状态**，供当轮与后续轮请求直接使用。
 
 - **实现**：LangGraph 的 `MemorySaver()`（`src/graph/app.py`），键为 `thread_id`（= `conversation_id`），值为完整状态（含 `messages`、节点输出等）。
-- **生命周期**：进程存活期间有效；**进程重启或扩缩容后丢失**。
+- **生命周期**：默认情况下（未配置 Redis checkpointer）进程存活期间有效；进程重启/扩缩容后 MemorySaver 里的图状态会丢失。
+- **当启用了 PostgreSQL 长期记忆（配置了 `chat_history_postgresql_uri`）时**：服务启动/请求开始会从 DB 按 `thread_id` 恢复 `chat_history` 与 `chat_runtime_state`，从而把“可用的短期记忆（messages + 运行时状态）”重建回图状态中。
+- **当配置了 PostgreSQL checkpointer（`chat_checkpointer_postgresql_uri`）时**：短期图状态会写入 PostgreSQL，能保存多久取决于数据库存储策略；本项目在 checkpointer 层不额外强制设置一个“固定 1 周”的过期时间，因此“一周甚至更久”通常是可行的（前提是 DB 不做清理）。
+- **当配置了 Redis checkpointer（`chat_checkpointer_redis_url`）时**：短期图状态会写入 Redis，能保存多久取决于 Redis 的 TTL/淘汰/持久化策略；本项目在 checkpointer 层不额外强制设置一个“固定 1 周”的过期时间，因此“一周甚至更久”是可行的。
 - **读写**：每次请求先读图状态（若存在则直接用），图执行后把新一轮 `messages` 等写回 MemorySaver；读写都在内存，延迟低。
 
 **作用**：多轮对话时不必每次从 DB 拉全量历史，直接用内存里的 `messages` 做路由与生成，节省 DB 与延迟。
@@ -16,7 +19,7 @@
 
 ## 2. 长期记忆（PostgreSQL）
 
-**是什么**：落在 PostgreSQL 里的对话与运行时状态，用于**跨进程、跨重启**恢复。
+**是什么**：落在 PostgreSQL 里的对话与运行时状态，用于**跨进程、跨重启**恢复（按 `thread_id`）。
 
 - **实现**：`src/chat_history.py` + 配置 `chat_history_postgresql_uri`。
 - **表**：
@@ -54,7 +57,7 @@
 
 | 方向 | 说明 |
 |------|------|
-| **多 worker 共享状态** | 配置 `chat_checkpointer_redis_url`（需 Redis 8+ 或 Redis Stack，含 RedisJSON/RediSearch）并安装 `langgraph-checkpoint-redis` 后，图将使用 Redis checkpointer，多进程共享图状态；未配置则使用进程内 MemorySaver。 |
+| **多 worker 共享状态** | 配置 `chat_checkpointer_postgresql_uri` 并安装 `langgraph-checkpoint-postgres`（或配置 `chat_checkpointer_redis_url` 并安装 `langgraph-checkpoint-redis`）后，图将使用对应 checkpointer，多进程共享图状态；未配置则使用进程内 MemorySaver。 |
 | **状态裁剪** | 通过长期记忆「只加载最近 N 条」实现：从 DB 注入短期记忆时仅加载最近 `chat_history_load_max_messages` 条，减少内存与反序列化。 |
 
 ### 4.2 长期记忆
@@ -91,4 +94,5 @@
 | chat_history_load_max_messages | 0 | 从 DB 加载时只取最近 N 条注入短期记忆，0 全量 |
 | chat_history_max_content_chars | 0 | 写入 chat_history 时单条 content 最大字符数，0 不截断 |
 | chat_history_use_asyncpg | False | True 时使用 asyncpg 异步读写，需安装 asyncpg |
+| chat_checkpointer_postgresql_uri | "" | 短期记忆 PostgreSQL checkpointer URL；为空则不启用（未配置 Redis 时回退 MemorySaver） |
 | chat_checkpointer_redis_url | "" | 短期记忆 Redis checkpointer URL，需 Redis 8+ 或 Stack；为空则 MemorySaver |

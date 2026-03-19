@@ -39,7 +39,7 @@ from config import get_settings
 from src.doc.mineru_client import MinerUClient, ParseResult, ChunkItem
 from src.doc.milvus_upload import MilvusUploader
 from src.doc.validation import validate_parse_result
-from src.graph.app import get_graph
+from src.graph.app import get_graph, close_checkpointer
 from src.agents.supervisor import supervisor_node_async
 from src.agents.chat_agent import chat_agent_stream_async
 from src.kb.engine import KnowledgeEngine
@@ -177,6 +177,7 @@ async def lifespan(app: FastAPI):
     yield
     await close_redis_connection()
     await close_shared_state_redis()
+    close_checkpointer()
     chat_history_dispose_engines()
     await chat_history_dispose_async_pools()
     if keepalive_task and not keepalive_task.done():

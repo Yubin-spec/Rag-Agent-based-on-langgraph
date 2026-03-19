@@ -33,6 +33,10 @@ redis>=5.0.0
 # Optional: 短期记忆多 worker 共享（需 Redis 8+ 或 Redis Stack，含 RedisJSON/RediSearch）
 # pip install langgraph-checkpoint-redis 后并配置 CHAT_CHECKPOINTER_REDIS_URL 启用
 
+# Optional: 短期记忆 checkpointer（PostgreSQL 落库，支持跨进程 interrupt 后 resume）
+# pip install langgraph-checkpoint-postgres 后并配置 CHAT_CHECKPOINTER_POSTGRESQL_URI 启用
+langgraph-checkpoint-postgres
+
 # 长期记忆异步写入（不占线程池）；配置 CHAT_HISTORY_USE_ASYNCPG=true 启用
 asyncpg>=0.29.0
 

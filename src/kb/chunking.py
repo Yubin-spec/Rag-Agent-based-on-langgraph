@@ -76,29 +76,82 @@ def _align_to_sentence_boundary(
 
 
 def _get_table_spans(text: str) -> List[Tuple[int, int]]:
-    """返回全文所有表格的 (start, end) 区间，用于结构感知：不跨表、跨页多表整表保留。"""
+    """
+    返回全文所有表格的 (start, end) 区间，用于结构感知。
+
+    正确性目标：避免“跨页续表”被切断。
+
+    旧逻辑把页码标记视为普通非表格行，导致跨页表格可能被切成多个 span，
+    后续 `_adjust_spans_for_tables()` 就无法保证整表不拆。
+    新逻辑会在相邻 table spans 之间，如果中间仅包含“空白或页码标记”，则合并这两个 span。
+    """
     if not text.strip():
         return []
+
+    # 行级页码标记：用于判断跨页续表之间的断点
+    page_marker_re = re.compile(
+        r"^\s*(?:---\s*)?(?:第\s*\d+\s*页|Page\s*\d+|p\.?\s*\d+|\-\s*\d+\s*\-)\s*$",
+        re.IGNORECASE,
+    )
+
     lines = text.split("\n")
-    tables: List[Tuple[int, int]] = []
-    i = 0
+    # 计算每行的字符起始偏移（pos），用于将“行 span”映射到“字符 span”
+    line_starts: List[int] = []
     pos = 0
+    for idx, line in enumerate(lines):
+        line_starts.append(pos)
+        pos += len(line)
+        # split("\n") 会丢弃换行符；仅在非最后一行补回 1 个 '\n'
+        if idx < len(lines) - 1:
+            pos += 1
+
+    def _is_table_line(line: str) -> bool:
+        return ("|" in line) and line.count("|") >= 2
+
+    def _is_page_marker_or_blank(line: str) -> bool:
+        return (not (line or "").strip()) or bool(page_marker_re.match(line))
+
+    # 1) 先按“连续表行”粗分出 spans（不会跨页合并）
+    raw_spans: List[Tuple[int, int, int, int]] = []  # (start_pos, end_pos_excl, start_line, end_line)
+    i = 0
     while i < len(lines):
-        line = lines[i]
-        if not line.strip():
+        if not _is_table_line(lines[i]):
             i += 1
-            pos += len(line) + 1
             continue
-        if "|" in line and line.count("|") >= 2:
-            start = pos
-            while i < len(lines) and "|" in lines[i] and lines[i].count("|") >= 2:
-                pos += len(lines[i]) + 1
-                i += 1
-            tables.append((start, pos))
+        start_line = i
+        start_pos = line_starts[i]
+        j = i + 1
+        end_line = i
+        while j < len(lines) and _is_table_line(lines[j]):
+            end_line = j
+            j += 1
+        end_pos_excl = line_starts[end_line] + len(lines[end_line]) + 1
+        raw_spans.append((start_pos, end_pos_excl, start_line, end_line))
+        i = j
+
+    if not raw_spans:
+        return []
+
+    # 2) 合并跨页续表：仅当相邻 spans 的“中间行”全是空白或页码标记时合并
+    merged_spans: List[Tuple[int, int, int, int]] = []
+    for span in raw_spans:
+        if not merged_spans:
+            merged_spans.append(span)
             continue
-        pos += len(line) + 1
-        i += 1
-    return tables
+        prev = merged_spans[-1]
+        prev_start_pos, prev_end_pos, prev_start_line, prev_end_line = prev
+        start_pos, end_pos_excl, start_line, end_line = span
+
+        between_lines = lines[prev_end_line + 1 : start_line]
+        if between_lines and all(_is_page_marker_or_blank(l) for l in between_lines):
+            merged_spans[-1] = (prev_start_pos, end_pos_excl, prev_start_line, end_line)
+        elif start_line == prev_end_line + 1:
+            # 没有中间行：直接合并（理论上不会发生，因为 raw_spans 已按连续表行聚合）
+            merged_spans[-1] = (prev_start_pos, end_pos_excl, prev_start_line, end_line)
+        else:
+            merged_spans.append(span)
+
+    return [(s, e) for (s, e, _, _) in merged_spans]
 
 
 def _adjust_spans_for_tables(

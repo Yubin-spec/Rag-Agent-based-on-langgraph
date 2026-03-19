@@ -63,15 +63,17 @@ class Settings(BaseSettings):
     rag_default_chunk_size: int = 512
     # 默认：父子分段 + 切点句/段边界对齐（避免断句、不过碎）。True 时仅用固定长度无对齐（兼容旧行为）
     rag_use_legacy_fixed_chunking: bool = False
-    rag_answer_grounding_min_score: float = 0.18  # 最终答案与检索文档的最低关联度，低于该值视为可能幻觉
+    rag_answer_grounding_min_score: float = 0.3  # 最终答案与检索文档的最低关联度，低于该值视为可能幻觉（海关高精度场景）
     rag_answer_max_regenerate_times: int = 3  # 最终答案与文档关联度低时，最多重生成 3 次
     # 注入生成阶段的检索上下文总字符数上限，0 表示不限制；超出则从末尾丢弃 chunk，控制 token
     rag_max_context_chars: int = 0
     # RAG 检索结果缓存：进程内 LRU 条数，0 表示关闭；相同 query 命中则跳过 Milvus+BM25
     rag_retrieval_cache_max_entries: int = 0
     rag_retrieval_cache_ttl_seconds: int = 300  # 仅当 max_entries>0 时有效
-    # RRF 融合：True 时 BM25 与向量两路用 RRF 合并排序，否则按比例取条数
-    rag_use_rrf: bool = True
+    # 检索融合策略：
+    # - False（默认）：按固定权重 rag_bm25_ratio / rag_vector_ratio 合并（更稳、更易解释）
+    # - True：使用 RRF 融合（实验或小流量验证时可开启）
+    rag_use_rrf: bool = False
     rag_rrf_k: int = 60  # RRF 公式 1/(k+rank) 的 k
     # 重排前规则过滤：True 时丢弃与 query 无任何词/字重叠的 chunk，减少送入重排的噪音
     rag_pre_rerank_require_query_overlap: bool = True
@@ -124,25 +126,35 @@ class Settings(BaseSettings):
     # ---------- 路径 ----------
     upload_dir: str = "./data/uploads"
     qa_data_path: str = "./data/high_freq_qa.json"
+    # 高频 QA 存储后端：
+    # - local: 仅本地 JSON
+    # - milvus: 仅 Milvus（推荐甲方集中维护时使用）
+    # - hybrid: 先 local 再 Milvus（兼容过渡）
+    qa_store_backend: str = "milvus"
+    qa_milvus_collection: str = "faq_chunks"
+    qa_milvus_nprobe: int = 64
+    qa_milvus_semantic_top_k: int = 80
     # 高频 QA 匹配策略：
     # - exact/alias：强精确匹配（最高精度）
     # - semantic：轻量相似度（用于兜底召回，需阈值控制）
     # - contains：历史包含匹配（兼容旧行为，误命中风险更高，建议逐步关闭）
     qa_enable_semantic_match: bool = True
-    # 默认值偏保守但可命中常见改写；上线后建议用线上弱反馈分布再收紧/放宽
-    qa_semantic_min_score: float = 0.55
-    qa_semantic_min_query_coverage: float = 0.35
+    # 默认值采用“业务稳态优先”策略：先控误命中，再结合线上数据逐步放宽
+    qa_semantic_min_score: float = 0.72
+    qa_semantic_min_query_coverage: float = 0.60
     qa_semantic_require_any_overlap: bool = True  # True 时先做字符重叠过滤，再计算分数
-    qa_semantic_top_k: int = 30  # 召回候选数量（越大越不漏，越慢）
-    qa_semantic_min_margin: float = 0.03  # top1-top2 分差，小于该值认为歧义，避免误命中
+    qa_semantic_top_k: int = 20  # 召回候选数量（越大越不漏，越慢）
+    qa_semantic_min_margin: float = 0.08  # top1-top2 分差，小于该值认为歧义，避免误命中
+    # 语义兜底最小 query 长度（归一化后字符数）；过短 query 仅允许 exact/alias，避免高歧义误命中
+    qa_semantic_min_query_chars: int = 5
     # 语义匹配性能优化：先用便宜的 ngram 重叠做候选预筛，再对少量候选做 evaluate_retrieval 精排
     qa_semantic_ngram_size: int = 2  # 中文场景用 2-gram 通常性价比最好
-    qa_semantic_prefilter_top_n: int = 80  # 预筛后最多进入精排的候选数
+    qa_semantic_prefilter_top_n: int = 60  # 预筛后最多进入精排的候选数
     qa_match_cache_max_entries: int = 512  # 高频 QA 匹配结果 LRU 缓存（按归一化 query）
     # 验证器：防止“分数最高但其实不相关”
-    qa_semantic_max_irrelevant_ratio: float = 0.75  # 无关信息比例上限；越低越严格
-    qa_semantic_min_ngram_overlap_count: int = 3  # query 与候选 ngram 重叠计数下限
-    qa_enable_legacy_contains_match: bool = True
+    qa_semantic_max_irrelevant_ratio: float = 0.60  # 无关信息比例上限；越低越严格
+    qa_semantic_min_ngram_overlap_count: int = 4  # query 与候选 ngram 重叠计数下限
+    qa_enable_legacy_contains_match: bool = False
 
     # ---------- 对话与上下文（性能与隔离） ----------
     max_conversation_turns: int = 15  # 单对话最多轮数，超过后提示新开对话
@@ -217,6 +229,8 @@ class Settings(BaseSettings):
     chat_history_max_content_chars: int = 0
     # 短期记忆：Redis checkpointer URL（需 Redis 带 RedisJSON/RediSearch，如 Redis 8+ 或 Stack）；为空则用进程内 MemorySaver
     chat_checkpointer_redis_url: str = ""
+    # 短期记忆：PostgreSQL checkpointer URL；为空则不启用（可用于进程/worker 共享并支持 interrupt 后 resume）
+    chat_checkpointer_postgresql_uri: str = ""
     # 长期记忆：True 时使用 asyncpg 异步读写（不占线程池），需安装 asyncpg；False 时用同步 SQLAlchemy + to_thread
     chat_history_use_asyncpg: bool = False
 

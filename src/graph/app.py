@@ -8,7 +8,7 @@ QA → Text2SQL → RAG
 
 chat、knowledge_* 异常时可路由到 human；human 节点内调用 interrupt(payload) 暂停，
 调用方从 result["__interrupt__"] 取 payload 展示，恢复时用 Command(resume=...) 继续执行。
-短期记忆：可选 Redis checkpointer（chat_checkpointer_redis_url）实现多 worker 共享状态，否则 MemorySaver。
+短期记忆：可选 checkpointer（chat_checkpointer_postgresql_uri / chat_checkpointer_redis_url）实现多 worker 共享状态，否则 MemorySaver（仅进程内）。
 """
 import sys
 from pathlib import Path
@@ -33,18 +33,49 @@ logger = logging.getLogger(__name__)
 # 全局图单例与检查点，避免重复编译（异步节点，支持 ainvoke 高性能并发）
 _graph = None
 _checkpointer = None
+_checkpointer_cm = None  # checkpointer 上下文（例如 PostgresSaver.from_conn_string 的 contextmanager）
 
 
 def _make_checkpointer():
-    """若配置了 chat_checkpointer_redis_url 则尝试使用 Redis checkpointer，否则 MemorySaver。"""
+    """
+    优先使用 PostgreSQL checkpointer（chat_checkpointer_postgresql_uri）。
+    如未配置/不可用，再尝试 Redis checkpointer（chat_checkpointer_redis_url）。
+    最终回退到进程内 MemorySaver。
+    """
     from config import get_settings
-    url = (getattr(get_settings(), "chat_checkpointer_redis_url", None) or "").strip()
-    if not url:
+
+    global _checkpointer_cm
+    _checkpointer_cm = None
+
+    settings = get_settings()
+
+    pg_url = (getattr(settings, "chat_checkpointer_postgresql_uri", None) or "").strip()
+    if pg_url:
+        try:
+            from langgraph.checkpoint.postgres import PostgresSaver  # type: ignore[reportMissingImports]
+
+            cm = PostgresSaver.from_conn_string(pg_url)
+            # PostgresSaver.from_conn_string 是 contextmanager，需要显式 enter 才能拿到 saver
+            saver = cm.__enter__() if hasattr(cm, "__enter__") else cm
+            saver.setup()
+            _checkpointer_cm = cm
+            logger.info("短期记忆已使用 PostgreSQL checkpointer（支持跨进程 interrupt 后 resume）")
+            return saver
+        except Exception as e:
+            logger.warning("PostgreSQL checkpointer 不可用，继续尝试 Redis/MemorySaver: %s", e)
+
+    redis_url = (getattr(settings, "chat_checkpointer_redis_url", None) or "").strip()
+    if not redis_url:
         return MemorySaver()
+
     try:
-        from langgraph.checkpoint.redis import RedisSaver
-        saver = RedisSaver.from_conn_string(url)
+        from langgraph.checkpoint.redis import RedisSaver  # type: ignore[reportMissingImports]
+
+        cm = RedisSaver.from_conn_string(redis_url)
+        # RedisSaver.from_conn_string 可能也是 contextmanager；这里做兼容处理
+        saver = cm.__enter__() if hasattr(cm, "__enter__") else cm
         saver.setup()
+        _checkpointer_cm = cm if hasattr(cm, "__exit__") else None
         logger.info("短期记忆已使用 Redis checkpointer（多 worker 可共享状态）")
         return saver
     except Exception as e:
@@ -96,7 +127,7 @@ def create_graph(*, checkpointer=None):
 
 def get_graph():
     """
-    获取全局编译后的 LangGraph 单例。按配置使用 Redis checkpointer（多 worker 共享）或 MemorySaver。
+    获取全局编译后的 LangGraph 单例。按配置使用 PostgreSQL/Redis checkpointer 共享或 MemorySaver。
     多轮对话依赖此检查点恢复 messages 等状态。
     """
     global _graph, _checkpointer
@@ -104,3 +135,18 @@ def get_graph():
         _checkpointer = _make_checkpointer()
         _graph = create_graph(checkpointer=_checkpointer)
     return _graph
+
+
+def close_checkpointer() -> None:
+    """关闭 checkpointer 的上下文资源（例如 PostgresSaver 的数据库连接）。"""
+    global _checkpointer_cm
+    cm = _checkpointer_cm
+    if cm is None:
+        return
+    try:
+        if hasattr(cm, "__exit__"):
+            cm.__exit__(None, None, None)
+    except Exception as e:
+        logger.warning("关闭 checkpointer 失败（忽略）：%s", e)
+    finally:
+        _checkpointer_cm = None

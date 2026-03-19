@@ -4,6 +4,7 @@
 这样在 LangGraph 层面就是“多个 Agent/Node 协作”，而不是把路由藏在一个大节点里。
 """
 from collections import OrderedDict
+import asyncio
 import json
 from typing import Optional, Tuple, TypedDict
 
@@ -246,10 +247,21 @@ async def knowledge_qa_node_async(state: AgentState) -> dict:
                 }
 
             # 非明确 Text2SQL：再尝试高频 QA（快路径）
-            answer = engine.qa.find(last)
+            # 注意：QAStore.match 内部包含 Milvus 向量检索与纯代码精排/验证，
+            # 同为同步阻塞操作；放到线程池，避免阻塞事件循环。
+            answer, qa_meta = await asyncio.to_thread(engine.qa.match, last)
             if answer:
                 trace.route = "qa"
                 trace.final_status = "qa_hit"
+                trace.qa_match_type = str(qa_meta.get("match_type") or "")
+                trace.qa_matched_question = str(qa_meta.get("matched_question") or "")
+                trace.qa_matched_alias = str(qa_meta.get("matched_alias") or "")
+                trace.qa_match_score = float(qa_meta.get("score") or 0.0)
+                trace.qa_query_coverage = float(qa_meta.get("query_coverage") or 0.0)
+                trace.qa_top2_score = float(qa_meta.get("top2_score") or 0.0)
+                trace.qa_margin = float(qa_meta.get("margin") or 0.0)
+                trace.qa_irrelevant_ratio = float(qa_meta.get("irrelevant_ratio") or 0.0)
+                trace.qa_ngram_overlap_cnt = int(qa_meta.get("ngram_overlap_cnt") or 0)
                 return {
                     "messages": [AIMessage(content=answer)],
                     "next": "__end__",
