@@ -15,7 +15,7 @@ Always start by classifying the task, then inspect only the relevant layer:
 2. Wrong tables, columns, or joins: inspect `src/kb/schema_loader.py` and `data/text2sql_schema_overrides.json`.
 3. Bad SQL generation: inspect Text2SQL prompts and validation loop in `src/kb/text2sql.py`.
 4. Execution failures or unsafe writes: inspect `_execute_sql()`, write-confirm flow, and `api/main.py`.
-5. Performance or token issues: inspect schema size, retries, LIMIT protection, and docs in `docs/TEXT2SQL_OPTIMIZATION.md`.
+5. Performance or token issues: inspect schema size, retries, LIMIT protection, and docs in `docs/Text2SQL优化.md`.
 
 Do not treat Text2SQL as a single file change. Most bugs are caused by mismatch between intent, schema block, validation, and execution.
 
@@ -25,11 +25,11 @@ Do not treat Text2SQL as a single file change. Most bugs are caused by mismatch 
 |--------|-------------------|
 | Text2SQL logic | `src/kb/text2sql.py` |
 | Schema loading and cache | `src/kb/schema_loader.py` |
-| QA -> Text2SQL -> RAG integration | `src/kb/engine.py` |
+| KnowledgeEngine: rule Text2SQL → QA → RAG | `src/kb/engine.py` |
 | API for schema review and confirm execute | `api/main.py` |
 | Runtime config | `config/settings.py` |
 | Human-maintained schema comments and relations | `data/text2sql_schema_overrides.json` |
-| Optimization notes | `docs/TEXT2SQL_OPTIMIZATION.md` |
+| Optimization notes | `docs/Text2SQL优化.md` |
 
 ## Pipeline Summary
 
@@ -64,7 +64,7 @@ Use this when a question should enter Text2SQL but does not, or enters Text2SQL 
 2. Check whether the reported query is a true data question or a false positive caused by broad keywords.
 3. Prefer the smallest safe change:
    add trigger words, add negative filters, or tighten the existing heuristic.
-4. Re-check `src/kb/engine.py` to confirm the QA -> Text2SQL -> RAG order still makes sense.
+4. Re-check `src/kb/engine.py` for rule Text2SQL short-circuit, then QA, then RAG (no full Text2SQL after QA in the monolithic engine).
 5. Call out behavior changes explicitly if the heuristic becomes broader or narrower.
 
 ### 2. Fix wrong tables, columns, comments, or joins
@@ -106,7 +106,7 @@ Use this when Text2SQL is slow, expensive, or unstable under large schemas.
 1. Measure whether the pressure comes from schema size, retries, DB connection setup, or answer generation.
 2. Consider schema pruning, better table suggestion, fewer retries, or simpler answer formatting.
 3. Keep existing safety checks unless the user explicitly asks to redesign them.
-4. Use `docs/TEXT2SQL_OPTIMIZATION.md` as the backlog of possible optimizations, not as ground truth for current behavior.
+4. Use `docs/Text2SQL优化.md` as the backlog of possible optimizations, not as ground truth for current behavior.
 
 ## Constraints To Preserve
 
@@ -142,4 +142,4 @@ When working on a Text2SQL task:
 
 - Detailed map and troubleshooting notes: [reference.md](reference.md)
 - Example task patterns: [examples.md](examples.md)
-- Optimization backlog: `docs/TEXT2SQL_OPTIMIZATION.md`
+- Optimization backlog: `docs/Text2SQL优化.md`

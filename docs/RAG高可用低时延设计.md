@@ -23,7 +23,7 @@
 - **做法**：
   - 对 DB、Milvus、LLM 分别做**熔断**：连续失败达阈值后短时不再请求，冷却后半开探测；避免下游慢或挂掉时连接/线程被占满形成雪崩。
   - **关键 vs 非关键**：必须成功的路径（如执行 Text2SQL）用 `critical=True`，失败抛错；对话历史、监控上报、RAG 检索结果等用 `critical=False`，失败时返回空/跳过并打日志，不阻塞主流程。
-- **本项目**：`db_resilience.py` 统一管理 DB/Milvus 连接与熔断；`llm.py` 多 DeepSeek 节点按节点熔断并自动切换健康节点。详见 [高并发场景下的缓存、熔断与降级策略](HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md)。
+- **本项目**：`db_resilience.py` 统一管理 DB/Milvus 连接与熔断；`llm.py` 多 DeepSeek 节点按节点熔断并自动切换健康节点。详见 [高并发场景下的缓存、熔断与降级策略](高并发缓存熔断降级.md)。
 
 ### 2.2 降级与可预期响应
 
@@ -58,7 +58,7 @@
 - **做法**：
   - **问答缓存**：问题归一化后作 key，命中则直接返回答案，不经过检索和 LLM。配合热 key 本地 LRU、防击穿单飞锁，高并发下仍稳、不击穿。
   - **检索缓存**：相同 query + 检索参数时复用「BM25 + 向量 + 重排」结果，只做一次 Milvus/BM25/重排，生成阶段仍走 LLM。适合重复问、相似问多的场景。
-- **本项目**：`answer_cache.py` 负责问答缓存；`rag.py` 中 `_merge_3_7` 外层包进程内 LRU 检索缓存。详见 [Redis 问答缓存说明](REDIS_CACHE.md) 与 [高并发缓存、熔断与降级](HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md#一缓存策略)。
+- **本项目**：`answer_cache.py` 负责问答缓存；`rag.py` 中 `_merge_3_7` 外层包进程内 LRU 检索缓存。详见 [Redis 问答缓存说明](Redis缓存.md) 与 [高并发缓存、熔断与降级](高并发缓存熔断降级.md#一缓存策略)。
 
 ### 3.2 异步与连接复用
 
@@ -66,7 +66,7 @@
 - **做法**：
   - API 到图执行、LLM 调用全走异步（`ainvoke` / `astream`）；同步阻塞操作（DB、部分检索）用 `asyncio.to_thread` 放入线程池，避免阻塞事件循环。
   - DB、Redis、Milvus 使用连接池；按 URI/实例复用，避免每次请求建连关连。
-- **本项目**：FastAPI 全 async 路由；LangGraph `ainvoke`/`aget_state`；DB 通过 `db_resilience` 连接池；Redis `redis.asyncio` 连接池。详见 [异步与高并发设计](ASYNC_CONCURRENCY.md)。
+- **本项目**：FastAPI 全 async 路由；LangGraph `ainvoke`/`aget_state`；DB 通过 `db_resilience` 连接池；Redis `redis.asyncio` 连接池。详见 [异步与高并发设计](异步并发.md)。
 
 ### 3.3 流式输出
 
@@ -105,7 +105,7 @@
 - **做法**：
   - LLM、DB、MinerU 等设置合理超时（如 `agent_request_timeout_seconds`），超时后触发重试或降级。
   - API 全局限流（如 Semaphore 限制同时处理请求数），超限排队或返回 503；对解析服务等也可做并发上限（如 MinerU 信号量）。
-- **本项目**：`api_max_concurrent_requests`、`agent_request_timeout_seconds`、`mineru_concurrency_limit` 等；详见 [高并发缓存、熔断与降级](HIGH_CONCURRENCY_CACHE_CIRCUIT_DEGRADATION.md#四限流与并发控制)。
+- **本项目**：`api_max_concurrent_requests`、`agent_request_timeout_seconds`、`mineru_concurrency_limit` 等；详见 [高并发缓存、熔断与降级](高并发缓存熔断降级.md#四限流与并发控制)。
 
 ---
 
@@ -115,7 +115,7 @@
 用户请求
   → 问答缓存命中？ → 是：直接返回（低延迟 + 无下游依赖）
   → 否：总控路由
-       → 知识库：QA 精准匹配 → Text2SQL → RAG
+       → 知识库：`KnowledgeEngine` 为 Text2SQL 规则预判 → 高频 QA → RAG；子图在 QA 未命中时可路由 Text2SQL 再 RAG
                   → RAG：检索缓存命中？ → 是：复用检索结果，只走生成
                   → 否：Milvus（熔断则降级为空）+ BM25 + 重排 → 评估/重检 → 生成
        → 生成：LLM 多节点（熔断切换）+ 流式输出

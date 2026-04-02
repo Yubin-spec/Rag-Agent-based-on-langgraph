@@ -4,8 +4,8 @@
 
 ## 结构概览
 
-- **总控 Agent**：**混合规则 + LLM** 做意图路由。先按规则预判（明显闲聊短语 → `chat`，含业务关键词 → `knowledge`），歧义时再调用 DeepSeek 根据对话推理，路由到 `chat`（闲聊/引导）或 `knowledge`（知识问答）。详见 [意图与路由](docs/INTENT_AND_ROUTING.md)。
-- **异步高并发**：API / 图 / 知识库均为异步优先；LLM 用 ainvoke/astream，同步 IO 用 `asyncio.to_thread`，可选配置线程池大小。详见 [异步与高并发](docs/ASYNC_CONCURRENCY.md)。
+- **总控 Agent**：**混合规则 + LLM** 做意图路由。先按规则预判（明显闲聊短语 → `chat`，含业务关键词 → `knowledge`），歧义时再调用 DeepSeek 根据对话推理，路由到 `chat`（闲聊/引导）或 `knowledge`（知识问答）。详见 [意图与路由](docs/意图识别与路由.md)。
+- **异步高并发**：API / 图 / 知识库均为异步优先；LLM 用 ainvoke/astream，同步 IO 用 `asyncio.to_thread`，可选配置线程池大小。详见 [异步与高并发](docs/异步并发.md)。
 - **闲聊 Agent**：打招呼、引导、介绍能力。
 - **知识库 Agent**：三种机制  
   1. **高频 QA**：从 `data/high_freq_qa.json` 加载，问法固定时精准匹配。  
@@ -60,7 +60,7 @@ python run.py
 uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
 
-- **Docker 内网部署**：见 [docs/DOCKER_DEPLOY.md](docs/DOCKER_DEPLOY.md)。项目根目录执行 `docker compose up -d --build`，需先 `cp .env.example .env` 并填写配置。
+- **Docker 内网部署**：见 [docs/Docker部署.md](docs/Docker部署.md)。项目根目录执行 `docker compose up -d --build`，需先 `cp .env.example .env` 并填写配置。
 
 - 接口摘要：
   - `POST /doc/upload`：上传文件，返回解析结果（含 `task_id`、`full_text`、`chunks`）。
@@ -72,18 +72,18 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000
 - **LLM**：DeepSeek（R1 可用 `deepseek-reasoner`），通过 `OPENAI_API_BASE`、`OPENAI_API_KEY`、`LLM_MODEL` 配置。
 - **向量/重排**：BGE-M3、BGE Reranker Large，见 `config/settings.py`。
 - **Milvus**：需先启动 Milvus，并创建/使用 `MILVUS_COLLECTION`（维度与 BGE-M3 一致，默认 1024）。
-- **Text2SQL**：默认 SQLite。表结构由 `src/kb/schema_loader.py` 从数据库读取；**人工审核**：前端「Text2SQL 表结构审核」可展示库表与字段并修改表含义、字段含义，**表间关联由人工整理后提交**（配置见 `data/text2sql_schema_overrides.json`）。定时（1 小时）检测 schema 变更并重新扫描。支持意图学习、仅允许 SELECT、删除需人工确认、SQL 校验重试最多 3 次、多表按关联 JOIN；**LIMIT 保护**（无 LIMIT 的 SELECT 自动追加上限，见 `text2sql_default_limit`）、**执行错误重试**（列名/表不匹配时再生成 1 次）、**时间范围解析**（问句中「去年」「最近三个月」等自动解析为具体日期区间并注入 prompt）。更多优化方向见 [Text2SQL 优化](docs/TEXT2SQL_OPTIMIZATION.md)。
+- **Text2SQL**：默认 SQLite。表结构由 `src/kb/schema_loader.py` 从数据库读取；**人工审核**：前端「Text2SQL 表结构审核」可展示库表与字段并修改表含义、字段含义，**表间关联由人工整理后提交**（配置见 `data/text2sql_schema_overrides.json`）。定时（1 小时）检测 schema 变更并重新扫描。支持意图学习、仅允许 SELECT、删除需人工确认、SQL 校验重试最多 3 次、多表按关联 JOIN；**LIMIT 保护**（无 LIMIT 的 SELECT 自动追加上限，见 `text2sql_default_limit`）、**执行错误重试**（列名/表不匹配时再生成 1 次）、**时间范围解析**（问句中「去年」「最近三个月」等自动解析为具体日期区间并注入 prompt）。更多优化方向见 [Text2SQL 优化](docs/Text2SQL优化.md)。
 - **MinerU**：基础版使用占位解析；接入真实 MinerU 时配置 `MINERU_API_URL`、`MINERU_API_TOKEN` 或本地 MinerU 调用。
 
 ## RAG 配置与评估
 
 - `config/settings.py`：`rag_chunk_sizes`、`rag_parent_overlap`（默认 150）、`rag_use_legacy_fixed_chunking`（True 时仅用固定长度切片）、`rag_bm25_ratio` / `rag_vector_ratio`（0.3 : 0.7）、`rag_min_match_score`、`rag_max_retrieve_attempts`（默认 3）。
 - 评估指标（`src/kb/retrieval_eval.py`）：`compute_match_score`、`compute_match_positions`、`compute_irrelevant_ratio`、`compute_query_coverage`。
-- 切片：主题为父子分段，默认 `chunk_text(..., align_to_sentence=True)`（固定长度+切点边界对齐）；详见 `docs/RAG_CHUNKING_VERSION_GRAY_REFLOW.md`。
+- 切片：主题为父子分段，默认 `chunk_text(..., align_to_sentence=True)`（固定长度+切点边界对齐）；详见 `docs/RAG切片版本灰度回流.md`。
 
 ## 扩展
 
 - 高频 QA：编辑 `data/high_freq_qa.json` 或修改 `qa_data_path`。
 - RAG：扩展 BM25 语料、Milvus 与 `retrieve_with_validation` 逻辑。
 - **意图路由**：规则词在 `src/agents/supervisor.py` 的 `KNOWLEDGE_KEYWORDS`、`CHAT_PHRASES`；总控/闲聊/知识库提示词在 `src/agents/` 下修改。
-- **Redis 缓存**：问答缓存使用连接池、超时、健康检查与断线重连；单条价值可限制长度；详见 [Redis 缓存](docs/REDIS_CACHE.md)。
+- **Redis 缓存**：问答缓存使用连接池、超时、健康检查与断线重连；单条价值可限制长度；详见 [Redis 缓存](docs/Redis缓存.md)。

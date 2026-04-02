@@ -99,7 +99,7 @@ def build_pdf(out_path: Path) -> None:
         "智能体入口：api/main.py 的 POST /chat、POST /chat/stream，内部 get_graph() 后 graph.ainvoke(...)。",
         "图编排：src/graph/app.py，START → supervisor → (chat | knowledge | human | END)。",
         "路由逻辑：src/agents/supervisor.py（规则优先 + LLM 兜底，失败转 human）。",
-        "知识库统一入口：src/kb/engine.py（QA → Text2SQL → RAG）。",
+        "知识库统一入口：src/kb/engine.py（Text2SQL 预判 → 高频 QA → Text2SQL → RAG）。",
         "RAG 检索：src/kb/rag.py；分块：src/kb/chunking.py；配置：config/settings.py。",
     ]
     story.append(

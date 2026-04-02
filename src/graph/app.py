@@ -3,8 +3,8 @@
 LangGraph 多智能体图：Supervisor 模式 + 人工介入（interrupt）。
 流程：START → 总控(supervisor) → 条件边(chat | knowledge | human) → 对应子节点 → END。
 
-其中 knowledge 为“知识库 Agent/子图”，内部拆分为 3 个独立节点（multi-node）：
-QA → Text2SQL → RAG
+其中 knowledge 为“知识库 Agent/子图”，LangGraph 上为 **2 个执行节点**：
+`knowledge_text2sql`（对应 `src/kb/text2sql.py`）与 `knowledge_qa_rag`（规则预判 → 高频 QA → 混合路由；RAG 在本节点内执行，Text2SQL 无结果则 `kb_rag_only` 回退 RAG）。
 
 chat、knowledge_* 异常时可路由到 human；human 节点内调用 interrupt(payload) 暂停，
 调用方从 result["__interrupt__"] 取 payload 展示，恢复时用 Command(resume=...) 继续执行。
@@ -101,7 +101,7 @@ def create_graph(*, checkpointer=None):
 
     builder.add_node("supervisor", supervisor_node_async)
     builder.add_node("chat", chat_agent_node_async)
-    # knowledge 作为一个“子智能体/子图”，内部再按 QA→Text2SQL→RAG 跑完
+    # knowledge 子图：见 knowledge_subgraph（knowledge_qa_rag + knowledge_text2sql 两节点）
     builder.add_node("knowledge", get_knowledge_graph())
     builder.add_node("human", human_handoff_node_async)
 

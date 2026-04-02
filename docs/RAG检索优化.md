@@ -26,7 +26,7 @@
 
 | 方向 | 做法 | 收益 | 接入点与代价 |
 |------|------|------|----------------|
-| **Query 改写 / 扩展** | **以规则为主**：归一化、纠错、同义词/术语用配置表（可梳理、可维护）；可选在规则之后用 LLM 做同义扩展。规则见 `docs/QUERY_REWRITE_RULES.md`，实现与配置：`src/kb/query_rewrite.py`、`rag_use_query_rewrite_by_rules`、`rag_query_rewrite_rules_path` | 提升对同义问法、错别字、表述差异的召回；规则可解释、可审计 | 在 `retrieve_with_validation` 入口对 query 做一次 `rewrite_query_by_rules` 再检索；规则表需自行梳理（示例 `data/query_rewrite_rules.example.json`） |
+| **Query 改写 / 扩展** | **以规则为主**：归一化、纠错、同义词/术语用配置表（可梳理、可维护）；可选在规则之后用 LLM 做同义扩展。规则见 `docs/查询改写规则.md`，实现与配置：`src/kb/query_rewrite.py`、`rag_use_query_rewrite_by_rules`、`rag_query_rewrite_rules_path` | 提升对同义问法、错别字、表述差异的召回；规则可解释、可审计 | 在 `retrieve_with_validation` 入口对 query 做一次 `rewrite_query_by_rules` 再检索；规则表需自行梳理（示例 `data/query_rewrite_rules.example.json`） |
 | **Query 分解** | 复杂问句拆成多个子问题，分别检索再合并去重或按子问题聚合 | 多意图、多条件问题召回更全 | 需定义「何时分解」与「如何合并」，适合明确多子问的场景；实现与评估成本较高 |
 | **HyDE / 假设性文档** | 先用 LLM 生成若干「假设答案」片段，用这些片段去向量检索，再对命中的真实 chunk 做重排 | 缓解 query 与文档表述差异导致的向量空间不匹配 | 在 `_vector_search` 前多一次 LLM 调用生成假设片段并分别检索；增加延迟与成本，需做 A/B 验证 |
 
@@ -53,7 +53,7 @@
 |------|------|------|----------------|
 | **用点击/反馈微调检索** | 利用用户反馈（点赞/点踩、采纳）或隐式点击，对 query-chunk 对做正负样本，微调向量或 reranker | 检索顺序更贴合业务分布 | 需收集与清洗日志、建训练 pipeline；与当前「仅 BGE 预训练」相比是较大迭代 |
 | **检索阶段 A/B** | 新策略（如 RRF、query 改写）与小流量对比，按 observation_id 打标，看 grounding、反馈、延迟 | 上线前有数据支撑 | 在检索入口按比例或 user_id 分流，写 trace 时带上策略标识；分析时按策略聚合 |
-| **分段耗时打点** | 对「向量检索 / BM25 / 重排 / 评估」各阶段打耗时，写入 trace 或日志 | 精确定位检索内部瓶颈 | 在 `_merge_3_7_impl`、`_evaluate_candidates` 内用 `perf_counter()` 打点，写入 `qa_rag_trace.extra` 或观测；见 TRACING_BOTTLENECK_RESOURCE_COST.md |
+| **分段耗时打点** | 对「向量检索 / BM25 / 重排 / 评估」各阶段打耗时，写入 trace 或日志 | 精确定位检索内部瓶颈 | 在 `_merge_3_7_impl`、`_evaluate_candidates` 内用 `perf_counter()` 打点，写入 `qa_rag_trace.extra` 或观测；见 链路追踪瓶颈与资源成本.md |
 
 ---
 

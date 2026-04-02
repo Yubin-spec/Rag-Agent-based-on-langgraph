@@ -6,7 +6,7 @@
 |------|------|-------|
 | Text2SQL entrypoint | `src/kb/text2sql.py` | Intent detection, prompt building, validation, execution, answer generation |
 | Schema loading | `src/kb/schema_loader.py` | DB introspection, schema cache, override loading, relation formatting |
-| Integration order | `src/kb/engine.py` | QA -> Text2SQL -> RAG routing |
+| Integration order | `src/kb/engine.py` | Rule Text2SQL short-circuit → QA → RAG (subgraph can route Text2SQL after QA miss) |
 | Schema review API | `api/main.py` | `GET/PUT /text2sql/schema` and `POST /text2sql/confirm_execute` |
 | Runtime settings | `config/settings.py` | `text2sql_*` knobs |
 | Human-maintained metadata | `data/text2sql_schema_overrides.json` | Table comments, column comments, relations |
@@ -195,7 +195,7 @@ Check:
 
 - `_ensure_limit()`
 - schema size and pruning approach
-- `docs/TEXT2SQL_OPTIMIZATION.md`
+- `docs/Text2SQL优化.md`
 
 ## Change Strategy Guidelines
 
@@ -208,4 +208,4 @@ Check:
 ## Related Documents
 
 - Example tasks and expected handling: [examples.md](examples.md)
-- Optimization backlog and future ideas: `docs/TEXT2SQL_OPTIMIZATION.md`
+- Optimization backlog and future ideas: `docs/Text2SQL优化.md`

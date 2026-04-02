@@ -1,7 +1,13 @@
 # src/agents/knowledge_agent.py
 """
-知识库 multi-agent 节点集合：将知识能力拆为 3 个独立节点（QA / Text2SQL / RAG）。
-这样在 LangGraph 层面就是“多个 Agent/Node 协作”，而不是把路由藏在一个大节点里。
+知识库 multi-agent 节点集合：LangGraph 子图仅 **两个执行节点**：
+
+- **knowledge_text2sql**：对应 `src/kb/text2sql.py`（NL2SQL 全链路）。
+- **knowledge_qa_rag**：Text2SQL 规则预判 → 高频 QA →（未命中）混合路由；走 RAG 时在本节点内执行，
+  走 Text2SQL 时经边进入上一节点；Text2SQL 无结果则 `kb_rag_only` 回到本节点只跑 RAG。
+
+业务顺序（单入口引擎）：
+- **KnowledgeEngine.query / aquery**：规则 Text2SQL 短路 → 高频 QA → RAG（QA 后不再全量 Text2SQL）。
 """
 from collections import OrderedDict
 import asyncio
@@ -187,8 +193,8 @@ async def _decide_text2sql_candidate(question: str) -> Tuple[bool, float, str, s
 
 def knowledge_agent_node(state: AgentState) -> dict:
     """
-    兼容旧入口（同步）：仍按 QA → Text2SQL → RAG 顺序一口气跑完。
-    新图会使用拆分后的三个节点：knowledge_qa / knowledge_text2sql / knowledge_rag。
+    兼容旧入口（同步）：与 KnowledgeEngine.query 一致（规则 Text2SQL 短路 → 高频 QA → RAG）。
+    新图使用两节点：knowledge_qa_rag + knowledge_text2sql。
     """
     engine = _get_kb_engine()
     last = _get_last_user_text(state)
@@ -216,10 +222,45 @@ def _is_retryable_error(e: Exception) -> bool:
     return "timeout" in msg or "connection" in msg or "5" in str(getattr(e, "status_code", ""))
 
 
-async def knowledge_qa_node_async(state: AgentState) -> dict:
+async def _knowledge_rag_node_body_async(state: AgentState) -> dict:
+    """仅执行 RAG（供 knowledge_qa_rag 内联调用，或 Text2SQL 失败回退）。"""
+    last = _get_last_user_text(state)
+    if not last:
+        return {"messages": [AIMessage(content="请直接输入您要咨询的业务或数据问题。")], "next": "__end__"}
+
+    from config import get_settings
+    settings = get_settings()
+    max_retries = max(0, getattr(settings, "agent_llm_retry_times", 2))
+    reply = getattr(settings, "agent_need_human_reply", "当前服务暂时异常，请稍后重试或转人工客服。")
+
+    for attempt in range(max_retries + 1):
+        try:
+            engine = _get_kb_engine()
+            answer, _ = await engine.aquery_rag_only(last)
+            return {
+                "messages": [AIMessage(content=answer)],
+                "next": "__end__",
+                "route": "knowledge_qa_rag",
+                "qa_trace": engine.get_last_trace(),
+                "text2sql_candidate": False,
+                "kb_rag_only": False,
+            }
+        except Exception as e:
+            if attempt < max_retries and _is_retryable_error(e):
+                continue
+            return {"next": "human", "human_message": reply}
+
+
+async def knowledge_qa_rag_node_async(state: AgentState) -> dict:
     """
-    QA 节点：命中则直接回复并结束；未命中则不产出消息，仅标记 qa_hit=False 交给下一步。
+    QA + RAG 合并节点（与 `knowledge_text2sql` 并列的另一图节点）：
+    - `kb_rag_only=True`：仅 RAG（Text2SQL 无结果后的回退）；
+    - 否则：Text2SQL 规则预判 → 高频 QA → 混合路由；去 Text2SQL 则只打标由边进入执行节点，
+      去 RAG 则在本节点内调用 `_knowledge_rag_node_body_async`。
     """
+    if state.get("kb_rag_only") is True:
+        return await _knowledge_rag_node_body_async(state)
+
     last = _get_last_user_text(state)
     if not last:
         return {"messages": [AIMessage(content="请直接输入您要咨询的业务或数据问题。")], "next": "__end__"}
@@ -238,7 +279,7 @@ async def knowledge_qa_node_async(state: AgentState) -> dict:
             rule = _rule_based_text2sql_candidate(last)
             if rule is True:
                 return {
-                    "route": "knowledge_qa",
+                    "route": "knowledge_qa_rag",
                     "qa_trace": engine.get_last_trace(),
                     "qa_hit": False,
                     "text2sql_candidate": True,
@@ -265,7 +306,7 @@ async def knowledge_qa_node_async(state: AgentState) -> dict:
                 return {
                     "messages": [AIMessage(content=answer)],
                     "next": "__end__",
-                    "route": "knowledge_qa",
+                    "route": "knowledge_qa_rag",
                     "qa_trace": engine.get_last_trace(),
                     "qa_hit": True,
                 }
@@ -289,18 +330,26 @@ async def knowledge_qa_node_async(state: AgentState) -> dict:
                     "kb_route_reason": reason,
                 }
 
-            return {
-                "route": "knowledge_qa",
-                "qa_trace": engine.get_last_trace(),
-                "qa_hit": False,
-                "text2sql_candidate": bool(text2sql_candidate),
-                "kb_route_confidence": conf,
-                "kb_route_reason": reason,
-            }
+            if text2sql_candidate:
+                return {
+                    "route": "knowledge_qa_rag",
+                    "qa_trace": engine.get_last_trace(),
+                    "qa_hit": False,
+                    "text2sql_candidate": True,
+                    "kb_route_confidence": conf,
+                    "kb_route_reason": reason,
+                }
+
+            # 路由为 RAG：不单独设图节点，在本节点内执行
+            return await _knowledge_rag_node_body_async(state)
         except Exception as e:
             if attempt < max_retries and _is_retryable_error(e):
                 continue
             return {"next": "human", "human_message": reply}
+
+
+# 兼容旧名称（历史文档/引用）
+knowledge_qa_node_async = knowledge_qa_rag_node_async
 
 
 async def knowledge_text2sql_node_async(state: AgentState) -> dict:
@@ -346,11 +395,12 @@ async def knowledge_text2sql_node_async(state: AgentState) -> dict:
                     "text2sql_hit": True,
                 }
 
-            # 兜底：Text2SQL 无法产出时，继续走 RAG
+            # 兜底：Text2SQL 无法产出时，回到 QA+RAG 节点仅跑 RAG
             return {
                 "route": "knowledge_text2sql",
                 "qa_trace": engine.get_last_trace(),
                 "text2sql_hit": False,
+                "kb_rag_only": True,
             }
         except Exception as e:
             if attempt < max_retries and _is_retryable_error(e):
@@ -360,31 +410,9 @@ async def knowledge_text2sql_node_async(state: AgentState) -> dict:
 
 async def knowledge_rag_node_async(state: AgentState) -> dict:
     """
-    RAG 节点：只跑 RAG（含二次 RAG），输出带引用的答案。
+    兼容旧名称：子图已合并为 knowledge_qa_rag，RAG 逻辑见 `_knowledge_rag_node_body_async`。
     """
-    last = _get_last_user_text(state)
-    if not last:
-        return {"messages": [AIMessage(content="请直接输入您要咨询的业务或数据问题。")], "next": "__end__"}
-
-    from config import get_settings
-    settings = get_settings()
-    max_retries = max(0, getattr(settings, "agent_llm_retry_times", 2))
-    reply = getattr(settings, "agent_need_human_reply", "当前服务暂时异常，请稍后重试或转人工客服。")
-
-    for attempt in range(max_retries + 1):
-        try:
-            engine = _get_kb_engine()
-            answer, _ = await engine.aquery_rag_only(last)
-            return {
-                "messages": [AIMessage(content=answer)],
-                "next": "__end__",
-                "route": "knowledge_rag",
-                "qa_trace": engine.get_last_trace(),
-            }
-        except Exception as e:
-            if attempt < max_retries and _is_retryable_error(e):
-                continue
-            return {"next": "human", "human_message": reply}
+    return await _knowledge_rag_node_body_async(state)
 
 
 async def knowledge_agent_node_async(state: AgentState) -> dict:

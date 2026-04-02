@@ -12,15 +12,14 @@
 - **LangGraph**：图里不内置「检索节点」，检索通常通过以下方式接入：
   - **工具调用**：某节点内调用 `retriever.invoke(question)`，把结果放入 state 或直接喂给 LLM；
   - **独立节点**：专门做一个「检索节点」，从 state 取 question，调用检索，把 chunks 写入 state，下一节点再消费；
-  - **封装在业务节点内**：如本项目的 knowledge 节点，内部自己调 RAG 引擎（QA → Text2SQL → retrieve_with_validation + 生成），图只看到「输入消息 → 输出消息」。
+  - **封装在业务节点内**：如本项目的 knowledge 子图，内部按 Text2SQL 预判 → 高频 QA → Text2SQL/RAG（含 `retrieve_with_validation` + 生成），图只看到「输入消息 → 输出消息」。
 
 ### 1.2 本项目实现（更新：knowledge 子图）
 
-- **图内无显式 Retriever 节点**：检索不作为图的单独节点，而是封装在 knowledge 子图的 RAG 节点中。
-- **knowledge 子图**：父图层面仍只有一个 `knowledge` 分支，但 `knowledge` 实现为子图，内部节点为：
-  - `knowledge_qa`：高频 QA 命中直接结束；
-  - `knowledge_text2sql`：数据查询/写操作确认（可能返回 `pending_sql`）；
-  - `knowledge_rag`：RAG 检索+生成（含二次 RAG）。
+- **图内无显式 Retriever 节点**：检索不作为图的单独节点，而是封装在 **`knowledge_qa_rag`** 节点内的 RAG 路径中。
+- **knowledge 子图**：父图层面仍只有一个 `knowledge` 分支，但 `knowledge` 实现为子图，LangGraph 上为 **两个执行节点**：
+  - `knowledge_qa_rag`：先做 **Text2SQL 规则预判**（强命中则去 Text2SQL、跳过高频 QA）；否则 **高频 QA**，未命中再做 **Text2SQL vs RAG** 混合路由（可澄清）；走 RAG 时**在本节点内**检索+生成（含二次 RAG）；走 Text2SQL 则经边到下一节点；
+  - `knowledge_text2sql`：对应 `src/kb/text2sql.py`，数据查询/写操作确认（可能返回 `pending_sql`）；无结果时 `kb_rag_only` 回到 `knowledge_qa_rag` 只跑 RAG。
   二级意图识别（Text2SQL vs RAG）采用“规则优先 + 歧义 LLM 推理 + 低置信澄清”。
 - **检索结果不写入图 state**：chunks、context 仅在本节点内使用，生成完答案后只把 `AIMessage(content=answer)` 和 `qa_trace` 写回 state，避免 state 膨胀。
 
@@ -60,7 +59,7 @@
 ### 3.1 图结构（更新：knowledge 子图）
 
 - **单总控（Supervisor）**：`START → supervisor → conditional_edges → chat | knowledge | human | __end__`；chat/knowledge 执行后再 `conditional_edges → human | __end__`，human 后直接 `END`。
-- **knowledge 为子图**：父图不关心其内部节点；`knowledge` 自己在子图内完成 QA/Text2SQL/RAG 的多节点执行后返回。
+- **knowledge 为子图**：父图不关心其内部节点；`knowledge` 自己在子图内按 **Text2SQL 预判 → 高频 QA → Text2SQL/RAG** 多节点执行后返回。
 - **无「多轮推理循环」**：正常路径是「总控 → 一个子节点 → 结束」；只有异常或转人工时才进 human 节点。没有「子节点执行完再回到总控」的边，因此**每轮用户消息只触发一次总控 + 一次子节点**。
 
 ### 3.2 路由如何决定（调度逻辑）
@@ -83,7 +82,7 @@
 | **总控** | 规则未命中时必调 LLM | 每轮至少一次总控；歧义句会多一次 LLM 调用，延迟与成本增加。 |
 | **Checkpointer** | 每步写一次完整 state | 节点结束后整图 state 序列化写入 MemorySaver/Redis；state 大（如 messages 很多）时写放大会明显。 |
 | **长期记忆加载** | 首请求或空 state 时查 DB | `_ensure_state_from_db` 从 PostgreSQL 拉历史并 `aupdate_state`，请求首包会多一次 DB 往返与一次 state 更新。 |
-| **Knowledge 节点** | 整条链路一次跑完 | QA → Text2SQL → RAG（检索 + 可能多轮重试生成）在同一节点内顺序执行，单次调用耗时长；流式虽已改为 astream，但检索仍是同步/ to_thread。 |
+| **Knowledge 子图** | 多节点或单节点封装 | 与 `KnowledgeEngine` 一致：Text2SQL 预判 → 高频 QA → Text2SQL 全量 → RAG；检索 + 可能多轮重试生成在 RAG 路径，单次调用耗时长；流式路径检索多为同步/ to_thread。 |
 | **消息窗口与摘要** | 总控/闲聊取最近 N 轮 + 可选摘要 | 窗口大或摘要 LLM 慢时，总控/闲聊的「准备消息」阶段会变长；摘要本身多一次 LLM 调用。 |
 | **多 worker** | MemorySaver 不共享 | 未配 Redis checkpointer 时，会话保持若不准，同一会话打到不同 worker 会拿不到图状态，只能依赖 DB 注入，且可能重复加载。 |
 
@@ -105,7 +104,7 @@
 
 ## 六、小结（面试可答）
 
-- **检索**：LangChain/LangGraph 里检索通常通过工具或节点封装；本项目检索在 knowledge 节点内部（QA → Text2SQL → RAG），图只看到输入/输出消息，不暴露检索中间结果。
+- **检索**：LangChain/LangGraph 里检索通常通过工具或节点封装；本项目检索在 knowledge 子图的 RAG 路径内，图只看到输入/输出消息，不暴露检索中间结果。
 - **记忆**：短期 = LangGraph checkpointer（MemorySaver/Redis）按 thread_id 存图状态，messages 用 add_messages 追加；长期 = PostgreSQL，请求开始时若图状态为空则注入；运行时 pending_sql/interrupted 放 shared_state；上下文用窗口 + 可选摘要控制送入 LLM 的量。
 - **调度**：单总控 + conditional_edges，总控写 next，图按 next 选边执行一个子节点后结束或转人工；无循环。
 - **瓶颈**：总控 LLM、checkpoint 写入、DB 加载、knowledge 整链耗时、多 worker 下 MemorySaver 不共享。

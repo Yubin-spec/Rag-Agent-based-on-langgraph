@@ -1,6 +1,8 @@
 # src/kb/engine.py
 """
-知识库统一入口：优先 QA 精准匹配 → Text2SQL → RAG 检索生成；RAG 答案展示依据来源与依赖切片。
+知识库统一入口（KnowledgeEngine）：Text2SQL 规则强命中则短路 → 否则高频 QA → 未命中再走 RAG。
+不在 QA 之后再做一次「全量 Text2SQL」；需要「QA 后可选 Text2SQL」时请走 LangGraph 子图（knowledge_qa → knowledge_text2sql | knowledge_rag）。
+RAG 答案展示依据来源与依赖切片。
 大模型仅使用 DeepSeek（src.llm.get_deepseek_llm），不调用 OpenAI。
 支持同步 query/query_stream 与异步 aquery_stream，便于高性能并发。
 """
@@ -137,8 +139,8 @@ class KnowledgeQueryTrace:
 
 class KnowledgeEngine:
     """
-    知识库问答统一入口：按顺序尝试 QA 精准匹配 → Text2SQL → RAG。
-    其中 RAG 生成阶段使用的 LLM 仅限 DeepSeek（_get_llm），不调用 OpenAI。
+    知识库问答统一入口：规则 Text2SQL 短路 → 高频 QA → RAG（不在 QA 后再全量 Text2SQL）。
+    RAG 生成阶段使用的 LLM 仅限 DeepSeek（_get_llm），不调用 OpenAI。
     """
 
     def __init__(self):
@@ -559,7 +561,10 @@ class KnowledgeEngine:
 
     def query(self, question: str) -> Tuple[str, Optional[str]]:
         """
-        依次尝试 QA、Text2SQL、RAG，返回 (回复文案, 待确认 SQL 或 None)。
+        返回 (回复文案, 待确认 SQL 或 None)。顺序：
+        0) Text2SQL 规则预判：强命中则先走 Text2SQL，有结果即返回（跳过高频 QA）；
+        1) 高频 QA 匹配；
+        2) 最后 RAG（QA 未命中不再在此处全量 Text2SQL）。
         当 Text2SQL 返回删除/修改类需人工确认时，第二项为待执行 SQL，由上层写入 state.pending_sql 并交 API 确认执行。
         """
         trace = self._reset_trace()
@@ -592,18 +597,7 @@ class KnowledgeEngine:
             trace.qa_ngram_overlap_cnt = int(qa_meta.get("ngram_overlap_cnt") or 0)
             return (answer, None)
 
-        # 2) 结构化数据 Text2SQL（可能返回待确认 SQL）
-        result = self.text2sql.query(question)
-        if result is not None:
-            trace.route = "text2sql"
-            if isinstance(result, Text2SQLConfirmRequired):
-                trace.final_status = "text2sql_pending"
-                trace.pending_sql = True
-                return (result.message, result.sql)
-            trace.final_status = "text2sql_answer"
-            return (result, None)
-
-        # 3) RAG：带评估与重检，并返回依据来源
+        # 2) RAG：带评估与重检，并返回依据来源
         return self.query_rag_only(question)
 
     def query_rag_only(self, question: str) -> Tuple[str, Optional[str]]:
@@ -647,7 +641,8 @@ class KnowledgeEngine:
 
     def query_stream(self, question: str):
         """
-        知识库流式回答：先出首字再逐 chunk。依次尝试 QA → Text2SQL → RAG，首个有结果即流式输出。
+        知识库流式回答：先出首字再逐 chunk。顺序与 query 一致：
+        Text2SQL 规则预判 → 高频 QA → RAG（QA 后不再全量 Text2SQL）。
         Yields: 文本片段（str）。
         """
         trace = self._reset_trace()
@@ -682,18 +677,7 @@ class KnowledgeEngine:
                 yield chunk
             return
 
-        # 2) Text2SQL（可能为待确认 SQL，统一按文案流式输出）
-        result = self.text2sql.query(question)
-        if result is not None:
-            trace.route = "text2sql"
-            trace.final_status = "text2sql_pending" if isinstance(result, Text2SQLConfirmRequired) else "text2sql_answer"
-            trace.pending_sql = isinstance(result, Text2SQLConfirmRequired)
-            msg = result.message if isinstance(result, Text2SQLConfirmRequired) else result
-            for chunk in self._yield_text_chunked(msg):
-                yield chunk
-            return
-
-        # 3) RAG：检索后流式生成（当前流式路径仅使用首轮 RAG，不做二次 RAG，以保障首包延迟）
+        # 2) RAG：检索后流式生成（当前流式路径仅使用首轮 RAG，不做二次 RAG，以保障首包延迟）
         trace.route = "rag"
         rag_result = self.rag.retrieve_with_validation(
             question, top_k=10, use_rerank=True, rerank_top=5
@@ -757,18 +741,7 @@ class KnowledgeEngine:
             trace.qa_ngram_overlap_cnt = int(qa_meta.get("ngram_overlap_cnt") or 0)
             return (answer, None)
 
-        # 2) Text2SQL（非明确场景才尝试，避免误触发）
-        result = await asyncio.to_thread(self.text2sql.query, question)
-        if result is not None:
-            trace.route = "text2sql"
-            if isinstance(result, Text2SQLConfirmRequired):
-                trace.final_status = "text2sql_pending"
-                trace.pending_sql = True
-                return (result.message, result.sql)
-            trace.final_status = "text2sql_answer"
-            return (result, None)
-
-        # 3) RAG
+        # 2) RAG
         return await self.aquery_rag_only(question)
 
     async def aquery_rag_only(self, question: str) -> Tuple[str, Optional[str]]:
@@ -843,24 +816,7 @@ class KnowledgeEngine:
                 yield chunk
             return
 
-        # 2) Text2SQL（非明确场景才尝试）
-        result = await asyncio.to_thread(self.text2sql.query, question)
-        if result is not None:
-            trace.route = "text2sql"
-            if isinstance(result, Text2SQLConfirmRequired):
-                trace.final_status = "text2sql_pending"
-                trace.pending_sql = True
-                if pending_sql_out is not None:
-                    pending_sql_out.append(result.sql)
-                for chunk in self._yield_text_chunked(result.message):
-                    yield chunk
-            else:
-                trace.final_status = "text2sql_answer"
-                for chunk in self._yield_text_chunked(result):
-                    yield chunk
-            return
-
-        # 3) RAG：检索在线程池，生成用 astream
+        # 2) RAG：检索在线程池，生成用 astream
         trace.route = "rag"
         rag_result = await asyncio.to_thread(
             self.rag.retrieve_with_validation,

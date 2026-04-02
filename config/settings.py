@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     rag_rerank_anchor_count: int = 3  # 必选证据条数，保证最终 top3 可引用
     rag_use_diversity_after_rerank: bool = True
     rag_diversity_mmr_lambda: float = 0.8  # MMR 中相关性权重，越高越偏向重排分
-    # Query 规则改写：配置表路径非空且启用时，检索前对 query 做归一化/纠错/同义词替换（规则需自行梳理，见 docs/QUERY_REWRITE_RULES.md）
+    # Query 规则改写：配置表路径非空且启用时，检索前对 query 做归一化/纠错/同义词替换（规则需自行梳理，见 docs/查询改写规则.md）
     rag_use_query_rewrite_by_rules: bool = False
     rag_query_rewrite_rules_path: str = "data/query_rewrite_rules.json"  # 相对项目根；示例见 data/query_rewrite_rules.example.json
     # 二次 RAG：首轮 RAG+生成效果不达标时，是否尝试基于 Q2（改写/细化后的问题）再检索一次
@@ -174,7 +174,7 @@ class Settings(BaseSettings):
     # ---------- 异步高并发 ----------
     # 线程池大小：asyncio.to_thread 使用的默认 executor 的 max_workers；0 表示使用 Python 默认（约 min(32, cpu+4)）
     asyncio_thread_pool_workers: int = 0
-    # Uvicorn 进程 worker 数；仅在生产启动（无 reload）时生效，默认 1。>1 时需配合负载均衡「会话保持」使用（见 docs/ASYNC_CONCURRENCY.md）
+    # Uvicorn 进程 worker 数；仅在生产启动（无 reload）时生效，默认 1。>1 时需配合负载均衡「会话保持」使用（见 docs/异步并发.md）
     uvicorn_workers: int = 7
     # API 全局限流：同时处理的请求数上限，0 表示不限制；超限返回 503
     api_max_concurrent_requests: int = 0
