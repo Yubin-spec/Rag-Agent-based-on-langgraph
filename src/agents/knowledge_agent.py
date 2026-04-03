@@ -18,6 +18,12 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 
 from .state import AgentState
+from src.kb.kb_scope import rag_context_from_agent_state_slice
+
+
+def _rag_ctx(state: AgentState):
+    """从 LangGraph state 构造 RAG 可见范围（与 Milvus 分仓字段对应）。"""
+    return rag_context_from_agent_state_slice(state)
 
 
 def _get_kb_engine():
@@ -236,7 +242,7 @@ async def _knowledge_rag_node_body_async(state: AgentState) -> dict:
     for attempt in range(max_retries + 1):
         try:
             engine = _get_kb_engine()
-            answer, _ = await engine.aquery_rag_only(last)
+            answer, _ = await engine.aquery_rag_only(last, rag_context=_rag_ctx(state))
             return {
                 "messages": [AIMessage(content=answer)],
                 "next": "__end__",
@@ -434,7 +440,7 @@ async def knowledge_agent_node_async(state: AgentState) -> dict:
     for attempt in range(max_retries + 1):
         try:
             engine = _get_kb_engine()
-            answer, pending_sql = await engine.aquery(last)
+            answer, pending_sql = await engine.aquery(last, rag_context=_rag_ctx(state))
             out: dict = {
                 "messages": [AIMessage(content=answer)],
                 "next": "__end__",

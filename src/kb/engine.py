@@ -22,6 +22,7 @@ from .intent_router import rule_based_text2sql_candidate
 from .text2sql import Text2SQL, Text2SQLConfirmRequired
 from .rag import get_rag_retriever, RAGRetrieveResult
 from .retrieval_eval import evaluate_retrieval
+from .kb_scope import RagSearchContext
 
 
 def _get_llm():
@@ -295,6 +296,7 @@ class KnowledgeEngine:
         answer1: str,
         rag_result1: RAGRetrieveResult,
         trace: KnowledgeQueryTrace,
+        rag_context: Optional[RagSearchContext] = None,
     ) -> Tuple[str, RAGRetrieveResult]:
         """
         根据 trace 判定是否需要二次 RAG：
@@ -322,6 +324,7 @@ class KnowledgeEngine:
                 top_k=top_k2,
                 use_rerank=True,
                 rerank_top=rerank_top2,
+                search_context=rag_context,
             )
         except Exception:
             # 检索异常时保留首轮结果
@@ -559,7 +562,12 @@ class KnowledgeEngine:
                     "low_grounding" if score < min_score else "missing_citations"
                 )
 
-    def query(self, question: str) -> Tuple[str, Optional[str]]:
+    def query(
+        self,
+        question: str,
+        *,
+        rag_context: Optional[RagSearchContext] = None,
+    ) -> Tuple[str, Optional[str]]:
         """
         返回 (回复文案, 待确认 SQL 或 None)。顺序：
         0) Text2SQL 规则预判：强命中则先走 Text2SQL，有结果即返回（跳过高频 QA）；
@@ -598,16 +606,27 @@ class KnowledgeEngine:
             return (answer, None)
 
         # 2) RAG：带评估与重检，并返回依据来源
-        return self.query_rag_only(question)
+        return self.query_rag_only(question, rag_context=rag_context)
 
-    def query_rag_only(self, question: str) -> Tuple[str, Optional[str]]:
+    def query_rag_only(
+        self,
+        question: str,
+        *,
+        rag_context: Optional[RagSearchContext] = None,
+    ) -> Tuple[str, Optional[str]]:
         """
         仅执行 RAG（不走 QA/Text2SQL），用于将知识库能力拆成多个 LangGraph 节点时复用。
         返回 (回复文案, None)；RAG 不产生 pending_sql。
         """
         trace = self._reset_trace()
         trace.route = "rag"
-        rag_result = self.rag.retrieve_with_validation(question, top_k=10, use_rerank=True, rerank_top=5)
+        rag_result = self.rag.retrieve_with_validation(
+            question,
+            top_k=10,
+            use_rerank=True,
+            rerank_top=5,
+            search_context=rag_context,
+        )
         trace.retrieve_attempt = rag_result.attempt
         trace.source_count = len(rag_result.chunks)
         trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))
@@ -622,7 +641,9 @@ class KnowledgeEngine:
 
         self._last_rag_chunks_for_q1 = rag_result.chunks
         answer_text = self._generate_grounded_answer(question, rag_result, trace=trace)
-        answer_text, rag_result = self._maybe_second_round_rag(question, answer_text, rag_result, trace)
+        answer_text, rag_result = self._maybe_second_round_rag(
+            question, answer_text, rag_result, trace, rag_context=rag_context
+        )
 
         sources_block = _format_sources(rag_result)
         if sources_block:
@@ -639,7 +660,12 @@ class KnowledgeEngine:
         for i in range(0, len(rest), chunk_size):
             yield rest[i : i + chunk_size]
 
-    def query_stream(self, question: str):
+    def query_stream(
+        self,
+        question: str,
+        *,
+        rag_context: Optional[RagSearchContext] = None,
+    ):
         """
         知识库流式回答：先出首字再逐 chunk。顺序与 query 一致：
         Text2SQL 规则预判 → 高频 QA → RAG（QA 后不再全量 Text2SQL）。
@@ -680,7 +706,11 @@ class KnowledgeEngine:
         # 2) RAG：检索后流式生成（当前流式路径仅使用首轮 RAG，不做二次 RAG，以保障首包延迟）
         trace.route = "rag"
         rag_result = self.rag.retrieve_with_validation(
-            question, top_k=10, use_rerank=True, rerank_top=5
+            question,
+            top_k=10,
+            use_rerank=True,
+            rerank_top=5,
+            search_context=rag_context,
         )
         trace.retrieve_attempt = rag_result.attempt
         trace.source_count = len(rag_result.chunks)
@@ -706,7 +736,12 @@ class KnowledgeEngine:
             for chunk in self._yield_text_chunked("\n\n" + sources_block):
                 yield chunk
 
-    async def aquery(self, question: str) -> Tuple[str, Optional[str]]:
+    async def aquery(
+        self,
+        question: str,
+        *,
+        rag_context: Optional[RagSearchContext] = None,
+    ) -> Tuple[str, Optional[str]]:
         """
         异步：分步执行，仅 CPU/同步 IO 用线程池，RAG 生成用 ainvoke 不占线程，支持高并发。
         返回 (回复文案, 待确认 SQL 或 None)。
@@ -742,16 +777,29 @@ class KnowledgeEngine:
             return (answer, None)
 
         # 2) RAG
-        return await self.aquery_rag_only(question)
+        return await self.aquery_rag_only(question, rag_context=rag_context)
 
-    async def aquery_rag_only(self, question: str) -> Tuple[str, Optional[str]]:
+    async def aquery_rag_only(
+        self,
+        question: str,
+        *,
+        rag_context: Optional[RagSearchContext] = None,
+    ) -> Tuple[str, Optional[str]]:
         """
         异步仅执行 RAG（不走 QA/Text2SQL），用于将知识库能力拆成多个 LangGraph 节点时复用。
         返回 (回复文案, None)。
         """
         trace = self._reset_trace()
         trace.route = "rag"
-        rag_result = await asyncio.to_thread(self.rag.retrieve_with_validation, question, top_k=10, use_rerank=True, rerank_top=5)
+        rag_result = await asyncio.to_thread(
+            lambda: self.rag.retrieve_with_validation(
+                question,
+                top_k=10,
+                use_rerank=True,
+                rerank_top=5,
+                search_context=rag_context,
+            )
+        )
         trace.retrieve_attempt = rag_result.attempt
         trace.source_count = len(rag_result.chunks)
         trace.retrieved_doc_ids = list(dict.fromkeys([c.doc_id for c in rag_result.chunks if c.doc_id]))
@@ -766,14 +814,20 @@ class KnowledgeEngine:
 
         self._last_rag_chunks_for_q1 = rag_result.chunks
         answer_text = await self._generate_grounded_answer_async(question, rag_result, trace=trace)
-        answer_text, rag_result = self._maybe_second_round_rag(question, answer_text, rag_result, trace)
+        answer_text, rag_result = self._maybe_second_round_rag(
+            question, answer_text, rag_result, trace, rag_context=rag_context
+        )
         sources_block = _format_sources(rag_result)
         if sources_block:
             return (answer_text + "\n\n" + sources_block, None)
         return (answer_text, None)
 
     async def aquery_stream(
-        self, question: str, pending_sql_out: Optional[List[str]] = None
+        self,
+        question: str,
+        pending_sql_out: Optional[List[str]] = None,
+        *,
+        rag_context: Optional[RagSearchContext] = None,
     ) -> AsyncIterator[str]:
         """
         异步流式回答：先出首字再逐 chunk；RAG 使用 LLM astream，其余在线程池执行后按段 yield。
@@ -819,8 +873,13 @@ class KnowledgeEngine:
         # 2) RAG：检索在线程池，生成用 astream
         trace.route = "rag"
         rag_result = await asyncio.to_thread(
-            self.rag.retrieve_with_validation,
-            question, top_k=10, use_rerank=True, rerank_top=5,
+            lambda: self.rag.retrieve_with_validation(
+                question,
+                top_k=10,
+                use_rerank=True,
+                rerank_top=5,
+                search_context=rag_context,
+            )
         )
         trace.retrieve_attempt = rag_result.attempt
         trace.source_count = len(rag_result.chunks)

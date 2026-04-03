@@ -38,6 +38,13 @@ class AgentState(TypedDict):
     kb_route_confidence: NotRequired[float]
     # Text2SQL 无结果时回到 QA+RAG 节点仅执行 RAG（避免单独的 RAG 图节点）
     kb_rag_only: NotRequired[bool]
+    # RAG 分仓检索上下文（由 API 注入，服务端构造 Milvus expr；勿信任客户端单独传 expr）
+    rag_org_id: NotRequired[str]
+    rag_user_id: NotRequired[str]
+    rag_include_national: NotRequired[bool]
+    rag_include_org: NotRequired[bool]
+    rag_include_user: NotRequired[bool]
+    rag_include_all_orgs: NotRequired[bool]
 
 
 def next_action_from_str(s: str) -> NextAction:

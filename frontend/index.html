@@ -70,12 +70,43 @@
     .btn-small { padding: 0.25rem 0.5rem; font-size: 0.85rem; cursor: pointer; border-radius: 4px; border: 1px solid #ccc; background: #fff; }
     .btn-small.del { color: #c62828; }
     .schema-actions { margin-top: 0.5rem; }
+    .kb-scope-panel { margin-top: 1rem; padding: 0.75rem; border: 1px solid #e5e7eb; border-radius: 10px; background: #fafbfc; font-size: 0.88rem; }
+    .kb-scope-panel h3 { margin: 0 0 0.5rem 0; font-size: 0.95rem; }
+    .kb-scope-panel label { display: block; margin: 0.35rem 0 0.15rem; color: #444; }
+    .kb-scope-panel input[type="text"],
+    .kb-scope-panel select { width: 100%; padding: 0.45rem 0.5rem; border: 1px solid #ccc; border-radius: 6px; font-size: 0.88rem; }
+    .kb-scope-panel .radio-row { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.35rem; }
+    .kb-scope-panel .radio-row label { display: flex; align-items: center; gap: 0.4rem; font-weight: normal; cursor: pointer; margin: 0; }
+    .kb-scope-hint { margin-top: 0.5rem; font-size: 0.8rem; color: #666; line-height: 1.45; }
   </style>
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
       <h1>知识库智能体</h1>
+      <div class="kb-scope-panel">
+        <h3>身份与知识库范围</h3>
+        <label for="kbUserId">用户 ID（X-User-Id）</label>
+        <input type="text" id="kbUserId" placeholder="如 demo-user" autocomplete="username" />
+        <label for="kbOrgId">隶属关编码（X-Org-Id）</label>
+        <input type="text" id="kbOrgId" placeholder="直属关填报，总署可空" />
+        <label for="kbCustomsRole">身份</label>
+        <select id="kbCustomsRole">
+          <option value="org">直属海关</option>
+          <option value="national">总署</option>
+        </select>
+        <div id="kbScopeOrgWrap">
+          <label>检索范围</label>
+          <div class="radio-row">
+            <label><input type="radio" name="kbScopeOrg" value="site" checked /> 本关知识库（全国政策 + 本关文档）</label>
+            <label><input type="radio" name="kbScopeOrg" value="my" /> 我的知识库（仅本人上传）</label>
+          </div>
+        </div>
+        <div id="kbScopeNationalWrap" style="display:none;">
+          <p class="kb-scope-hint"><strong>总署</strong>：检索<strong>全部隶属关</strong>文档、总署/全国政策库，以及<strong>当前用户</strong>上传文档。服务端仅在 <code>身份=总署</code> 时允许跨关检索。</p>
+        </div>
+        <p class="kb-scope-hint">演示页通过请求头/JSON 传参；生产环境应由网关鉴权后注入角色，勿伪造总署权限。</p>
+      </div>
       <button type="button" id="clearChat" class="btn-small">+ 新建对话</button>
       <input type="text" id="conversationSearch" class="conversation-search" placeholder="搜索会话标题" />
       <div id="conversationList" class="conversation-list"></div>
@@ -144,6 +175,10 @@
   <script>
     const API = "http://localhost:8000";
     const CONVERSATION_ID_KEY = "kb_agent_conversation_id";
+    const LS_USER_ID = "kb_agent_user_id";
+    const LS_ORG_ID = "kb_agent_org_id";
+    const LS_CUSTOMS_ROLE = "kb_agent_customs_role";
+    const LS_KB_SCOPE_ORG = "kb_agent_kb_scope_org";
     const OPS_AUTO_REFRESH_MS = 10000;
     let currentTaskId = null;
     let conversationId = localStorage.getItem(CONVERSATION_ID_KEY) || null;  // 同会话复用，实现多轮与隔离
@@ -151,6 +186,107 @@
     let conversationSearch = "";
     let opsAutoRefreshTimer = null;
     const FEEDBACK_TAG_OPTIONS = ["答非所问", "证据不充分", "像在猜", "政策理解有误", "没有解决问题", "希望转人工"];
+
+    function getKbUserId() {
+      return (document.getElementById("kbUserId").value || "").trim() || "demo-user";
+    }
+    function getKbOrgId() {
+      return (document.getElementById("kbOrgId").value || "").trim();
+    }
+    function getKbCustomsRole() {
+      return document.getElementById("kbCustomsRole").value === "national" ? "national" : "org";
+    }
+    /** 直属关：site | my；总署下无意义 */
+    function getOrgKbScope() {
+      const r = document.querySelector('input[name="kbScopeOrg"]:checked');
+      return r && r.value === "my" ? "my" : "site";
+    }
+    function kbAgentHeaders() {
+      const uid = getKbUserId();
+      const oid = getKbOrgId();
+      const role = getKbCustomsRole();
+      const h = { "X-User-Id": uid, "X-Customs-Role": role };
+      if (oid) h["X-Org-Id"] = oid;
+      return h;
+    }
+    /**
+     * 与后端 ChatRequest 对齐：总署默认「全隶属关 + 总署 + 我的」；直属关按单选切换本关或仅我的。
+     */
+    function chatRagPayload() {
+      const role = getKbCustomsRole();
+      if (role === "national") {
+        return {
+          customs_role: "national",
+          rag_include_national: true,
+          rag_include_org: true,
+          rag_include_all_orgs: true,
+          rag_include_user: true,
+        };
+      }
+      const scope = getOrgKbScope();
+      if (scope === "my") {
+        return {
+          customs_role: "org",
+          rag_include_national: false,
+          rag_include_org: false,
+          rag_include_all_orgs: false,
+          rag_include_user: true,
+        };
+      }
+      return {
+        customs_role: "org",
+        rag_include_national: true,
+        rag_include_org: true,
+        rag_include_all_orgs: false,
+        rag_include_user: false,
+      };
+    }
+    function kbUploadConfirmBody(taskId) {
+      const role = getKbCustomsRole();
+      const uid = getKbUserId();
+      const oid = getKbOrgId();
+      if (role === "national") {
+        return { task_id: taskId, user_id: uid, kb_tier: "user", org_id: "", owner_user_id: undefined };
+      }
+      if (getOrgKbScope() === "my" || !oid) {
+        return { task_id: taskId, user_id: uid, kb_tier: "user", org_id: oid || undefined, owner_user_id: undefined };
+      }
+      return { task_id: taskId, user_id: uid, kb_tier: "org", org_id: oid, owner_user_id: undefined };
+    }
+    function persistKbScopePrefs() {
+      localStorage.setItem(LS_USER_ID, getKbUserId());
+      localStorage.setItem(LS_ORG_ID, getKbOrgId());
+      localStorage.setItem(LS_CUSTOMS_ROLE, getKbCustomsRole());
+      localStorage.setItem(LS_KB_SCOPE_ORG, getOrgKbScope());
+    }
+    function loadKbScopePrefs() {
+      const u = localStorage.getItem(LS_USER_ID);
+      const o = localStorage.getItem(LS_ORG_ID);
+      const r = localStorage.getItem(LS_CUSTOMS_ROLE);
+      const s = localStorage.getItem(LS_KB_SCOPE_ORG);
+      if (u) document.getElementById("kbUserId").value = u;
+      if (o !== null) document.getElementById("kbOrgId").value = o;
+      if (r === "national" || r === "org") document.getElementById("kbCustomsRole").value = r;
+      if (s === "my") {
+        const rad = document.querySelector('input[name="kbScopeOrg"][value="my"]');
+        if (rad) rad.checked = true;
+      }
+    }
+    function syncKbScopeUi() {
+      const national = getKbCustomsRole() === "national";
+      document.getElementById("kbScopeOrgWrap").style.display = national ? "none" : "block";
+      document.getElementById("kbScopeNationalWrap").style.display = national ? "block" : "none";
+    }
+
+    document.getElementById("kbCustomsRole").addEventListener("change", () => {
+      persistKbScopePrefs();
+      syncKbScopeUi();
+    });
+    document.getElementById("kbUserId").addEventListener("change", persistKbScopePrefs);
+    document.getElementById("kbOrgId").addEventListener("change", persistKbScopePrefs);
+    document.querySelectorAll('input[name="kbScopeOrg"]').forEach(el => {
+      el.addEventListener("change", persistKbScopePrefs);
+    });
 
     document.getElementById("file").addEventListener("change", async (e) => {
       const file = e.target.files?.[0];
@@ -164,7 +300,11 @@
       const fd = new FormData();
       fd.append("file", file);
       try {
-        const r = await fetch(API + "/doc/upload", { method: "POST", body: fd });
+        const r = await fetch(API + "/doc/upload", {
+          method: "POST",
+          headers: kbAgentHeaders(),
+          body: fd,
+        });
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || "上传失败");
         currentTaskId = data.task_id;
@@ -180,10 +320,11 @@
     document.getElementById("confirmBtn").addEventListener("click", async () => {
       if (!currentTaskId) return;
       try {
+        const payload = kbUploadConfirmBody(currentTaskId);
         const r = await fetch(API + "/doc/confirm_upload", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ task_id: currentTaskId }),
+          headers: { "Content-Type": "application/json", ...kbAgentHeaders() },
+          body: JSON.stringify(payload),
         });
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || "上传失败");
@@ -261,7 +402,7 @@
       try {
         const r = await fetch(API + "/qa/feedback", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...kbAgentHeaders() },
           body: JSON.stringify({
             observation_id: observationId,
             conversation_id: conversationId,
@@ -299,7 +440,9 @@
     async function loadConversationHistory() {
       if (!conversationId) return;
       try {
-        const r = await fetch(API + "/chat/history?conversation_id=" + encodeURIComponent(conversationId));
+        const r = await fetch(API + "/chat/history?conversation_id=" + encodeURIComponent(conversationId), {
+          headers: kbAgentHeaders(),
+        });
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || "加载历史失败");
         renderHistory(data.messages || []);
@@ -490,7 +633,7 @@
 
     async function loadConversationList() {
       try {
-        const r = await fetch(API + "/chat/conversations");
+        const r = await fetch(API + "/chat/conversations", { headers: kbAgentHeaders() });
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || "加载会话列表失败");
         conversations = data.conversations || [];
@@ -508,7 +651,7 @@
       try {
         const r = await fetch(API + "/chat/conversations/title", {
           method: "PUT",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...kbAgentHeaders() },
           body: JSON.stringify({ conversation_id: item.conversation_id, title }),
         });
         const data = await r.json();
@@ -524,6 +667,7 @@
       try {
         const r = await fetch(API + "/chat/conversations/" + encodeURIComponent(item.conversation_id), {
           method: "DELETE",
+          headers: kbAgentHeaders(),
         });
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || "删除失败");
@@ -679,8 +823,14 @@
       try {
         const r = await fetch(API + "/chat", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text, conversation_id: conversationId || undefined }),
+          headers: { "Content-Type": "application/json", ...kbAgentHeaders() },
+          body: JSON.stringify({
+            message: text,
+            conversation_id: conversationId || undefined,
+            user_id: getKbUserId(),
+            org_id: getKbOrgId() || undefined,
+            ...chatRagPayload(),
+          }),
         });
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || "请求失败");
@@ -709,6 +859,8 @@
     document.getElementById("loadAnalyticsBtn").addEventListener("click", loadQaAnalytics);
     document.getElementById("loadOpsStatusBtn").addEventListener("click", loadOpsStatus);
 
+    loadKbScopePrefs();
+    syncKbScopeUi();
     loadConversationList().then(loadConversationHistory);
     loadQaAnalytics();
     loadOpsStatus();

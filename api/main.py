@@ -356,6 +356,89 @@ class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None  # 对话 ID，同 ID 即同会话（数据隔离），不传则新开对话
     user_id: Optional[str] = None  # 可选，与 X-User-Id 二选一，用于用户隔离
+    org_id: Optional[str] = None  # 隶属海关等业务机构 ID；也可传请求头 X-Org-Id
+    # 海关演示/对接网关：总署 national 可跨全部隶属关检索；生产环境应由网关注入 X-Customs-Role，勿轻信 body
+    customs_role: Optional[str] = None  # national | org
+    rag_include_national: Optional[bool] = None  # RAG 是否检索总署/全国仓；默认 True
+    rag_include_org: Optional[bool] = None  # 是否检索隶属仓（本关或全部，见 rag_include_all_orgs）；默认 True
+    rag_include_user: Optional[bool] = None  # 是否检索当前用户私库；默认 True
+    # 仅 customs_role=national 时生效；直属关请求即使为 True 也会被服务端忽略
+    rag_include_all_orgs: Optional[bool] = None
+
+
+def _customs_role_from_request(request: Request, req: Optional[ChatRequest] = None) -> str:
+    """总署 national / 直属关 org。优先读 X-Customs-Role，其次 body.customs_role。"""
+    h = (request.headers.get("X-Customs-Role") or request.headers.get("x-customs-role") or "").strip().lower()
+    if h in ("national", "zongshu"):
+        return "national"
+    if h in ("org", "affiliated"):
+        return "org"
+    if req is not None and req.customs_role:
+        r = str(req.customs_role).strip().lower()
+        if r in ("national", "zongshu", "总署"):
+            return "national"
+        if r in ("org", "affiliated", "直属", "直属关"):
+            return "org"
+    return "org"
+
+
+def _effective_rag_include_all_orgs(request: Request, req: ChatRequest) -> bool:
+    """跨全部隶属关文档：仅总署身份且客户端显式 rag_include_all_orgs=True。"""
+    if _customs_role_from_request(request, req) != "national":
+        return False
+    return req.rag_include_all_orgs is True
+
+
+def _org_id_from_request(request: Request, body_org_id: Optional[str] = None) -> str:
+    """隶属机构 ID：body.org_id 优先，否则 X-Org-Id。"""
+    if body_org_id and str(body_org_id).strip():
+        return str(body_org_id).strip()
+    h = request.headers.get("X-Org-Id") or request.headers.get("x-org-id")
+    return h.strip() if h and str(h).strip() else ""
+
+
+def _chat_rag_state_patch(request: Request, req: ChatRequest) -> dict:
+    """注入知识库 RAG 分仓检索上下文（写入 LangGraph state）。"""
+    s = get_settings()
+    uid = _user_id_from_request(request, req.user_id)
+    oid = _org_id_from_request(request, req.org_id)
+    return {
+        "rag_org_id": oid,
+        "rag_user_id": uid or "",
+        "rag_include_national": req.rag_include_national
+        if req.rag_include_national is not None
+        else bool(getattr(s, "rag_search_include_national", True)),
+        "rag_include_org": req.rag_include_org
+        if req.rag_include_org is not None
+        else bool(getattr(s, "rag_search_include_org", True)),
+        "rag_include_user": req.rag_include_user
+        if req.rag_include_user is not None
+        else bool(getattr(s, "rag_search_include_user", True)),
+        "rag_include_all_orgs": _effective_rag_include_all_orgs(request, req),
+    }
+
+
+def _build_rag_search_context_from_chat_request(request: Request, req: ChatRequest):
+    """与非流式 invoke 使用的分仓字段一致，供 /chat/stream 知识库分支构造 Milvus expr。"""
+    from src.kb.kb_scope import build_rag_search_context_from_inputs
+
+    s = get_settings()
+    uid = _user_id_from_request(request, req.user_id)
+    oid = _org_id_from_request(request, req.org_id)
+    return build_rag_search_context_from_inputs(
+        org_id=oid,
+        user_id=uid,
+        include_national=req.rag_include_national
+        if req.rag_include_national is not None
+        else bool(getattr(s, "rag_search_include_national", True)),
+        include_org=req.rag_include_org
+        if req.rag_include_org is not None
+        else bool(getattr(s, "rag_search_include_org", True)),
+        include_user=req.rag_include_user
+        if req.rag_include_user is not None
+        else bool(getattr(s, "rag_search_include_user", True)),
+        include_all_orgs=_effective_rag_include_all_orgs(request, req),
+    )
 
 
 class ChatResponse(BaseModel):
@@ -473,6 +556,9 @@ class ConfirmUploadRequest(BaseModel):
     task_id: str
     user_id: Optional[str] = None  # 可选，与 X-User-Id 二选一，用于用户隔离
     chunks: Optional[List[ChunkItem]] = None  # 用户自定义后的 chunks，若不传则用原解析结果
+    kb_tier: Optional[str] = "user"  # national | org | user，受 doc_upload_allowed_kb_tiers 约束
+    org_id: Optional[str] = None  # kb_tier=org 时必填；可与 X-Org-Id 校验一致
+    owner_user_id: Optional[str] = None  # kb_tier=user 时默认当前用户，禁止冒用
 
 
 class SchemaColumn(BaseModel):
@@ -666,8 +752,28 @@ async def confirm_upload(request: Request, body: ConfirmUploadRequest):
                 "warnings": [{"category": i.category, "message": i.message, "chunk_index": i.chunk_index} for i in report.warnings],
             },
         }
+    from src.kb.kb_scope import validate_upload_kb_fields
+
     uploader = MilvusUploader()
-    count = await asyncio.to_thread(uploader.upload_parse_result, result)
+    resolved_org = (body.org_id or "").strip() or _org_id_from_request(request, None)
+    try:
+        tier, oid_u, owner_uid, doc_src = validate_upload_kb_fields(
+            body.kb_tier or "user",
+            org_id=resolved_org,
+            owner_user_id=body.owner_user_id or "",
+            request_user_id=user_id,
+            request_org_id=_org_id_from_request(request, body.org_id),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    count = await asyncio.to_thread(
+        uploader.upload_parse_result,
+        result,
+        kb_tier=tier,
+        org_id=oid_u,
+        owner_user_id=owner_uid,
+        doc_source=doc_src,
+    )
     await shared_state_module.delete_parse_result(cache_key)
     return {
         "uploaded": count,
@@ -1137,9 +1243,10 @@ async def _chat_impl(
             )
             return ChatResponse(reply=cached, conversation_id=conversation_id, observation_id=observation_id)
         messages = [HumanMessage(content=req.message)]
+        invoke_payload = {**_chat_rag_state_patch(request, req), "messages": messages}
         try:
             result = await asyncio.wait_for(
-                graph.ainvoke({"messages": messages}, config),
+                graph.ainvoke(invoke_payload, config),
                 timeout=float(getattr(settings, "agent_request_timeout_seconds", 120)),
             )
         except asyncio.TimeoutError:
@@ -1263,11 +1370,13 @@ async def _chat_stream_generator(
     message: str,
     user_id: Optional[str] = None,
     started_at: Optional[float] = None,
+    request: Optional[Request] = None,
+    req: Optional[ChatRequest] = None,
 ):
     """流式对话 SSE 生成器，在会话锁内执行，保证同一会话串行。"""
     async with conversation_lock(thread_id):
         async for chunk in _chat_stream_generator_impl(
-            thread_id, conversation_id, message, user_id, started_at
+            thread_id, conversation_id, message, user_id, started_at, request, req
         ):
             yield chunk
 
@@ -1278,6 +1387,8 @@ async def _chat_stream_generator_impl(
     message: str,
     user_id: Optional[str] = None,
     started_at: Optional[float] = None,
+    request: Optional[Request] = None,
+    req: Optional[ChatRequest] = None,
 ):
     """
     流式对话的 SSE 实现：先出首字再逐 chunk；路由与 LLM 均异步。
@@ -1497,7 +1608,12 @@ async def _chat_stream_generator_impl(
             else:
                 engine = KnowledgeEngine()
                 pending_holder: list = []
-                async for chunk in engine.aquery_stream(message, pending_sql_out=pending_holder):
+                rag_ctx = None
+                if request is not None and req is not None:
+                    rag_ctx = _build_rag_search_context_from_chat_request(request, req)
+                async for chunk in engine.aquery_stream(
+                    message, pending_sql_out=pending_holder, rag_context=rag_ctx
+                ):
                     full_chunks.append(chunk)
                     yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
                 qa_trace = engine.get_last_trace()
@@ -1637,7 +1753,9 @@ async def chat_stream(request: Request, req: ChatRequest):
     thread_id = _thread_id(user_id, conversation_id)
     started_at = time.perf_counter()
     return StreamingResponse(
-        _chat_stream_generator(thread_id, conversation_id, req.message, user_id, started_at),
+        _chat_stream_generator(
+            thread_id, conversation_id, req.message, user_id, started_at, request, req
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

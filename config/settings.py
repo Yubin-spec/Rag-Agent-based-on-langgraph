@@ -53,6 +53,20 @@ class Settings(BaseSettings):
     milvus_collection: str = "kb_chunks"
     milvus_dim: int = 1024  # BGE-M3 向量维度
 
+    # ---------- 文档分仓（总署 / 隶属海关 / 用户）----------
+    # 允许通过 API 入库的 kb_tier 集合；national 默认不在列表中，需显式放开并配合 doc_upload_allow_national_tier
+    doc_upload_allowed_kb_tiers: List[str] = ["user", "org"]
+    doc_upload_allow_national_tier: bool = False  # True 时允许 kb_tier=national 入库（运维/同步账号）
+    # RAG 检索是否按分仓过滤（Milvus expr）；关闭时行为同旧版全库向量检索。迁移 schema 后可开启。
+    rag_kb_scope_filter_enabled: bool = False
+    # 旧数据无 kb_tier 字段或为空串时，是否视为「全国可见」参与检索（升级过渡期）
+    rag_kb_legacy_empty_tier_visible: bool = True
+    rag_search_include_national: bool = True
+    rag_search_include_org: bool = True
+    rag_search_include_user: bool = True
+    # 当 Milvus 带分仓过滤 expr 时关闭 BM25（BM25 与 Milvus 分仓未对齐）；仅向量+重排，首版推荐
+    rag_disable_bm25_when_scope_filter: bool = True
+
     # ---------- RAG 切片与检索 ----------
     rag_chunk_sizes: List[int] = [256, 384, 512, 768]
     rag_parent_overlap: int = 150

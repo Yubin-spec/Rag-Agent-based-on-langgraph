@@ -6,6 +6,9 @@
 存储格式：每条记录包含结构化元数据（doc_name、page、parent_block、child_block），
 chunk_id 格式为「文档名-p页码-b父块编号-c子块编号」，便于按文档/页码/层级检索与溯源。
 
+分仓字段（海关场景）：kb_tier（national/org/user）、org_id、owner_user_id、doc_source，
+检索侧通过 Milvus search expr 限定可见范围（见 src.kb.kb_scope）。
+
 连接韧性：通过 db_resilience 管理 Milvus 连接，支持重试、熔断与懒重连。
 """
 import logging
@@ -19,9 +22,10 @@ from .mineru_client import ChunkItem, ParseResult
 logger = logging.getLogger(__name__)
 
 
-def _build_collection_schema(collection_name: str):
-    """创建 Milvus collection 并建 HNSW 索引。"""
+def build_kb_collection_schema(collection_name: str):
+    """创建 Milvus collection：向量 HNSW + 分仓标量字段；供入库与迁移脚本复用。"""
     from pymilvus import Collection, FieldSchema, CollectionSchema, DataType
+
     dim = get_settings().milvus_dim
     fields = [
         FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=256, is_primary=True),
@@ -33,14 +37,23 @@ def _build_collection_schema(collection_name: str):
         FieldSchema(name="child_block", dtype=DataType.INT64),
         FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535),
         FieldSchema(name="parent_content", dtype=DataType.VARCHAR, max_length=65535),
+        FieldSchema(name="kb_tier", dtype=DataType.VARCHAR, max_length=32),
+        FieldSchema(name="org_id", dtype=DataType.VARCHAR, max_length=256),
+        FieldSchema(name="owner_user_id", dtype=DataType.VARCHAR, max_length=256),
+        FieldSchema(name="doc_source", dtype=DataType.VARCHAR, max_length=64),
         FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
     ]
-    schema = CollectionSchema(fields=fields, description="kb chunks with structured metadata")
+    schema = CollectionSchema(fields=fields, description="kb chunks with scope metadata")
     coll = Collection(name=collection_name, schema=schema)
     coll.create_index(
         field_name="embedding",
         index_params={"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}},
     )
+    for fname in ("kb_tier", "org_id", "owner_user_id"):
+        try:
+            coll.create_index(field_name=fname, index_params={})
+        except Exception as e:
+            logger.debug("Milvus 标量索引可选跳过 %s: %s", fname, e)
     coll.load()
     return coll
 
@@ -48,8 +61,7 @@ def _build_collection_schema(collection_name: str):
 class MilvusUploader:
     """
     将确认后的解析结果（ParseResult）写入 Milvus：BGE-M3 编码 content/parent_content，
-    写入 id、doc_id、chunk_id、doc_name、page、parent_block、child_block、content、parent_content、embedding；
-    无 collection 时自动创建。连接失败时自动重试，熔断后降级返回 0。
+    写入分仓元数据 kb_tier/org_id/owner_user_id/doc_source 及原有切片字段。
     """
 
     def __init__(self):
@@ -62,13 +74,18 @@ class MilvusUploader:
             self.settings.milvus_uri,
             self.settings.milvus_collection,
             create_if_missing=True,
-            schema_builder=_build_collection_schema,
+            schema_builder=build_kb_collection_schema,
         )
 
     def upload_parse_result(
         self,
         parse_result: ParseResult,
         doc_id: Optional[str] = None,
+        *,
+        kb_tier: str = "user",
+        org_id: str = "",
+        owner_user_id: str = "",
+        doc_source: str = "api_upload",
     ) -> int:
         """将解析结果中的 chunks 向量化并写入 Milvus。返回写入条数。Milvus 不可用时返回 0。"""
         if self._embed is None:
@@ -85,7 +102,15 @@ class MilvusUploader:
         child_blocks: List[int] = []
         contents: List[str] = []
         parent_contents: List[str] = []
+        kb_tiers: List[str] = []
+        org_ids: List[str] = []
+        owner_user_ids: List[str] = []
+        doc_sources: List[str] = []
         texts_to_embed: List[str] = []
+        tier_norm = (kb_tier or "user").strip().lower()
+        org_norm = (org_id or "").strip()
+        owner_norm = (owner_user_id or "").strip()
+        src_norm = (doc_source or "api_upload").strip()[:64]
         for c in parse_result.chunks:
             chunk_id = c.chunk_id or f"{doc_id}_{len(ids)}"
             ids.append(chunk_id)
@@ -97,17 +122,33 @@ class MilvusUploader:
             child_blocks.append(getattr(c, "child_block", 0) or 0)
             contents.append((c.content or "")[:65530])
             parent_contents.append((c.parent_content or "")[:65530])
+            kb_tiers.append(tier_norm[:32])
+            org_ids.append(org_norm[:256])
+            owner_user_ids.append(owner_norm[:256])
+            doc_sources.append(src_norm[:64])
             texts_to_embed.append(
                 (c.parent_content or "") + "\n" + (c.content or "")
-                if c.parent_content else (c.content or "")
+                if c.parent_content
+                else (c.content or "")
             )
         if not texts_to_embed:
             return 0
         embeddings = self._embed.encode(texts_to_embed).tolist()
         entities = [
-            ids, doc_ids, chunk_ids, doc_names,
-            pages, parent_blocks, child_blocks,
-            contents, parent_contents, embeddings,
+            ids,
+            doc_ids,
+            chunk_ids,
+            doc_names,
+            pages,
+            parent_blocks,
+            child_blocks,
+            contents,
+            parent_contents,
+            kb_tiers,
+            org_ids,
+            owner_user_ids,
+            doc_sources,
+            embeddings,
         ]
 
         def _do_insert(coll):
@@ -125,7 +166,7 @@ class MilvusUploader:
         )
         if count > 0:
             logger.info(
-                "Milvus 写入 %d 条 chunk，doc_id=%s, doc_name=%s",
-                count, doc_id, doc_name_default,
+                "Milvus 写入 %d 条 chunk，doc_id=%s, doc_name=%s, kb_tier=%s",
+                count, doc_id, doc_name_default, tier_norm,
             )
         return count

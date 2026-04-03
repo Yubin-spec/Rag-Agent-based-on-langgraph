@@ -18,6 +18,7 @@ from config import get_settings
 from .retrieval_eval import evaluate_retrieval, RetrievalEvalResult, compute_query_coverage
 from .embedding_loader import get_bge_embedding, get_bge_reranker
 from .query_rewrite import rewrite_query_by_rules
+from .kb_scope import RagSearchContext, build_milvus_rag_expr
 
 
 def _jieba_tokenize_for_search(text: str) -> List[str]:
@@ -34,9 +35,17 @@ _rag_cache: Optional[OrderedDict] = None
 _rag_cache_lock = threading.Lock()
 
 
-def _rag_cache_key(query: str, total_k: int, use_rerank: bool, rerank_top: int) -> str:
-    h = hashlib.sha256(f"{query}|{total_k}|{use_rerank}|{rerank_top}".encode()).hexdigest()[:32]
-    return f"rag:v1:{h}"
+def _rag_cache_key(
+    query: str,
+    total_k: int,
+    use_rerank: bool,
+    rerank_top: int,
+    scope_key: str = "",
+) -> str:
+    h = hashlib.sha256(
+        f"{query}|{total_k}|{use_rerank}|{rerank_top}|{scope_key}".encode()
+    ).hexdigest()[:32]
+    return f"rag:v2:{h}"
 
 
 def _get_settings():
@@ -127,9 +136,16 @@ class RAGRetriever:
             return None
         return self._embedding.encode(texts).tolist()
 
-    def _vector_search(self, query: str, top_k: int) -> List[dict]:
+    def _vector_search(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        expr: Optional[str] = None,
+    ) -> List[dict]:
         """
         Milvus HNSW 向量检索，返回含 content、parent_content、score、source=vector 的 dict 列表。
+        expr 非空时按分仓过滤（kb_tier/org_id/owner_user_id）。
         连接断开时自动重连重试，熔断后降级返回空列表。
         """
         if not self._embedding:
@@ -142,13 +158,16 @@ class RAGRetriever:
         search_params = {"metric_type": "IP", "params": {"nprobe": 64}}
 
         def _do_search(coll):
-            results = coll.search(
-                data=qv,
-                anns_field="embedding",
-                param=search_params,
-                limit=top_k,
-                output_fields=["content", "parent_content", "doc_id", "chunk_id"],
-            )
+            kw: dict = {
+                "data": qv,
+                "anns_field": "embedding",
+                "param": search_params,
+                "limit": top_k,
+                "output_fields": ["content", "parent_content", "doc_id", "chunk_id"],
+            }
+            if expr:
+                kw["expr"] = expr
+            results = coll.search(**kw)
             out = []
             for hits in results:
                 for h in hits:
@@ -202,14 +221,16 @@ class RAGRetriever:
         total_k: int,
         use_rerank: bool = True,
         rerank_top: int = 5,
+        search_context: Optional[RagSearchContext] = None,
     ) -> List[dict]:
         """按配置比例（默认 3:7）取 BM25 与向量结果，合并后使用 BGE Reranker 重排。支持进程内 LRU 缓存。"""
         global _rag_cache
         s = _get_settings()
         max_entries = max(0, getattr(s, "rag_retrieval_cache_max_entries", 0))
         ttl = max(1, getattr(s, "rag_retrieval_cache_ttl_seconds", 300))
+        scope_key = (search_context.cache_key_suffix() if search_context is not None else "")
         if max_entries > 0:
-            key = _rag_cache_key(query, total_k, use_rerank, rerank_top)
+            key = _rag_cache_key(query, total_k, use_rerank, rerank_top, scope_key)
             with _rag_cache_lock:
                 if _rag_cache is None:
                     _rag_cache = OrderedDict()
@@ -220,7 +241,9 @@ class RAGRetriever:
                         _rag_cache.move_to_end(key)
                         return cached
                     _rag_cache.pop(key, None)
-        combined = self._merge_3_7_impl(query, total_k, use_rerank, rerank_top)
+        combined = self._merge_3_7_impl(
+            query, total_k, use_rerank, rerank_top, search_context=search_context
+        )
         if max_entries > 0 and combined:
             with _rag_cache_lock:
                 if _rag_cache is None:
@@ -326,19 +349,24 @@ class RAGRetriever:
         total_k: int,
         use_rerank: bool = True,
         rerank_top: int = 5,
+        search_context: Optional[RagSearchContext] = None,
     ) -> List[dict]:
         """实际检索逻辑：RRF 融合（可选）、规则预过滤、BGE 重排、重排后多样性（保证 top 可引用）。"""
         s = _get_settings()
+        expr: Optional[str] = None
+        if search_context is not None:
+            expr = build_milvus_rag_expr(search_context)
+        skip_bm25 = bool(expr) and bool(getattr(s, "rag_disable_bm25_when_scope_filter", True))
         bm25_ratio = s.rag_bm25_ratio
         vector_ratio = s.rag_vector_ratio
         # 两路多取一些候选，便于 RRF 或比例合并
-        expand = 2 if getattr(s, "rag_use_rrf", True) else 1
+        expand = 2 if getattr(s, "rag_use_rrf", False) else 1
         bm25_k = max(1, int(round(total_k * bm25_ratio)) * expand + 5)
         vector_k = max(1, int(round(total_k * vector_ratio)) * expand + 10)
-        vector_raw = self._vector_search(query, vector_k)
-        bm25_raw = self._bm25_search(query, bm25_k)
+        vector_raw = self._vector_search(query, vector_k, expr=expr)
+        bm25_raw = [] if skip_bm25 else self._bm25_search(query, bm25_k)
 
-        if getattr(s, "rag_use_rrf", True) and (vector_raw or bm25_raw):
+        if getattr(s, "rag_use_rrf", False) and (vector_raw or bm25_raw):
             rrf_k = max(1, getattr(s, "rag_rrf_k", 60))
             combined = self._rrf_merge(vector_raw, bm25_raw, rrf_k, total_k)
         else:
@@ -411,10 +439,11 @@ class RAGRetriever:
         top_k: int = 10,
         use_rerank: bool = True,
         rerank_top: int = 5,
+        search_context: Optional[RagSearchContext] = None,
     ) -> List[dict]:
         """兼容旧接口：混合检索 3:7，重排，返回 dict 列表（无评估与重检）。"""
         q = _effective_query_for_retrieval(query)
-        merged = self._merge_3_7(q, top_k, use_rerank, rerank_top)
+        merged = self._merge_3_7(q, top_k, use_rerank, rerank_top, search_context=search_context)
         return [
             {
                 "content": c.get("content"),
@@ -431,6 +460,7 @@ class RAGRetriever:
         top_k: int = 10,
         use_rerank: bool = True,
         rerank_top: int = 5,
+        search_context: Optional[RagSearchContext] = None,
     ) -> RAGRetrieveResult:
         """
         混合检索（3:7）+ 评估；若最佳匹配度 < 0.3 或过无关则重检，最多 3 次。
@@ -446,7 +476,9 @@ class RAGRetriever:
         last_evals: List[RetrievalEvalResult] = []
 
         for attempt in range(1, max_attempts + 1):
-            merged = self._merge_3_7(q, current_k, use_rerank, rerank_top)
+            merged = self._merge_3_7(
+                q, current_k, use_rerank, rerank_top, search_context=search_context
+            )
             if not merged:
                 return RAGRetrieveResult(chunks=[], evals=[], attempt=attempt)
             chunks_with_eval = self._evaluate_candidates(q, merged)
