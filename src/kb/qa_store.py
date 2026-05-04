@@ -230,8 +230,8 @@ class QAStore:
             return None
 
         limit = max(1, int(getattr(settings, "qa_milvus_semantic_top_k", 80) or 80))  # ANN 召回条数上限
-        nprobe = max(1, int(getattr(settings, "qa_milvus_nprobe", 64) or 64))  # 探测聚类数，越大越准越慢
-        search_params = {"metric_type": "IP", "params": {"nprobe": nprobe}}  # 内积与归一化向量配合常用 cosine 等价
+        ef = max(1, int(getattr(settings, "qa_milvus_ef_search", 64) or 64))  # HNSW 搜索范围，越大越准越慢
+        search_params = {"metric_type": "IP", "params": {"ef": ef}}  # 内积与归一化向量配合常用 cosine 等价
 
         def _do_search(coll):
             results = coll.search(

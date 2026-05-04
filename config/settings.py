@@ -53,6 +53,17 @@ class Settings(BaseSettings):
     milvus_collection: str = "kb_chunks"
     milvus_dim: int = 1024  # BGE-M3 向量维度
 
+    # ---------- Milvus HNSW 索引参数 ----------
+    # M: 图中每个节点的最大连接数；过高增加内存（~30%），过低影响召回
+    # 小数据量(<1M): 8~16; 中等(1M~10M): 16~32; 大数据量(>10M): 32~64
+    milvus_hnsw_m: int = 16
+    # efConstruction: 构建索引时的搜索范围；越高索引质量越好，但构建时间显著增加
+    milvus_hnsw_ef_construction: int = 256
+    # efSearch: 查询时的动态搜索范围；越高召回越准，但延迟增加；建议 >= top_k * 2
+    milvus_hnsw_ef_search: int = 64
+    # nprobe: IVF 系列索引的探测聚类数（HNSW 索引不使用此参数，仅作兼容）
+    milvus_ivf_nprobe: int = 64
+
     # ---------- 文档分仓（总署 / 隶属海关 / 用户）----------
     # 允许通过 API 入库的 kb_tier 集合；national 默认不在列表中，需显式放开并配合 doc_upload_allow_national_tier
     doc_upload_allowed_kb_tiers: List[str] = ["user", "org"]
@@ -146,7 +157,7 @@ class Settings(BaseSettings):
     # - hybrid: 先 local 再 Milvus（兼容过渡）
     qa_store_backend: str = "milvus"
     qa_milvus_collection: str = "faq_chunks"
-    qa_milvus_nprobe: int = 64
+    qa_milvus_ef_search: int = 64  # FAQ HNSW 搜索 ef 参数（建议 >= top_k * 2）
     qa_milvus_semantic_top_k: int = 80
     # 高频 QA 匹配策略：
     # - exact/alias：强精确匹配（最高精度）

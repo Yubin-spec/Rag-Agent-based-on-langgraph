@@ -1203,6 +1203,8 @@ FodyWeavers.xsd
 *.msp
 *.sln.iml
 *
+!src/
+!src/**
 !/.gitignore
 !*.go
 !go.sum
@@ -3072,6 +3074,7 @@ bin-release/
 *.air
 .gradle
 **/build/
+!src/
 !src/**/build/
 gradle-app.setting
 !gradle-wrapper.jar

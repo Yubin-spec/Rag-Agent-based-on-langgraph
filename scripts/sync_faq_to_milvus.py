@@ -4,6 +4,8 @@
 用法：
   python scripts/sync_faq_to_milvus.py
   python scripts/sync_faq_to_milvus.py --path data/high_freq_qa.json --replace
+
+索引设计：见 docs/Milvus索引结构设计.md，Schema 定义统一由 src.kb.milvus_schema 管理。
 """
 
 import argparse
@@ -14,34 +16,11 @@ from pathlib import Path
 from config import get_settings
 from src.db_resilience import get_milvus_collection, milvus_operation_with_retry
 from src.kb.embedding_loader import get_bge_embedding
+from src.kb.milvus_schema import build_faq_chunks_schema
 
 
 def _normalize(s: str) -> str:
     return "".join((s or "").split()).lower().strip()
-
-
-def _build_collection_schema(collection_name: str):
-    from pymilvus import Collection, CollectionSchema, DataType, FieldSchema
-
-    dim = get_settings().milvus_dim
-    fields = [
-        FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=128, is_primary=True),
-        FieldSchema(name="question_norm", dtype=DataType.VARCHAR, max_length=1024),
-        FieldSchema(name="candidate_text", dtype=DataType.VARCHAR, max_length=4096),
-        FieldSchema(name="matched_question", dtype=DataType.VARCHAR, max_length=2048),
-        FieldSchema(name="matched_alias", dtype=DataType.VARCHAR, max_length=2048),
-        FieldSchema(name="answer", dtype=DataType.VARCHAR, max_length=65535),
-        FieldSchema(name="match_type", dtype=DataType.VARCHAR, max_length=32),
-        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
-    ]
-    schema = CollectionSchema(fields=fields, description="faq chunks (exact/alias + semantic)")
-    coll = Collection(name=collection_name, schema=schema)
-    coll.create_index(
-        field_name="embedding",
-        index_params={"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}},
-    )
-    coll.load()
-    return coll
 
 
 def _load_items(path: Path) -> list[dict]:
@@ -126,7 +105,7 @@ def main():
         s.milvus_uri,
         s.qa_milvus_collection,
         create_if_missing=True,
-        schema_builder=_build_collection_schema,
+        schema_builder=build_faq_chunks_schema,
     )
     if coll is None:
         print("[ERROR] milvus collection unavailable")

@@ -10,52 +10,19 @@ chunk_id 格式为「文档名-p页码-b父块编号-c子块编号」，便于�
 检索侧通过 Milvus search expr 限定可见范围（见 src.kb.kb_scope）。
 
 连接韧性：通过 db_resilience 管理 Milvus 连接，支持重试、熔断与懒重连。
+
+索引设计：见 docs/Milvus索引结构设计.md，Schema 定义统一由 src.kb.milvus_schema 管理。
 """
 import logging
 from typing import List, Optional
 
 from config import get_settings
 from src.kb.embedding_loader import get_bge_embedding
+from src.kb.milvus_schema import build_kb_chunks_schema
 from src.db_resilience import get_milvus_collection, milvus_operation_with_retry
 from .mineru_client import ChunkItem, ParseResult
 
 logger = logging.getLogger(__name__)
-
-
-def build_kb_collection_schema(collection_name: str):
-    """创建 Milvus collection：向量 HNSW + 分仓标量字段；供入库与迁移脚本复用。"""
-    from pymilvus import Collection, FieldSchema, CollectionSchema, DataType
-
-    dim = get_settings().milvus_dim
-    fields = [
-        FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=256, is_primary=True),
-        FieldSchema(name="doc_id", dtype=DataType.VARCHAR, max_length=256),
-        FieldSchema(name="chunk_id", dtype=DataType.VARCHAR, max_length=256),
-        FieldSchema(name="doc_name", dtype=DataType.VARCHAR, max_length=256),
-        FieldSchema(name="page", dtype=DataType.INT64),
-        FieldSchema(name="parent_block", dtype=DataType.INT64),
-        FieldSchema(name="child_block", dtype=DataType.INT64),
-        FieldSchema(name="content", dtype=DataType.VARCHAR, max_length=65535),
-        FieldSchema(name="parent_content", dtype=DataType.VARCHAR, max_length=65535),
-        FieldSchema(name="kb_tier", dtype=DataType.VARCHAR, max_length=32),
-        FieldSchema(name="org_id", dtype=DataType.VARCHAR, max_length=256),
-        FieldSchema(name="owner_user_id", dtype=DataType.VARCHAR, max_length=256),
-        FieldSchema(name="doc_source", dtype=DataType.VARCHAR, max_length=64),
-        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
-    ]
-    schema = CollectionSchema(fields=fields, description="kb chunks with scope metadata")
-    coll = Collection(name=collection_name, schema=schema)
-    coll.create_index(
-        field_name="embedding",
-        index_params={"metric_type": "IP", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 256}},
-    )
-    for fname in ("kb_tier", "org_id", "owner_user_id"):
-        try:
-            coll.create_index(field_name=fname, index_params={})
-        except Exception as e:
-            logger.debug("Milvus 标量索引可选跳过 %s: %s", fname, e)
-    coll.load()
-    return coll
 
 
 class MilvusUploader:
@@ -74,7 +41,7 @@ class MilvusUploader:
             self.settings.milvus_uri,
             self.settings.milvus_collection,
             create_if_missing=True,
-            schema_builder=build_kb_collection_schema,
+            schema_builder=build_kb_chunks_schema,
         )
 
     def upload_parse_result(

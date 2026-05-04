@@ -155,7 +155,8 @@ class RAGRetriever:
             return []
 
         s = _get_settings()
-        search_params = {"metric_type": "IP", "params": {"nprobe": 64}}
+        ef = max(1, int(getattr(s, "milvus_hnsw_ef_search", 64) or 64))
+        search_params = {"metric_type": "IP", "params": {"ef": ef}}
 
         def _do_search(coll):
             kw: dict = {
