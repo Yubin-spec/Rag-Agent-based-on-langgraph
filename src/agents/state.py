@@ -22,6 +22,7 @@ class AgentState(TypedDict):
     - human_message: 转人工时由上游节点写入的提示文案，人工介入节点会将其作为回复发出
     - route: 实际执行的子链路（chat / knowledge / cache / text2sql_confirm 等），供 API 侧监控使用
     - qa_trace: 知识库链路的质量追踪信息，供问答效果监控与用户反馈分析使用
+    - retrieval_filter: 知识库检索前的过滤条件（如 doc_id / category / doc_path），先缩小范围再检索
     """
     messages: Annotated[list[BaseMessage], add_messages]
     next: NextAction
@@ -29,6 +30,7 @@ class AgentState(TypedDict):
     human_message: NotRequired[Optional[str]]
     route: NotRequired[Optional[str]]
     qa_trace: NotRequired[dict]
+    retrieval_filter: NotRequired[Optional[dict]]
 
 
 def next_action_from_str(s: str) -> NextAction:

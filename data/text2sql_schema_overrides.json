@@ -1,0 +1,21 @@
+{
+  "table_comments": {
+    "import_export_stats": "口岸进出口统计数据",
+    "aeoc_enterprises": "AEO认证企业名单"
+  },
+  "column_comments": {
+    "import_export_stats": {
+      "year": "年份",
+      "port": "口岸名称",
+      "category": "商品类别",
+      "volume": "进出口量数值",
+      "unit": "计量单位"
+    },
+    "aeoc_enterprises": {
+      "name": "企业名称",
+      "level": "AEO认证等级",
+      "region": "所在地区"
+    }
+  },
+  "relations": []
+}

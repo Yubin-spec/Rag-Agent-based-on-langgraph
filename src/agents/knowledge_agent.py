@@ -34,7 +34,7 @@ def knowledge_agent_node(state: AgentState) -> dict:
             "messages": [AIMessage(content="请直接输入您要咨询的业务或数据问题。")],
             "next": "__end__",
         }
-    answer, pending_sql = engine.query(last)
+    answer, pending_sql = engine.query(last, retrieval_filter=state.get("retrieval_filter"))
     out = {"messages": [AIMessage(content=answer)], "next": "__end__", "route": "knowledge", "qa_trace": engine.get_last_trace()}
     # 删除/修改类 SQL 只生成不执行时，由 API 层存入 _pending_sql，等用户确认后执行
     if pending_sql:
@@ -67,7 +67,9 @@ async def knowledge_agent_node_async(state: AgentState) -> dict:
     for attempt in range(max_retries + 1):
         try:
             engine = _get_kb_engine()
-            answer, pending_sql = await engine.aquery(last)
+            answer, pending_sql = await engine.aquery(
+                last, retrieval_filter=state.get("retrieval_filter")
+            )
             out: dict = {"messages": [AIMessage(content=answer)], "next": "__end__", "route": "knowledge", "qa_trace": engine.get_last_trace()}
             if pending_sql:
                 out["pending_sql"] = pending_sql

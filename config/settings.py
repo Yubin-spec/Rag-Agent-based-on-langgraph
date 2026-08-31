@@ -48,16 +48,22 @@ class Settings(BaseSettings):
     # 可为 HuggingFace 模型名或本地路径，本地加载不调用远程 API
     bge_reranker_model: str = "BAAI/bge-reranker-large"
 
-    # ---------- Milvus 向量库 ----------
-    milvus_uri: str = "http://localhost:19530"
-    milvus_collection: str = "kb_chunks"
-    milvus_dim: int = 1024  # BGE-M3 向量维度
+    # ---------- Elasticsearch 向量库 ----------
+    es_uri: str = "http://localhost:9200"
+    es_index: str = "kb_chunks"
+    es_dim: int = 1024  # BGE-M3 向量维度
+    es_username: str = ""  # 如 ES 开启安全认证则填写，否则留空
+    es_password: str = ""
+    es_timeout_seconds: int = 30
 
     # ---------- RAG 切片与检索 ----------
     rag_chunk_sizes: List[int] = [256, 384, 512, 768]
     rag_parent_overlap: int = 150
-    rag_bm25_ratio: float = 0.3
-    rag_vector_ratio: float = 0.7
+    rag_bm25_ratio: float = 0.3  # 默认 BM25 权重（动态权重未启用或无法计算时的兜底）
+    rag_vector_ratio: float = 0.7  # 默认向量权重
+    rag_dynamic_weight_enabled: bool = True  # 按查询与语料的词汇重合度动态调整 BM25/向量比例
+    rag_bm25_ratio_min: float = 0.2  # 动态 BM25 权重下限
+    rag_bm25_ratio_max: float = 0.7  # 动态 BM25 权重上限
     rag_min_match_score: float = 0.3
     rag_max_retrieve_attempts: int = 3
     rag_default_chunk_size: int = 512

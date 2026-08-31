@@ -1,4 +1,4 @@
 from .mineru_client import MinerUClient, ParseResult
-from .milvus_upload import MilvusUploader
+from .es_upload import ESUploader
 
-__all__ = ["MinerUClient", "ParseResult", "MilvusUploader"]
+__all__ = ["MinerUClient", "ParseResult", "ESUploader"]

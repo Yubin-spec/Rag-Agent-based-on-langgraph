@@ -3,7 +3,7 @@
 知识库智能体 HTTP API：文档上传/解析/确认上传、多智能体对话。
 
 主要能力：
-- 文档：POST /doc/upload 上传并解析（MinerU 或占位），POST /doc/confirm_upload 确认后写入 Milvus。
+- 文档：POST /doc/upload 上传并解析（MinerU 或占位），POST /doc/confirm_upload 确认后写入 Elasticsearch。
 - 对话：POST /chat 非流式、POST /chat/stream 流式（先出首字）；总控路由到闲聊或知识库，内部仅 DeepSeek。
 - Text2SQL：GET/PUT /text2sql/schema 表结构审核，POST /text2sql/confirm_execute 人工确认执行删除/修改类 SQL。
 
@@ -37,7 +37,7 @@ import uuid
 
 from config import get_settings
 from src.doc.mineru_client import MinerUClient, ParseResult, ChunkItem
-from src.doc.milvus_upload import MilvusUploader
+from src.doc.es_upload import ESUploader
 from src.graph.app import get_graph
 from src.agents.supervisor import supervisor_node_async
 from src.agents.chat_agent import chat_agent_stream_async
@@ -326,10 +326,22 @@ def _thread_id(user_id: Optional[str], conversation_id: str) -> str:
     return conversation_id
 
 
+def _answer_cache_lookup_key(message: str, retrieval_filter: Optional[dict] = None) -> str:
+    """缓存 key：同一问题在不同过滤范围下答案可能不同，key 需带上过滤条件。"""
+    if not retrieval_filter:
+        return (message or "").strip()
+    return json.dumps(
+        {"q": message, "f": retrieval_filter},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
 class ChatRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None  # 对话 ID，同 ID 即同会话（数据隔离），不传则新开对话
     user_id: Optional[str] = None  # 可选，与 X-User-Id 二选一，用于用户隔离
+    retrieval_filter: Optional[dict] = None  # 可选：检索前先按 doc_id/category/doc_path 缩小范围
 
 
 class ChatResponse(BaseModel):
@@ -447,6 +459,8 @@ class ConfirmUploadRequest(BaseModel):
     task_id: str
     user_id: Optional[str] = None  # 可选，与 X-User-Id 二选一，用于用户隔离
     chunks: Optional[List[ChunkItem]] = None  # 用户自定义后的 chunks，若不传则用原解析结果
+    category: Optional[str] = None  # 文档分类，写入 ES 后可用于检索前 filter
+    doc_path: Optional[str] = None  # 文档在目录层级中的路径，可用于前缀过滤
 
 
 class SchemaColumn(BaseModel):
@@ -510,7 +524,7 @@ async def doc_upload(request: Request, file: UploadFile = File(...)):
     """
     上传文档并解析（MinerU 或本地占位）。
     将文件写入 upload_dir，调用解析器得到全文与 chunks，存入 _parse_cache（key 含 user_id）。
-    返回 task_id、原文摘要、chunks 等供前端对比；确认后由 /doc/confirm_upload 写入 Milvus。
+    返回 task_id、原文摘要、chunks 等供前端对比；确认后由 /doc/confirm_upload 写入 Elasticsearch。
     """
     user_id = _user_id_from_request(request, None)
     settings = get_settings()
@@ -538,7 +552,7 @@ async def doc_upload(request: Request, file: UploadFile = File(...)):
 async def confirm_upload(request: Request, body: ConfirmUploadRequest):
     """
     用户确认上传：从 _parse_cache 取出对应 task_id 的解析结果（按 user_id 隔离），
-    可选使用 body.chunks 覆盖原 chunks，然后调用 MilvusUploader 写入向量库。
+    可选使用 body.chunks 覆盖原 chunks，然后调用 ESUploader 写入向量库。
     确认成功后从缓存删除该条，防止重复确认。
     """
     user_id = _user_id_from_request(request, body.user_id)
@@ -556,8 +570,13 @@ async def confirm_upload(request: Request, body: ConfirmUploadRequest):
         )
     else:
         result = base
-    uploader = MilvusUploader()
-    count = await asyncio.to_thread(uploader.upload_parse_result, result)
+    uploader = ESUploader()
+    count = await asyncio.to_thread(
+        uploader.upload_parse_result,
+        result,
+        category=body.category,
+        doc_path=body.doc_path,
+    )
     del _parse_cache[cache_key]  # 确认后移除，避免重复确认
     return {"uploaded": count, "task_id": body.task_id}
 
@@ -807,6 +826,7 @@ async def chat(request: Request, req: ChatRequest):
     started_at = time.perf_counter()
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
+    cache_query = _answer_cache_lookup_key(req.message, req.retrieval_filter)
 
     # 长期记忆：若配置了 PostgreSQL，且当前进程内无该会话状态，则从 DB 加载并注入
     await _ensure_state_from_db(graph, config, thread_id)
@@ -854,7 +874,7 @@ async def chat(request: Request, req: ChatRequest):
     # 问答缓存：若历史问题命中缓存，直接返回并写入本轮对话状态（缓存异常不影响主流程）
     if getattr(settings, "answer_cache_enabled", True):
         try:
-            cached = await get_cached_answer(req.message)
+            cached = await get_cached_answer(cache_query)
         except Exception:
             cached = None
         if cached is not None:
@@ -971,8 +991,8 @@ async def chat(request: Request, req: ChatRequest):
             return ChatResponse(reply=reply_exec, conversation_id=conversation_id, observation_id=observation_id)
 
     # 防击穿：同一问题仅一个协程回源，持锁后再次查缓存再决定是否走图
-    async with answer_lock(req.message):
-        cached = await get_cached_answer(req.message)
+    async with answer_lock(cache_query):
+        cached = await get_cached_answer(cache_query)
         if cached is not None:
             observation_id = str(uuid.uuid4())
             if hasattr(graph, "aupdate_state"):
@@ -1005,9 +1025,11 @@ async def chat(request: Request, req: ChatRequest):
             )
             return ChatResponse(reply=cached, conversation_id=conversation_id, observation_id=observation_id)
         messages = [HumanMessage(content=req.message)]
+        invoke_state: dict = {"messages": messages}
+        invoke_state["retrieval_filter"] = req.retrieval_filter or None
         try:
             result = await asyncio.wait_for(
-                graph.ainvoke({"messages": messages}, config),
+                graph.ainvoke(invoke_state, config),
                 timeout=float(getattr(settings, "agent_request_timeout_seconds", 120)),
             )
         except asyncio.TimeoutError:
@@ -1096,7 +1118,7 @@ async def chat(request: Request, req: ChatRequest):
         qa_trace = result.get("qa_trace") or None
         if getattr(settings, "answer_cache_enabled", True) and reply:
             try:
-                await set_cached_answer(req.message, reply)
+                await set_cached_answer(cache_query, reply)
             except Exception:
                 pass
         await _persist_conversation_session(thread_id, conversation_id, user_id, req.message)
@@ -1131,6 +1153,7 @@ async def _chat_stream_generator(
     message: str,
     user_id: Optional[str] = None,
     started_at: Optional[float] = None,
+    retrieval_filter: Optional[dict] = None,
 ):
     """
     流式对话的 SSE 生成器：先出首字再逐 chunk；路由与 LLM 均异步，不阻塞事件循环。
@@ -1141,6 +1164,7 @@ async def _chat_stream_generator(
     started_at = started_at or time.perf_counter()
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
+    cache_query = _answer_cache_lookup_key(message, retrieval_filter)
     # 流式下的「确认执行」：执行待确认 SQL 并流式返回结果，然后发送 done
     if message.strip() in ("确认执行", "确认") and thread_id in _pending_sql:
         sql = _pending_sql.pop(thread_id)
@@ -1222,7 +1246,7 @@ async def _chat_stream_generator(
     # 问答缓存：问题归一化后查 Redis，命中则先流式输出首字再按 chunk 输出剩余，写状态后 done
     if getattr(settings_stream, "answer_cache_enabled", True):
         try:
-            cached = await get_cached_answer(message)
+            cached = await get_cached_answer(cache_query)
         except Exception:
             cached = None
         if cached is not None:
@@ -1258,8 +1282,8 @@ async def _chat_stream_generator(
             return
 
     # 防击穿：同一问题仅一个协程回源，持锁后再次查缓存再决定是否走图
-    async with answer_lock(message):
-        cached = await get_cached_answer(message)
+    async with answer_lock(cache_query):
+        cached = await get_cached_answer(cache_query)
         if cached is not None:
             observation_id = str(uuid.uuid4())
             if cached:
@@ -1299,6 +1323,7 @@ async def _chat_stream_generator(
             current = []
         new_messages = list(current) + [HumanMessage(content=message)]
         new_state = {"messages": new_messages}
+        new_state["retrieval_filter"] = retrieval_filter or None
 
         # 总控路由：仅当明确为 knowledge 时走知识库流式，否则走闲聊流式
         next_action = (await supervisor_node_async(new_state)).get("next", "chat")
@@ -1315,7 +1340,11 @@ async def _chat_stream_generator(
             else:
                 engine = KnowledgeEngine()
                 pending_holder: list = []
-                async for chunk in engine.aquery_stream(message, pending_sql_out=pending_holder):
+                async for chunk in engine.aquery_stream(
+                    message,
+                    pending_sql_out=pending_holder,
+                    retrieval_filter=retrieval_filter,
+                ):
                     full_chunks.append(chunk)
                     yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
                 qa_trace = engine.get_last_trace()
@@ -1339,7 +1368,7 @@ async def _chat_stream_generator(
                     )
                 if getattr(settings_stream, "answer_cache_enabled", True):
                     try:
-                        await set_cached_answer(message, full_reply)
+                        await set_cached_answer(cache_query, full_reply)
                     except Exception:
                         pass
                 await _persist_conversation_session(thread_id, conversation_id, user_id, message)
@@ -1500,7 +1529,14 @@ async def chat_stream(request: Request, req: ChatRequest):
         pass
 
     return StreamingResponse(
-        _chat_stream_generator(thread_id, conversation_id, req.message, user_id, started_at),
+        _chat_stream_generator(
+            thread_id,
+            conversation_id,
+            req.message,
+            user_id,
+            started_at,
+            retrieval_filter=req.retrieval_filter,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

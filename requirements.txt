@@ -11,7 +11,7 @@ sentence-transformers>=3.0.0
 FlagEmbedding>=1.2.0
 
 # Vector DB & Retrieval
-pymilvus>=2.4.0
+elasticsearch>=8.17.0
 rank_bm25>=0.2.2
 
 # Text2SQL / DB

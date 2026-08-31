@@ -38,7 +38,7 @@ class ChunkItem(BaseModel):
 
 
 class ParseResult(BaseModel):
-    """解析结果：任务 id、原始路径、全文、分段 chunks，供前端对比与自定义后上传 Milvus。"""
+    """解析结果：任务 id、原始路径、全文、分段 chunks，供前端对比与自定义后上传 Elasticsearch。"""
     task_id: str
     original_path: str
     full_text: str

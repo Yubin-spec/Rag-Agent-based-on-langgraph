@@ -1,6 +1,5 @@
-# src/kb/embedding_loader.py
 """
-BGE 向量与重排模型单例加载，供 RAGRetriever 与 MilvusUploader 复用，避免重复加载。
+BGE 向量与重排模型单例加载，供 RAGRetriever 与 ESUploader 复用，避免重复加载。
 """
 from typing import Any
 
@@ -11,7 +10,7 @@ _reranker: Any = None
 
 
 def get_bge_embedding() -> Any:
-    """进程内单例 BGE-M3 向量模型，供 RAG 检索与 Milvus 写入复用。"""
+    """进程内单例 BGE-M3 向量模型，供 RAG 检索与 ES 写入复用。"""
     global _embedding
     if _embedding is not None:
         return _embedding
